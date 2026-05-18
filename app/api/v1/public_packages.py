@@ -1,0 +1,433 @@
+from typing import Optional, List
+from datetime import date, timedelta
+from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, or_, and_
+from sqlalchemy.orm import selectinload
+
+from app.core.timezone import ist_date_today
+from app.db.session import get_db
+from app.models.package import Package, PackageVariant, PackageVariantInventory
+from app.models.tag import Tag
+from app.models.enums import PackageType, RegionType, PublishStatus
+from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO
+from app.schemas.inventory import PublicDateAvailability, PublicPackageAvailabilityResponse
+from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
+
+router = APIRouter()
+PUBLIC_CACHE_TTL_SECONDS = 60
+
+def get_active_paid_variants(pkg: Package) -> list[PackageVariant]:
+    return [
+        v for v in pkg.variants
+        if v.is_active and not v.deleted_at and v.adult_price and v.adult_price > 0
+    ]
+
+def has_text(value: object) -> bool:
+    return bool(str(value or "").strip())
+
+@router.get("", response_model=PaginatedResponse[PackageListDTO])
+async def get_packages(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(10, ge=1, le=50, description="Items per page"),
+    type: Optional[PackageType] = Query(None, description="Filter by TOUR or TRIP"),
+    region: Optional[RegionType] = Query(None, description="Filter by AP or TS"),
+    is_featured: Optional[bool] = Query(None, description="Filter featured only"),
+    tags: Optional[List[str]] = Query(None, description="Filter by tags"),
+    sort: Optional[str] = Query("priority", description="Sort by: priority, price_low, price_high"),
+    q: Optional[str] = Query(None, description="Search term for title/description")
+):
+    """
+    Public Package Discovery API.
+    Returns a paginated list of active packages, properly eagerly loading variants for starting_price.
+    """
+    cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{sort}:{q or ''}"
+    set_public_cache_headers(response)
+
+    async def load_packages() -> PaginatedResponse[PackageListDTO]:
+        offset = (page - 1) * size
+
+        # Base Query (Only ACTIVE and PUBLISHED packages)
+        base_query = select(Package).where(
+            Package.status == PublishStatus.PUBLISHED,
+            Package.is_active == True,
+            Package.deleted_at.is_(None)
+        )
+
+        # Filters
+        if type:
+            base_query = base_query.where(Package.type == type)
+        if region:
+            base_query = base_query.where(Package.region == region)
+        if is_featured is not None:
+            base_query = base_query.where(Package.is_featured == is_featured)
+        
+        if q:
+            search_pattern = f"%{q}%"
+            base_query = base_query.where(
+                or_(
+                    Package.title.ilike(search_pattern),
+                    Package.description.ilike(search_pattern)
+                )
+            )
+        
+        if tags:
+            # Filter packages that have ANY of the requested tags (OR logic)
+            base_query = base_query.where(Package.tags.any(Tag.name.in_(tags)))
+
+        # Count Query
+        count_query = select(func.count()).select_from(base_query.subquery())
+        total_result = await db.execute(count_query)
+        total_count = total_result.scalar_one()
+
+        # Subquery to get minimum price per package
+        price_subquery = (
+            select(
+                PackageVariant.package_id,
+                func.min(PackageVariant.adult_price).label("min_price")
+            )
+            .where(
+                PackageVariant.is_active == True,
+                PackageVariant.deleted_at == None,
+                PackageVariant.adult_price > 0
+            )
+            .group_by(PackageVariant.package_id)
+            .subquery()
+        )
+
+        data_query = (
+            base_query
+            .outerjoin(price_subquery, Package.id == price_subquery.c.package_id)
+            .options(
+                selectinload(Package.variants.and_(
+                    PackageVariant.is_active == True,
+                    PackageVariant.deleted_at == None,
+                    PackageVariant.adult_price > 0,
+                )),
+                selectinload(Package.tags)
+            )
+        )
+
+        # Sorting
+        if sort == "price_low":
+            data_query = data_query.order_by(price_subquery.c.min_price.asc().nulls_last(), Package.id.desc())
+        elif sort == "price_high":
+            data_query = data_query.order_by(price_subquery.c.min_price.desc().nulls_last(), Package.id.desc())
+        else: # Default: priority
+            data_query = data_query.order_by(Package.order_priority.asc(), Package.id.desc())
+
+        data_query = data_query.offset(offset).limit(size)
+        
+        result = await db.execute(data_query)
+        packages = result.scalars().all()
+
+        # Map to DTOs
+        dto_list = []
+        for pkg in packages:
+            # Calculate Starting Price
+            starting_price = min((v.adult_price for v in pkg.variants), default=None)
+            
+            dto = PackageListDTO(
+                id=pkg.id,
+                slug=pkg.slug,
+                title=pkg.title,
+                type=pkg.type,
+                region=pkg.region,
+                cover_image_url=pkg.cover_image_url,
+                is_featured=pkg.is_featured,
+                tags=[tag.name for tag in pkg.tags if tag.is_active],
+                starting_price=starting_price,
+                variants=[
+                    PackageVariantPublicDTO(
+                        id=v.id,
+                        title=v.title,
+                        adult_price=v.adult_price,
+                        child_price=v.child_price,
+                        transport_info=v.transport_info
+                    )
+                    for v in pkg.variants
+                ]
+            )
+            dto_list.append(dto)
+
+        has_next = (offset + size) < total_count
+        has_prev = page > 1
+
+        return PaginatedResponse(
+            items=dto_list,
+            total=total_count,
+            page=page,
+            size=size,
+            has_next=has_next,
+            has_prev=has_prev
+        )
+
+    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_packages)
+
+@router.get("/{slug}", response_model=PackageDetailDTO)
+async def get_package_detail(
+    slug: str,
+    response: Response,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Public Package Detail API.
+    Returns full details for a specific package, including all content sections.
+    """
+    cache_key = f"packages:detail:{slug}"
+    set_public_cache_headers(response)
+
+    async def load_package_detail() -> PackageDetailDTO:
+        query = (
+            select(Package)
+            .where(
+                Package.slug == slug,
+                Package.status == PublishStatus.PUBLISHED,
+                Package.is_active == True,
+                Package.deleted_at.is_(None)
+            )
+            .options(
+                selectinload(Package.variants.and_(
+                    PackageVariant.is_active == True,
+                    PackageVariant.deleted_at == None,
+                    PackageVariant.adult_price > 0,
+                )),
+                selectinload(Package.tags),
+                selectinload(Package.gallery),
+                selectinload(Package.itinerary),
+                selectinload(Package.highlights),
+                selectinload(Package.inclusions),
+                selectinload(Package.exclusions),
+                selectinload(Package.boarding_points),
+                selectinload(Package.faqs),
+                selectinload(Package.policies)
+            )
+        )
+        
+        result = await db.execute(query)
+        pkg = result.scalar_one_or_none()
+        
+        if not pkg:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Package not found or inactive"
+            )
+            
+        starting_price = min((v.adult_price for v in pkg.variants), default=None)
+        
+        from app.services.r2_storage import r2_service
+        active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
+        brochure_url = await r2_service.get_public_url(active_brochure_key)
+        gen_brochure_url = await r2_service.get_public_url(pkg.generated_brochure_url)
+        
+        return PackageDetailDTO(
+            id=pkg.id,
+            slug=pkg.slug,
+            title=pkg.title,
+            type=pkg.type,
+            region=pkg.region,
+            description=pkg.description,
+            brochure_pdf_url=brochure_url,
+            generated_brochure_url=gen_brochure_url,
+            cover_image_url=pkg.cover_image_url,
+            order_priority=pkg.order_priority,
+            is_featured=pkg.is_featured,
+            is_active=pkg.is_active,
+            created_at=pkg.created_at,
+            updated_at=pkg.updated_at,
+            tags=[tag.name for tag in pkg.tags if tag.is_active],
+            starting_price=starting_price,
+            meta_title=pkg.meta_title,
+            meta_description=pkg.meta_description,
+            og_image_url=pkg.og_image_url,
+            canonical_url=pkg.canonical_url,
+            variants=[
+                PackageVariantPublicDTO(
+                    id=v.id,
+                    title=v.title,
+                    adult_price=v.adult_price,
+                    child_price=v.child_price,
+                    transport_info=v.transport_info
+                ) for v in pkg.variants
+            ],
+            gallery=[
+                item for item in pkg.gallery
+                if not item.deleted_at and has_text(item.image_url)
+            ],
+            itinerary=[
+                item for item in pkg.itinerary
+                if not item.deleted_at and has_text(item.title)
+            ],
+            highlights=[
+                item for item in pkg.highlights
+                if not item.deleted_at and has_text(item.title)
+            ],
+            inclusions=[
+                item for item in pkg.inclusions
+                if not item.deleted_at and has_text(item.label)
+            ],
+            exclusions=[
+                item for item in pkg.exclusions
+                if not item.deleted_at and has_text(item.label)
+            ],
+            boarding_points=[
+                item for item in pkg.boarding_points
+                if not item.deleted_at and has_text(item.title)
+            ],
+            faqs=[
+                item for item in pkg.faqs
+                if not item.deleted_at and has_text(item.question) and has_text(item.answer)
+            ],
+            policies=[
+                item for item in pkg.policies
+                if not item.deleted_at and has_text(item.title) and has_text(item.description)
+            ]
+        )
+
+    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
+
+
+@router.get("/{slug}/availability", response_model=PublicPackageAvailabilityResponse)
+async def get_package_availability(
+    slug: str,
+    response: Response,
+    month: str = Query(..., description="Month in YYYY-MM format, e.g. 2026-06"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public availability endpoint for a package's detail page.
+    Returns per-date seat counts, price overrides, and open/closed status
+    for all active variants within the requested month.
+
+    Business rules enforced:
+    - Today and past dates are excluded from results (no same-day booking).
+    - Dates with is_closed=True are returned with status='CLOSED'.
+    - Dates with available_seats=0 are returned with status='SOLD_OUT'.
+    - Dates with no inventory row are returned with status='NO_INVENTORY'.
+    """
+    set_no_store_headers(response)
+    today = ist_date_today()
+
+    # Validate month format
+    try:
+        year, mon = int(month[:4]), int(month[5:7])
+        from_date = date(year, mon, 1)
+        if mon == 12:
+            to_date = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            to_date = date(year, mon + 1, 1) - timedelta(days=1)
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format.")
+
+    # Load package with variants
+    pkg_result = await db.execute(
+        select(Package)
+        .where(
+            Package.slug == slug,
+            Package.status == PublishStatus.PUBLISHED,
+            Package.is_active == True,
+            Package.deleted_at.is_(None),
+        )
+        .options(selectinload(Package.variants))
+    )
+    pkg = pkg_result.scalar_one_or_none()
+    if not pkg:
+        raise HTTPException(status_code=404, detail="Package not found or inactive.")
+
+    active_variants = get_active_paid_variants(pkg)
+    if not active_variants:
+        return PublicPackageAvailabilityResponse(
+            package_id=pkg.id, slug=pkg.slug, month=month, dates=[]
+        )
+
+    variant_ids = [v.id for v in active_variants]
+    variant_map = {v.id: v for v in active_variants}
+
+    # Fetch all inventory rows for these variants in the month
+    inv_result = await db.execute(
+        select(PackageVariantInventory).where(
+            and_(
+                PackageVariantInventory.variant_id.in_(variant_ids),
+                PackageVariantInventory.date >= from_date,
+                PackageVariantInventory.date <= to_date,
+            )
+        ).order_by(PackageVariantInventory.date.asc(), PackageVariantInventory.variant_id.asc())
+    )
+    inv_rows = inv_result.scalars().all()
+
+    # Build a map: (variant_id, date) -> inventory_row
+    inv_map: dict[tuple, PackageVariantInventory] = {}
+    for row in inv_rows:
+        inv_map[(row.variant_id, row.date)] = row
+
+    availability: list[PublicDateAvailability] = []
+
+    # Walk every date in the month, for every variant
+    current = from_date
+    while current <= to_date:
+        # Skip today and past dates — no same-day booking allowed
+        if current <= today:
+            current += timedelta(days=1)
+            continue
+
+        for variant in active_variants:
+            inv = inv_map.get((variant.id, current))
+
+            base_adult = variant.adult_price
+            base_child = variant.child_price
+
+            if inv is None:
+                availability.append(
+                    PublicDateAvailability(
+                        date=current,
+                        variant_id=variant.id,
+                        variant_title=variant.title,
+                        adult_price=base_adult,
+                        child_price=base_child,
+                        effective_adult_price=base_adult,
+                        available_seats=0,
+                        is_closed=False,
+                        status="NO_INVENTORY",
+                    )
+                )
+            elif inv.is_closed:
+                availability.append(
+                    PublicDateAvailability(
+                        date=current,
+                        variant_id=variant.id,
+                        variant_title=variant.title,
+                        adult_price=base_adult,
+                        child_price=base_child,
+                        effective_adult_price=inv.price_override or base_adult,
+                        available_seats=max(0, inv.total_capacity - inv.booked_count),
+                        is_closed=True,
+                        status="CLOSED",
+                    )
+                )
+            else:
+                avail_seats = max(0, inv.total_capacity - inv.booked_count)
+                slot_status = "OPEN" if avail_seats > 0 else "SOLD_OUT"
+                availability.append(
+                    PublicDateAvailability(
+                        date=current,
+                        variant_id=variant.id,
+                        variant_title=variant.title,
+                        adult_price=base_adult,
+                        child_price=base_child,
+                        effective_adult_price=inv.price_override or base_adult,
+                        available_seats=avail_seats,
+                        is_closed=False,
+                        status=slot_status,
+                    )
+                )
+
+        current += timedelta(days=1)
+
+    return PublicPackageAvailabilityResponse(
+        package_id=pkg.id,
+        slug=pkg.slug,
+        month=month,
+        dates=availability,
+    )

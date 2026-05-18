@@ -1,0 +1,117 @@
+"""
+Auth request/response schemas + User profile schemas — Phase-3.
+"""
+from typing import Optional
+from pydantic import EmailStr, Field, field_validator
+from app.schemas.base import AppBaseModel, TimestampSchema
+from app.models.enums import UserRole, AccountStatus
+
+
+# ─── Base User ────────────────────────────────────────────────────────────────
+
+class UserBase(AppBaseModel):
+    email: EmailStr
+    full_name: str
+    phone_number: Optional[str] = None
+    role: UserRole = UserRole.USER
+
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=8)
+
+
+class UserResponse(UserBase, TimestampSchema):
+    id: int
+    account_status: AccountStatus
+
+
+# ─── Tourist Auth ─────────────────────────────────────────────────────────────
+
+class TouristSignupRequest(AppBaseModel):
+    full_name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=128)
+    phone_number: Optional[str] = Field(None, max_length=20)
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def strip_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip() or None
+        return None
+
+
+class TouristLoginRequest(AppBaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1)
+
+
+# ─── Agent Auth ───────────────────────────────────────────────────────────────
+
+class AgentLoginRequest(AppBaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1)
+
+
+# ─── Admin Auth (2-step: password → OTP) ────────────────────────────────────
+
+class AdminLoginRequest(AppBaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1)
+
+
+class AdminOTPVerifyRequest(AppBaseModel):
+    user_id: int
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+# ─── Google OAuth ─────────────────────────────────────────────────────────────
+
+class GoogleCallbackRequest(AppBaseModel):
+    code: str
+    redirect_uri: Optional[str] = None  # override for prod vs dev
+
+
+# ─── Token Responses ─────────────────────────────────────────────────────────
+
+class UserMeResponse(AppBaseModel):
+    id: int
+    email: Optional[str]
+    full_name: str
+    role: UserRole
+    account_status: AccountStatus
+    phone_number: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class ProfileUpdateRequest(AppBaseModel):
+    full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+
+class TokenResponse(AppBaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserMeResponse
+
+
+class OTPInitiatedResponse(AppBaseModel):
+    """Returned after admin password validation. Step 1 of 2."""
+    user_id: int
+    message: str = "OTP sent to registered email. Valid for 5 minutes."
+
+
+class RefreshResponse(AppBaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class ForgotPasswordRequest(AppBaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(AppBaseModel):
+    email: EmailStr
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_password: str = Field(..., min_length=8, max_length=128)

@@ -1,0 +1,54 @@
+from typing import Optional
+from datetime import datetime
+from pydantic import Field, field_validator
+from decimal import Decimal
+from app.schemas.base import AppBaseModel, TimestampSchema
+
+class CouponBase(AppBaseModel):
+    code: str = Field(..., min_length=3, max_length=32)
+    discount_type: str = Field(..., description="FLAT or PERCENTAGE")
+    discount_value: Decimal = Field(..., ge=0)
+    min_booking_amount: Optional[Decimal] = Field(None, ge=0)
+    max_discount_amount: Optional[Decimal] = Field(None, ge=0)
+    usage_limit: Optional[int] = Field(None, ge=1)
+    package_id: Optional[int] = None
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    is_active: bool = True
+
+    @field_validator("discount_type")
+    @classmethod
+    def validate_discount_type(cls, v: str) -> str:
+        v_upper = v.upper()
+        if v_upper not in ("FLAT", "PERCENTAGE"):
+            raise ValueError("discount_type must be FLAT or PERCENTAGE")
+        return v_upper
+
+class CouponCreate(CouponBase):
+    pass
+
+class CouponUpdate(AppBaseModel):
+    code: Optional[str] = Field(None, min_length=3, max_length=32)
+    discount_type: Optional[str] = Field(None, description="FLAT or PERCENTAGE")
+    discount_value: Optional[Decimal] = Field(None, ge=0)
+    min_booking_amount: Optional[Decimal] = Field(None, ge=0)
+    max_discount_amount: Optional[Decimal] = Field(None, ge=0)
+    usage_limit: Optional[int] = Field(None, ge=1)
+    package_id: Optional[int] = None
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    is_active: Optional[bool] = None
+
+    @field_validator("discount_type")
+    @classmethod
+    def validate_discount_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_upper = v.upper()
+        if v_upper not in ("FLAT", "PERCENTAGE"):
+            raise ValueError("discount_type must be FLAT or PERCENTAGE")
+        return v_upper
+
+class CouponResponse(CouponBase, TimestampSchema):
+    id: int
+    usage_count: int
