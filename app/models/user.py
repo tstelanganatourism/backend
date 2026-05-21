@@ -18,10 +18,13 @@ class User(BaseModel):
 
     # Agent-specific fields (nullable — only populated for role=AGENT)
     commission_percentage = Column(Numeric(5, 2), default=0.00, server_default="0.00", nullable=True)
+    commission_type = Column(String(16), default="PERCENTAGE", server_default="PERCENTAGE", nullable=False)  # PERCENTAGE or FIXED_AMOUNT
+    commission_fixed_amount = Column(Numeric(10, 2), nullable=True)
     company_name = Column(String, nullable=True)
     gst_number = Column(String, nullable=True)
     address = Column(Text, nullable=True)
     admin_notes = Column(Text, nullable=True)
+    white_label_enabled = Column(Boolean, default=False, server_default="false", nullable=False)
     
     # Profile picture
     avatar_url = Column(String, nullable=True)

@@ -3,7 +3,7 @@ import logging
 from arq import create_pool
 from arq.connections import RedisSettings
 from app.core.config import settings
-from app.services.pdf_generator import generate_package_brochure_task
+from app.services.pdf_generator import generate_package_brochure_task, generate_booking_ticket_task, generate_booking_invoice_task
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ async def shutdown(ctx):
     pass
 
 class WorkerSettings:
-    functions = [generate_package_brochure_task]
+    functions = [generate_package_brochure_task, generate_booking_ticket_task, generate_booking_invoice_task]
     redis_settings = REDIS_SETTINGS
     on_startup = startup
     on_shutdown = shutdown

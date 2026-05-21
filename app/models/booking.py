@@ -78,12 +78,14 @@ class BookingPassenger(BaseModel):
     full_name = Column(String, nullable=False)
     age = Column(Integer, nullable=False)
     gender = Column(SQLEnum(GenderType), nullable=True)
-    is_child = Column(Boolean, Computed("age < 10", persisted=True))
+    is_child = Column(Boolean, Computed("age <= 10", persisted=True))
     phone_number = Column(String, nullable=True)
+    relationship_to_lead = Column(String(50), nullable=True)
+    is_primary = Column(Boolean, default=False, server_default="false", nullable=False)
     
-    # Secure Encrypted Aadhaar fields (BR-12)
-    aadhar_encrypted = Column(String(512), nullable=False)
-    aadhar_hash = Column(String(64), nullable=False, index=True)
+    # Secure Encrypted Aadhaar fields (BR-12) — nullable for children (<18)
+    aadhar_encrypted = Column(String(512), nullable=True)
+    aadhar_hash = Column(String(64), nullable=True, index=True)
     aadhar_image_url = Column(String(512), nullable=True)
 
     booking = relationship("Booking", back_populates="passengers")
@@ -98,5 +100,36 @@ class CancellationRequest(BaseModel):
     processed_at = Column(DateTime(timezone=True), nullable=True)
     processed_by = Column(ForeignKey("users.id"), nullable=True)
     admin_notes = Column(String, nullable=True)
+    
+    # Store cancellation metadata (Phase 2)
+    cancellation_fee = Column(Numeric(12, 2), nullable=True)
+    refund_amount = Column(Numeric(12, 2), nullable=True)
 
     booking = relationship("Booking", back_populates="cancellation_requests")
+
+class BookingDraft(BaseModel):
+    """
+    Temporary hold for checkouts. Converted to Booking only on Razorpay Webhook success.
+    """
+    __tablename__ = "booking_drafts"
+
+    draft_id = Column(String, unique=True, nullable=False, index=True)
+    razorpay_order_id = Column(String, unique=True, nullable=True, index=True)
+    user_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
+    agent_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
+    
+    # Store the entire validated request payload and pricing snapshot
+    checkout_payload = Column(JSONB, nullable=False)
+    pricing_snapshot = Column(JSONB, nullable=False)
+    
+    # Indexed fields to easily locate and release reserved inventory during cleanup
+    target_type = Column(String, nullable=False) # 'package' or 'room'
+    variant_id = Column(Integer, nullable=True) 
+    room_variant_id = Column(Integer, nullable=True) 
+    travel_date = Column(Date, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    
+    amount_payable = Column(Numeric(12, 2), nullable=False)
+    coupon_applied = Column(String(50), nullable=True)
+    
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)

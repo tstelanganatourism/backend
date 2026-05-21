@@ -11,7 +11,8 @@ class CouponBase(AppBaseModel):
     min_booking_amount: Optional[Decimal] = Field(None, ge=0)
     max_discount_amount: Optional[Decimal] = Field(None, ge=0)
     usage_limit: Optional[int] = Field(None, ge=1)
-    package_id: Optional[int] = None
+    applicable_package_ids: list[int] = Field(default_factory=list)
+    applicable_room_ids: list[int] = Field(default_factory=list)
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     is_active: bool = True
@@ -34,7 +35,8 @@ class CouponUpdate(AppBaseModel):
     min_booking_amount: Optional[Decimal] = Field(None, ge=0)
     max_discount_amount: Optional[Decimal] = Field(None, ge=0)
     usage_limit: Optional[int] = Field(None, ge=1)
-    package_id: Optional[int] = None
+    applicable_package_ids: Optional[list[int]] = None
+    applicable_room_ids: Optional[list[int]] = None
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     is_active: Optional[bool] = None
@@ -52,3 +54,15 @@ class CouponUpdate(AppBaseModel):
 class CouponResponse(CouponBase, TimestampSchema):
     id: int
     usage_count: int
+
+class CouponValidateRequest(AppBaseModel):
+    code: str
+    target_type: Optional[str] = None
+    target_id: Optional[int] = None
+    booking_amount: float
+
+class CouponValidateResponse(AppBaseModel):
+    valid: bool
+    discount_amount: float = 0.0
+    discounted_subtotal: float = 0.0
+    reason: Optional[str] = None

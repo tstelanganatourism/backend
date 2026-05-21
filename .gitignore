@@ -36,3 +36,11 @@ current_otp.txt
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Scratch and test utility files
+check_status.py
+ensure_new100.py
+fix_rooms_status.py
+scratch_*.py
+trigger_brochure.py
+update_package_4_duration.py

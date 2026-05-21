@@ -23,6 +23,8 @@ class R2StorageService:
             self.bucket_name
         ])
         
+        self._client = None
+        self._client_context = None
         if self.is_configured:
             self.endpoint_url = f"https://{self.account_id}.r2.cloudflarestorage.com"
             self.session = aiobotocore.session.get_session()
@@ -30,17 +32,25 @@ class R2StorageService:
         else:
             logger.warning("R2StorageService is not fully configured in settings.")
 
-    def _get_client(self):
+    async def get_client(self):
         if not self.is_configured:
             raise ValueError("R2 Storage is not configured.")
-            
-        return self.session.create_client(
-            's3',
-            endpoint_url=self.endpoint_url,
-            aws_access_key_id=self.access_key,
-            aws_secret_access_key=self.secret_key,
-            region_name="auto"
-        )
+        if self._client is None:
+            self._client_context = self.session.create_client(
+                's3',
+                endpoint_url=self.endpoint_url,
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name="auto"
+            )
+            self._client = await self._client_context.__aenter__()
+        return self._client
+
+    async def close(self):
+        if self._client_context is not None:
+            await self._client_context.__aexit__(None, None, None)
+            self._client = None
+            self._client_context = None
 
     async def upload_file(self, file_content: bytes, object_name: str, content_type: str = "application/pdf") -> str:
         """
@@ -50,18 +60,18 @@ class R2StorageService:
         if not self.is_configured:
             raise ValueError("R2 Storage is not configured.")
             
-        async with self._get_client() as client:
-            try:
-                await client.put_object(
-                    Bucket=self.bucket_name,
-                    Key=object_name,
-                    Body=file_content,
-                    ContentType=content_type
-                )
-                return object_name
-            except ClientError as e:
-                logger.error(f"Failed to upload to R2: {e}")
-                raise e
+        client = await self.get_client()
+        try:
+            await client.put_object(
+                Bucket=self.bucket_name,
+                Key=object_name,
+                Body=file_content,
+                ContentType=content_type
+            )
+            return object_name
+        except ClientError as e:
+            logger.error(f"Failed to upload to R2: {e}")
+            raise e
 
     async def generate_presigned_url(self, object_name: str, expires_in: int = 900) -> str:
         """
@@ -82,19 +92,19 @@ class R2StorageService:
         if cached and cached[0] > now:
             return cached[1]
             
-        async with self._get_client() as client:
-            try:
-                generated = client.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': self.bucket_name, 'Key': object_name},
-                    ExpiresIn=expires_in
-                )
-                url = await generated if inspect.isawaitable(generated) else generated
-                self._signed_url_cache[object_name] = (now + max(60, expires_in - 60), url)
-                return url
-            except ClientError as e:
-                logger.error(f"Failed to generate presigned URL: {e}")
-                raise e
+        client = await self.get_client()
+        try:
+            generated = client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': object_name},
+                ExpiresIn=expires_in
+            )
+            url = await generated if inspect.isawaitable(generated) else generated
+            self._signed_url_cache[object_name] = (now + max(60, expires_in - 60), url)
+            return url
+        except ClientError as e:
+            logger.error(f"Failed to generate presigned URL: {e}")
+            raise e
 
     async def delete_file(self, object_name: str) -> bool:
         """
@@ -104,16 +114,16 @@ class R2StorageService:
             logger.warning(f"R2 Storage not configured. Skipping deletion of {object_name}.")
             return False
             
-        async with self._get_client() as client:
-            try:
-                await client.delete_object(
-                    Bucket=self.bucket_name,
-                    Key=object_name
-                )
-                return True
-            except ClientError as e:
-                logger.error(f"Failed to delete {object_name} from R2: {e}")
-                return False
+        client = await self.get_client()
+        try:
+            await client.delete_object(
+                Bucket=self.bucket_name,
+                Key=object_name
+            )
+            return True
+        except ClientError as e:
+            logger.error(f"Failed to delete {object_name} from R2: {e}")
+            return False
 
     async def get_public_url(self, object_name: Optional[str]) -> Optional[str]:
         """

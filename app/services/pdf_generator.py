@@ -100,3 +100,92 @@ async def generate_package_brochure_task(ctx, package_id: int):
             package.brochure_generation_status = DocumentGenerationStatus.FAILED
             await db.commit()
             raise e # Raise to let ARQ handle retries if applicable
+
+async def generate_booking_ticket_task(ctx, booking_id: int):
+    """
+    Background task to generate a booking ticket PDF and upload to R2.
+    """
+    from app.models.booking import Booking
+    from app.utils.pricing import get_booking_hash
+    
+    async with AsyncSessionLocal() as db:
+        booking = await db.get(Booking, booking_id)
+        if not booking:
+            logger.error(f"Booking {booking_id} not found for ticket PDF generation.")
+            return
+            
+        try:
+            booking.ticket_generation_status = DocumentGenerationStatus.GENERATING
+            await db.commit()
+            
+            signature = get_booking_hash(booking.public_id, settings.SECRET_KEY)
+            frontend_url = settings.FRONTEND_URL.rstrip('/')
+            print_url = f"{frontend_url}/print/ticket/{booking.public_id}?secret={signature}"
+            
+            pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
+            
+            version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            object_name = f"private/tickets/generated/{booking.public_id}_{version}.pdf"
+            await r2_service.upload_file(pdf_bytes, object_name, content_type="application/pdf")
+            
+            if booking.ticket_pdf_url and booking.ticket_pdf_url != object_name:
+                try:
+                    await r2_service.delete_file(booking.ticket_pdf_url)
+                except Exception as del_err:
+                    logger.warning(f"Failed to delete old ticket file {booking.ticket_pdf_url}: {del_err}")
+                
+            booking.ticket_pdf_url = object_name
+            booking.ticket_generation_status = DocumentGenerationStatus.AVAILABLE
+            await db.commit()
+            logger.info(f"Successfully generated and uploaded ticket for booking {booking.public_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate ticket for booking {booking_id}: {e}")
+            booking.ticket_generation_status = DocumentGenerationStatus.FAILED
+            await db.commit()
+            raise e
+
+async def generate_booking_invoice_task(ctx, booking_id: int):
+    """
+    Background task to generate a booking invoice PDF and upload to R2.
+    """
+    from app.models.booking import Booking
+    from app.utils.pricing import get_booking_hash
+    
+    async with AsyncSessionLocal() as db:
+        booking = await db.get(Booking, booking_id)
+        if not booking:
+            logger.error(f"Booking {booking_id} not found for invoice PDF generation.")
+            return
+            
+        try:
+            booking.invoice_generation_status = DocumentGenerationStatus.GENERATING
+            await db.commit()
+            
+            signature = get_booking_hash(booking.public_id, settings.SECRET_KEY)
+            frontend_url = settings.FRONTEND_URL.rstrip('/')
+            print_url = f"{frontend_url}/print/invoice/{booking.public_id}?secret={signature}"
+            
+            pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
+            
+            version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            object_name = f"private/invoices/generated/{booking.public_id}_{version}.pdf"
+            await r2_service.upload_file(pdf_bytes, object_name, content_type="application/pdf")
+            
+            if booking.invoice_pdf_url and booking.invoice_pdf_url != object_name:
+                try:
+                    await r2_service.delete_file(booking.invoice_pdf_url)
+                except Exception as del_err:
+                    logger.warning(f"Failed to delete old invoice file {booking.invoice_pdf_url}: {del_err}")
+                
+            booking.invoice_pdf_url = object_name
+            booking.invoice_generation_status = DocumentGenerationStatus.AVAILABLE
+            await db.commit()
+            logger.info(f"Successfully generated and uploaded invoice for booking {booking.public_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate invoice for booking {booking_id}: {e}")
+            booking.invoice_generation_status = DocumentGenerationStatus.FAILED
+            await db.commit()
+            raise e
+

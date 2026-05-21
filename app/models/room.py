@@ -49,7 +49,6 @@ class Room(BaseModel, SEOMixin):
     # Relationships
     tags = relationship("Tag", secondary=room_tags)
     variants = relationship("RoomVariant", back_populates="room", cascade="all, delete-orphan")
-    inventory = relationship("RoomSlotInventory", back_populates="room")
     gallery = relationship("RoomGalleryImage", back_populates="room", cascade="all, delete-orphan", order_by="RoomGalleryImage.sort_order")
     highlights = relationship("RoomHighlight", back_populates="room", cascade="all, delete-orphan", order_by="RoomHighlight.sort_order")
     faqs = relationship("RoomFAQ", back_populates="room", cascade="all, delete-orphan", order_by="RoomFAQ.sort_order")
@@ -105,6 +104,7 @@ class RoomVariant(BaseModel):
     weekend_price = Column(Numeric(10, 2), nullable=False, index=True)
     
     capacity_per_room = Column(Integer, nullable=False)
+    total_rooms = Column(Integer, default=0, server_default="0", nullable=False)
     
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
 
@@ -115,23 +115,27 @@ class RoomVariant(BaseModel):
 
     # Relationships
     room = relationship("Room", back_populates="variants")
+    inventory = relationship("RoomSlotInventory", back_populates="room_variant", cascade="all, delete-orphan")
 
 class RoomSlotInventory(BaseModel):
     __tablename__ = "room_slot_inventory"
 
-    room_id = Column(ForeignKey("rooms.id"), nullable=False, index=True)
+    room_variant_id = Column(ForeignKey("room_variants.id", ondelete="CASCADE"), nullable=False, index=True)
     date = Column(Date, nullable=False, index=True) 
     slot_start = Column(Time, nullable=False)
     slot_end = Column(Time, nullable=False)
     total_rooms = Column(Integer, nullable=False)
     booked_rooms = Column(Integer, default=0, server_default="0", nullable=False)
+    reserved_rooms = Column(Integer, default=0, server_default="0", nullable=False)
+    is_closed = Column(Boolean, default=False, server_default="false", nullable=False)
     
     # In PostgreSQL we can use Computed. In SQLAlchemy we define it like this:
-    available_rooms = Column(Integer, Computed('total_rooms - booked_rooms', persisted=True))
+    available_rooms = Column(Integer, Computed('total_rooms - booked_rooms - reserved_rooms', persisted=True))
 
     __table_args__ = (
-        UniqueConstraint('room_id', 'date', 'slot_start', 'slot_end', name='uq_room_slot_inventory'),
-        CheckConstraint("booked_rooms <= total_rooms", name="chk_room_capacity"),
+        UniqueConstraint('room_variant_id', 'date', 'slot_start', 'slot_end', name='uq_room_slot_inventory_variant'),
+        CheckConstraint("booked_rooms + reserved_rooms <= total_rooms", name="chk_room_capacity"),
     )
 
-    room = relationship("Room", back_populates="inventory")
+    room_variant = relationship("RoomVariant", back_populates="inventory")
+

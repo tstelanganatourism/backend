@@ -6,6 +6,7 @@ from app.core.error_handlers import setup_exception_handlers
 from app.core.logging import setup_logging
 from loguru import logger
 import sqlalchemy
+import asyncio
 
 from app.api.v1 import auth
 from app.api.v1 import public_packages, public_rooms
@@ -22,6 +23,16 @@ app = FastAPI(
 
 # Initialize structured logging and error handlers
 setup_logging()
+
+if settings.SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        traces_sample_rate=1.0,
+        environment=settings.ENVIRONMENT,
+    )
+    logger.info("Sentry initialized")
+
 setup_exception_handlers(app)
 
 app.add_middleware(
@@ -61,6 +72,22 @@ app.include_router(
     promotions.router,
     prefix="/api/v1/promotions",
     tags=["Promotions"],
+)
+from app.api.v1 import public_coupons
+from app.api.v1 import public_bookings
+app.include_router(
+    public_coupons.router,
+    prefix="/api/v1"
+)
+app.include_router(
+    public_bookings.router,
+    prefix="/api/v1/bookings"
+)
+from app.api.v1 import payments
+app.include_router(
+    payments.router,
+    prefix="/api/v1/payments",
+    tags=["Payments & Webhooks"]
 )
 from app.api.v1 import documents
 
@@ -117,6 +144,40 @@ async def health_check():
         return Response(content=json.dumps(health_status), status_code=503, media_type="application/json")
         
     return health_status
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Warm up R2 Storage client
+    from app.services.r2_storage import r2_service
+    try:
+        if r2_service.is_configured:
+            logger.info("Pre-warming R2 Storage Service Client...")
+            await r2_service.get_client()
+            logger.info("R2 Storage Service Client pre-warmed successfully!")
+    except Exception as e:
+        logger.error(f"Failed to pre-warm R2 Storage client during startup: {e}")
+
+    # Start the Draft Cleanup background worker
+    from app.workers.draft_cleanup import draft_cleanup_loop
+    task = asyncio.create_task(draft_cleanup_loop())
+    # Store on app state so shutdown can cancel it
+    app.state.draft_cleanup_task = task
+    logger.info("[DraftCleanup] Background worker task created.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    task = getattr(app.state, "draft_cleanup_task", None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("[DraftCleanup] Background worker task cancelled on shutdown.")
+
+
 
 
 

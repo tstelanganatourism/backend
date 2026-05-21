@@ -69,6 +69,8 @@ class PackageListDTO(AppBaseModel):
     slug: str
     title: str
     type: PackageType
+    duration: Optional[str] = None
+    place: Optional[str] = None
     region: Optional[RegionType] = None
     cover_image_url: Optional[str] = None
     is_featured: bool
@@ -133,6 +135,7 @@ class RoomListDTO(AppBaseModel):
     cover_image_url: Optional[str] = None
     is_featured: bool
     starting_price: Optional[Decimal] = None
+    starting_weekend_price: Optional[Decimal] = None
     address: Optional[str] = None
     map_url: Optional[str] = None
     facilities: List[str] = Field(default_factory=list)

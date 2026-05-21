@@ -16,9 +16,25 @@ def setup_exception_handlers(app: FastAPI):
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        def clean_value(val):
+            if isinstance(val, dict):
+                return {k: clean_value(v) for k, v in val.items()}
+            elif isinstance(val, list):
+                return [clean_value(v) for v in val]
+            elif isinstance(val, Exception):
+                return str(val)
+            elif not isinstance(val, (str, int, float, bool, type(None))):
+                return str(val)
+            return val
+
+        try:
+            errors = clean_value(exc.errors())
+        except Exception:
+            errors = str(exc)
+
         return JSONResponse(
             status_code=422,
-            content={"error": {"code": "VALIDATION_ERROR", "details": exc.errors()}}
+            content={"error": {"code": "VALIDATION_ERROR", "details": errors}}
         )
         
     @app.exception_handler(Exception)

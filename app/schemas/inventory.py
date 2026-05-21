@@ -29,7 +29,7 @@ class PackageInventoryUpdateRequest(AppBaseModel):
     """Partial update for a single (variant_id, date) inventory row."""
     total_capacity: Optional[int] = Field(None, ge=1, le=10000)
     is_closed: Optional[bool] = None
-    price_override: Optional[Decimal] = Field(None, ge=0)
+    price_override: Optional[Decimal] = Field(None)
 
 
 class PackageInventoryRow(AppBaseModel):
@@ -72,8 +72,9 @@ class PublicDateAvailability(AppBaseModel):
     variant_title: str
     adult_price: Decimal
     child_price: Decimal
-    # Effective price (price_override if set, else variant base price)
+    # Effective prices (price_override if set, else variant base price)
     effective_adult_price: Decimal
+    effective_child_price: Decimal
     available_seats: int
     is_closed: bool
     # Derived status for easy frontend consumption
@@ -85,3 +86,36 @@ class PublicPackageAvailabilityResponse(AppBaseModel):
     slug: str
     month: str  # "YYYY-MM"
     dates: List[PublicDateAvailability]
+
+
+# ─── Room Inventory Schemas ──────────────────────────────────────────────────
+
+class RoomInventoryGenerateRequest(AppBaseModel):
+    room_variant_id: int
+    from_date: date
+    to_date: date
+    override_total_rooms: Optional[int] = Field(None, ge=0, le=10000)
+
+
+class RoomInventoryUpdateRequest(AppBaseModel):
+    total_rooms: Optional[int] = Field(None, ge=0, le=10000)
+    is_closed: Optional[bool] = None
+
+
+class RoomInventoryRow(AppBaseModel):
+    id: int
+    room_variant_id: int
+    date: date
+    slot_start: str
+    slot_end: str
+    total_rooms: int
+    booked_rooms: int
+    available_rooms: int
+    is_closed: bool
+
+
+class RoomInventoryGenerateResponse(AppBaseModel):
+    created: int
+    skipped: int
+    message: str
+

@@ -3,6 +3,7 @@ User repository — async database operations for the users table.
 """
 from typing import Optional
 
+import bleach
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +11,14 @@ from app.models.user import User
 from app.models.enums import UserRole, AccountStatus
 from app.core.security import get_password_hash
 from app.core.timezone import get_ist_now
+
+
+def _sanitize_name(name: str) -> str:
+    """Strip all HTML tags from a name string as defense-in-depth."""
+    if not name:
+        return name
+    return bleach.clean(name, tags=[], strip=True).strip()
+
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
@@ -46,7 +55,7 @@ async def create_tourist_user(
 ) -> User:
     """Create a new tourist account. Hashes password before storage."""
     user = User(
-        full_name=full_name,
+        full_name=_sanitize_name(full_name),
         email=email,
         password_hash=get_password_hash(password),
         phone_number=phone_number,
@@ -69,7 +78,7 @@ async def create_google_user(
 ) -> User:
     """Create a tourist account from Google OAuth (no password)."""
     user = User(
-        full_name=full_name,
+        full_name=_sanitize_name(full_name),
         email=email,
         google_id=google_id,
         password_hash=None,

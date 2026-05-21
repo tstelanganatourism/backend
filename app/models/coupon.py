@@ -1,4 +1,5 @@
 from sqlalchemy import Column, String, Numeric, Integer, DateTime, Boolean, ForeignKey
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel
 
@@ -12,15 +13,13 @@ class Coupon(BaseModel):
     max_discount_amount = Column(Numeric(10, 2), nullable=True) # for percentage max cap
     usage_limit = Column(Integer, nullable=True)
     usage_count = Column(Integer, default=0, nullable=False)
-    package_id = Column(Integer, ForeignKey("packages.id", ondelete="SET NULL"), nullable=True) # RESTRICT TO SPECIFIC PACKAGE
+    applicable_package_ids = Column(ARRAY(Integer), default=[], nullable=False, server_default='{}')
+    applicable_room_ids = Column(ARRAY(Integer), default=[], nullable=False, server_default='{}')
     valid_from = Column(DateTime(timezone=True), nullable=True)
     valid_until = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
 
-    # Relationship to package (optional)
-    package = relationship("Package", backref="coupons")
-
-    def is_valid(self, booking_amount: float = 0.0, package_id: int = None) -> bool:
+    def is_valid(self, booking_amount: float = 0.0, target_type: str = None, target_id: int = None) -> bool:
         """
         Evaluate if this coupon is active and valid for redemption.
         Enforces:
@@ -54,7 +53,36 @@ class Coupon(BaseModel):
             return False
             
         # 5. Target product constraints check
-        if self.package_id is not None and (package_id is None or package_id != self.package_id):
-            return False
+        is_global = not self.applicable_package_ids and not self.applicable_room_ids
+        if is_global:
+            pass # Applies to all
+        else:
+            if target_type == 'PACKAGE':
+                if target_id not in (self.applicable_package_ids or []):
+                    return False
+            elif target_type == 'ROOM':
+                if target_id not in (self.applicable_room_ids or []):
+                    return False
+            else:
+                return False # Unknown target_type and coupon is restricted
             
         return True
+
+    def calculate_discount(self, booking_amount: float) -> float:
+        """
+        Calculate the exact discount amount for a given booking subtotal.
+        Never returns negative values. Applies max_discount_amount cap if PERCENTAGE.
+        """
+        if booking_amount <= 0:
+            return 0.0
+            
+        discount = 0.0
+        
+        if self.discount_type == 'FLAT':
+            discount = min(float(self.discount_value), booking_amount)
+        elif self.discount_type == 'PERCENTAGE':
+            discount = booking_amount * (float(self.discount_value) / 100.0)
+            if self.max_discount_amount is not None:
+                discount = min(discount, float(self.max_discount_amount))
+                
+        return max(0.0, discount)

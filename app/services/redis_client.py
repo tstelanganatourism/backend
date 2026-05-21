@@ -80,3 +80,45 @@ async def is_token_blacklisted(jti: str) -> bool:
     key = f"blacklist:{jti}"
     result = await client.exists(key)
     return bool(result)
+
+
+# ─── Package Availability Caching ────────────────────────────────────────────
+
+import json
+
+async def get_cached_availability(slug: str, month: str) -> Optional[dict]:
+    """Retrieve cached package availability JSON from Redis."""
+    try:
+        client = get_redis()
+        key = f"pkg_availability:{slug}:{month}"
+        data = await client.get(key)
+        if data:
+            return json.loads(data)
+    except Exception:
+        pass
+    return None
+
+async def set_cached_availability(slug: str, month: str, data: dict, ttl_seconds: int = 60) -> None:
+    """Cache package availability JSON in Redis with a TTL."""
+    try:
+        client = get_redis()
+        key = f"pkg_availability:{slug}:{month}"
+        await client.setex(key, ttl_seconds, json.dumps(data))
+    except Exception:
+        pass
+
+async def invalidate_cached_availability(slug: str) -> None:
+    """Invalidate all cached availability keys for a package slug."""
+    try:
+        client = get_redis()
+        cursor = 0
+        match = f"pkg_availability:{slug}:*"
+        while True:
+            cursor, keys = await client.scan(cursor, match=match)
+            if keys:
+                await client.delete(*keys)
+            if cursor == 0:
+                break
+    except Exception:
+        pass
+

@@ -1,10 +1,34 @@
 """
 Auth request/response schemas + User profile schemas — Phase-3.
 """
+import re
 from typing import Optional
-from pydantic import EmailStr, Field, field_validator
+from pydantic import EmailStr, Field, field_validator, ConfigDict
 from app.schemas.base import AppBaseModel, TimestampSchema
 from app.models.enums import UserRole, AccountStatus
+
+# ─── Shared Name Validation ──────────────────────────────────────────────────
+
+_NAME_REGEX = re.compile(r"^[A-Za-z\s'\-\.]{2,100}$")
+_DANGEROUS_PATTERNS = [
+    "<script", "javascript:", "onerror=", "onload=",
+    "iframe", "<img", "<", ">",
+]
+
+def _validate_human_name(v: str) -> str:
+    """Validate a human name — rejects XSS payloads, allows real names."""
+    if v is None:
+        return v
+    cleaned = v.strip()
+    if not cleaned:
+        raise ValueError("Name cannot be empty")
+    lower = cleaned.lower()
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern in lower:
+            raise ValueError("Name contains invalid characters")
+    if not _NAME_REGEX.match(cleaned):
+        raise ValueError("Name contains invalid characters")
+    return cleaned
 
 
 # ─── Base User ────────────────────────────────────────────────────────────────
@@ -28,10 +52,16 @@ class UserResponse(UserBase, TimestampSchema):
 # ─── Tourist Auth ─────────────────────────────────────────────────────────────
 
 class TouristSignupRequest(AppBaseModel):
+    model_config = ConfigDict(extra="forbid")
     full_name: str = Field(..., min_length=2, max_length=100)
     email: EmailStr
     password: str = Field(..., min_length=8, max_length=128)
     phone_number: Optional[str] = Field(None, max_length=20)
+
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def validate_full_name(cls, v: str) -> str:
+        return _validate_human_name(v)
 
     @field_validator("phone_number", mode="before")
     @classmethod
@@ -85,9 +115,17 @@ class UserMeResponse(AppBaseModel):
 
 
 class ProfileUpdateRequest(AppBaseModel):
+    model_config = ConfigDict(extra="forbid")
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
+
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def validate_full_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_human_name(v)
 
 
 class TokenResponse(AppBaseModel):

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Numeric, Integer, Boolean, ForeignKey, UniqueConstraint, Table, Enum as SQLEnum, Date, CheckConstraint, BigInteger, Index
+from sqlalchemy import Column, String, Numeric, Integer, Boolean, ForeignKey, UniqueConstraint, Table, Enum as SQLEnum, Date, CheckConstraint, BigInteger, Index, text
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel, SortableMixin, SEOMixin
 from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus
@@ -18,6 +18,8 @@ class Package(BaseModel, SEOMixin):
     title = Column(String, nullable=False)
     slug = Column(String, unique=True, nullable=False, index=True)
     description = Column(String, nullable=True)
+    duration = Column(String, nullable=True)
+    place = Column(String, nullable=True)
     cover_image_url = Column(String, nullable=True)
     brochure_pdf_url = Column(String, nullable=True)
     generated_brochure_url = Column(String, nullable=True)
@@ -43,6 +45,9 @@ class Package(BaseModel, SEOMixin):
         Index("ix_packages_public_priority", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_packages_public_featured", "is_featured", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_packages_admin_listing", "deleted_at", "status", "order_priority", "created_at"),
+        # Partial exact filters for storefront
+        Index("ix_packages_type_region", "type", "region", "is_active", "order_priority", postgresql_where=text("deleted_at IS NULL")),
+        Index("ix_packages_fts", text("to_tsvector('english'::regconfig, title || ' ' || coalesce(description, ''))"), postgresql_using='gin'),
     )
 
 class PackageGalleryImage(BaseModel, SortableMixin):
@@ -140,6 +145,7 @@ class PackageVariantInventory(BaseModel):
     date = Column(Date, nullable=False, index=True)
     total_capacity = Column(Integer, nullable=False, default=500, server_default="500")
     booked_count = Column(Integer, default=0, server_default="0", nullable=False)
+    reserved_count = Column(Integer, default=0, server_default="0", nullable=False)
     # Admin can manually close a date regardless of remaining seats
     is_closed = Column(Boolean, default=False, server_default="false", nullable=False)
     # Optional per-date price override (overrides variant base price for that date)
@@ -147,7 +153,7 @@ class PackageVariantInventory(BaseModel):
 
     __table_args__ = (
         UniqueConstraint('variant_id', 'date', name='uq_variant_inventory'),
-        CheckConstraint("booked_count <= total_capacity", name="chk_variant_capacity"),
+        CheckConstraint("booked_count + reserved_count <= total_capacity", name="chk_variant_capacity"),
     )
 
     variant = relationship("PackageVariant", back_populates="inventory")

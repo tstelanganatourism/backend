@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text
 from typing import List, Optional
 from app.db.session import get_db
 from app.models.package import (
@@ -80,11 +80,9 @@ async def list_packages(
     base_query = select(Package).where(Package.deleted_at.is_(None))
     
     if search:
+        fts_vector = func.to_tsvector(text("'english'::regconfig"), Package.title + ' ' + func.coalesce(Package.description, ''))
         base_query = base_query.where(
-            or_(
-                Package.title.ilike(f"%{search}%"),
-                Package.description.ilike(f"%{search}%")
-            )
+            fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), search))
         )
         
     if status_filter:
@@ -458,14 +456,27 @@ async def publish_package(
     package.brochure_generation_status = DocumentGenerationStatus.QUEUED
     await db.commit()
 
-    from app.worker import get_arq_pool
-    import uuid
-    arq_pool = await get_arq_pool()
-    await arq_pool.enqueue_job(
-        "generate_package_brochure_task", 
-        package.id, 
-        _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
-    )
+    from app.services.pdf_generator import generate_package_brochure_task
+    from app.core.config import settings
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"Local development mode: triggering brochure generation task for package {package.id} inline via FastAPI BackgroundTasks.")
+        background_tasks.add_task(generate_package_brochure_task, None, package.id)
+    else:
+        try:
+            from app.worker import get_arq_pool
+            import uuid
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job(
+                "generate_package_brochure_task", 
+                package.id, 
+                _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
+            )
+        except Exception as e:
+            logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
+            background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
     # Re-query the package with eager loads to prevent expired attributes during Pydantic serialization
     refresh_result = await db.execute(query)
@@ -590,14 +601,27 @@ async def regenerate_brochure(
     package.brochure_generation_status = DocumentGenerationStatus.QUEUED
     await db.commit()
     
-    from app.worker import get_arq_pool
-    import uuid
-    arq_pool = await get_arq_pool()
-    await arq_pool.enqueue_job(
-        "generate_package_brochure_task", 
-        package.id, 
-        _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
-    )
+    from app.services.pdf_generator import generate_package_brochure_task
+    from app.core.config import settings
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"Local development: triggering brochure regeneration for package {package.id} inline via FastAPI BackgroundTasks.")
+        background_tasks.add_task(generate_package_brochure_task, None, package.id)
+    else:
+        try:
+            from app.worker import get_arq_pool
+            import uuid
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job(
+                "generate_package_brochure_task", 
+                package.id, 
+                _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
+            )
+        except Exception as e:
+            logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
+            background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
     await log_action(db, current_admin.id, "REGENERATE_BROCHURE", "Package", str(package.id), {"title": package.title})
     await db.commit()

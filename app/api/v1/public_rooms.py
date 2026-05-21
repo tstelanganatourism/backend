@@ -1,11 +1,13 @@
 from typing import Optional, List
+from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text, and_
 from sqlalchemy.orm import selectinload
+from pydantic import BaseModel
 
 from app.db.session import get_db
-from app.models.room import Room, RoomVariant
+from app.models.room import Room, RoomVariant, RoomSlotInventory
 from app.schemas.public import PaginatedResponse, RoomListDTO, RoomDetailDTO, RoomVariantPublicDTO
 from app.utils.cache import set_public_cache_headers, ttl_cache_get_or_set
 from app.models.enums import PublishStatus
@@ -13,12 +15,32 @@ from app.models.enums import PublishStatus
 router = APIRouter()
 PUBLIC_CACHE_TTL_SECONDS = 60
 
+
+# ── Room Availability Schemas ─────────────────────────────────────────────────
+
+class RoomDateAvailability(BaseModel):
+    date: date
+    variant_id: int
+    variant_name: str
+    slot_start: str
+    slot_end: str
+    total_rooms: int
+    available_rooms: int
+    is_closed: bool
+    status: str  # OPEN, CLOSED, SOLD_OUT, NO_INVENTORY
+
+class RoomAvailabilityResponse(BaseModel):
+    room_id: int
+    slug: str
+    month: str
+    dates: List[RoomDateAvailability]
+
 @router.get("", response_model=PaginatedResponse[RoomListDTO])
 async def get_rooms(
     response: Response,
     db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1, description="Page number"),
-    size: int = Query(10, ge=1, le=50, description="Items per page"),
+    size: int = Query(10, ge=1, le=100, description="Items per page"),
     is_featured: Optional[bool] = Query(None, description="Filter featured only"),
     facilities: Optional[List[str]] = Query(None, description="Filter by facilities"),
     sort: Optional[str] = Query("priority", description="Sort by: priority, price_low, price_high"),
@@ -45,13 +67,9 @@ async def get_rooms(
         if is_featured is not None:
             base_query = base_query.where(Room.is_featured == is_featured)
         if q:
-            search_pattern = f"%{q}%"
+            fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
             base_query = base_query.where(
-                or_(
-                    Room.lodge_name.ilike(search_pattern),
-                    Room.address.ilike(search_pattern),
-                    Room.description.ilike(search_pattern)
-                )
+                fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
             )
         
         if facilities:
@@ -100,6 +118,7 @@ async def get_rooms(
         dto_list = []
         for r in rooms:
             starting_price = min((v.weekday_price for v in r.variants), default=None)
+            starting_weekend_price = min((v.weekend_price for v in r.variants), default=None)
             
             dto_list.append(RoomListDTO(
                 id=r.id,
@@ -108,6 +127,7 @@ async def get_rooms(
                 cover_image_url=r.cover_image_url,
                 is_featured=r.is_featured,
                 starting_price=starting_price,
+                starting_weekend_price=starting_weekend_price,
                 address=r.address,
                 map_url=r.map_url,
                 facilities=r.facilities if r.facilities else []
@@ -212,3 +232,136 @@ async def get_room_detail(
         )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_room_detail)
+
+
+@router.get("/{slug}/availability", response_model=RoomAvailabilityResponse)
+async def get_room_availability(
+    slug: str,
+    response: Response,
+    month: str = Query(..., description="Month in YYYY-MM format, e.g. 2026-06"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public availability endpoint for a room's detail page.
+    Returns per-date inventory status for all active variants within the requested month.
+    
+    Business rules:
+    - Today and past dates excluded (no same-day booking).
+    - Dates with is_closed=True → CLOSED.
+    - Dates with available_rooms=0 → SOLD_OUT.
+    - Dates with no inventory row → NO_INVENTORY (disabled in calendar).
+    """
+    from app.core.timezone import ist_date_today
+    set_public_cache_headers(response)
+    today = ist_date_today()
+
+    # Validate month format
+    try:
+        year, mon = int(month[:4]), int(month[5:7])
+        from_date = date(year, mon, 1)
+        if mon == 12:
+            to_date = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            to_date = date(year, mon + 1, 1) - timedelta(days=1)
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format.")
+
+    # Load room with active variants
+    result = await db.execute(
+        select(Room)
+        .where(
+            Room.slug == slug,
+            Room.status == PublishStatus.PUBLISHED,
+            Room.is_active == True,
+            Room.deleted_at.is_(None),
+        )
+        .options(selectinload(Room.variants.and_(RoomVariant.is_active == True, RoomVariant.deleted_at == None)))
+    )
+    room = result.scalar_one_or_none()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found or inactive.")
+
+    active_variants = [v for v in room.variants if v.is_active and v.deleted_at is None]
+    if not active_variants:
+        return RoomAvailabilityResponse(room_id=room.id, slug=room.slug, month=month, dates=[])
+
+    variant_ids = [v.id for v in active_variants]
+    variant_map = {v.id: v for v in active_variants}
+
+    # Fetch all inventory rows for these variants in the month
+    inv_result = await db.execute(
+        select(RoomSlotInventory).where(
+            and_(
+                RoomSlotInventory.room_variant_id.in_(variant_ids),
+                RoomSlotInventory.date >= from_date,
+                RoomSlotInventory.date <= to_date,
+            )
+        ).order_by(RoomSlotInventory.date.asc(), RoomSlotInventory.room_variant_id.asc())
+    )
+    inv_rows = inv_result.scalars().all()
+
+    # Build map: (variant_id, date) -> list of inventory rows (one per slot)
+    inv_map: dict[tuple, list] = {}
+    for row in inv_rows:
+        key = (row.room_variant_id, row.date)
+        if key not in inv_map:
+            inv_map[key] = []
+        inv_map[key].append(row)
+
+    availability: list[RoomDateAvailability] = []
+
+    # Walk every date in the month, for every variant
+    current = from_date
+    while current <= to_date:
+        if current <= today:
+            current += timedelta(days=1)
+            continue
+
+        for variant in active_variants:
+            inv_rows_for_day = inv_map.get((variant.id, current), [])
+            
+            if not inv_rows_for_day:
+                # No inventory row at all → NO_INVENTORY
+                slot_start = str(room.slot_start) if room.slot_start else "12:00"
+                slot_end = str(room.slot_end) if room.slot_end else "11:00"
+                availability.append(RoomDateAvailability(
+                    date=current,
+                    variant_id=variant.id,
+                    variant_name=variant.variant_name,
+                    slot_start=slot_start,
+                    slot_end=slot_end,
+                    total_rooms=0,
+                    available_rooms=0,
+                    is_closed=False,
+                    status="NO_INVENTORY",
+                ))
+            else:
+                for inv in inv_rows_for_day:
+                    avail = max(0, inv.total_rooms - inv.booked_rooms - inv.reserved_rooms)
+                    if inv.is_closed:
+                        s = "CLOSED"
+                    elif avail <= 0:
+                        s = "SOLD_OUT"
+                    else:
+                        s = "OPEN"
+                    availability.append(RoomDateAvailability(
+                        date=current,
+                        variant_id=variant.id,
+                        variant_name=variant.variant_name,
+                        slot_start=str(inv.slot_start),
+                        slot_end=str(inv.slot_end),
+                        total_rooms=inv.total_rooms,
+                        available_rooms=avail,
+                        is_closed=inv.is_closed,
+                        status=s,
+                    ))
+
+        current += timedelta(days=1)
+
+    return RoomAvailabilityResponse(
+        room_id=room.id,
+        slug=room.slug,
+        month=month,
+        dates=availability,
+    )
+

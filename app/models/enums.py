@@ -28,17 +28,19 @@ class GenderType(str, enum.Enum):
     OTHER = 'OTHER'
 
 class BookingSource(str, enum.Enum):
-    PUBLIC = 'PUBLIC'
+    USER = 'USER'
     AGENT = 'AGENT'
-    OFFLINE = 'OFFLINE'
+    ADMIN = 'ADMIN'
+    ADMIN_DIRECT = 'ADMIN_DIRECT'
+    PUBLIC = 'USER' # Backwards compatibility alias
 
 class BookingStatus(str, enum.Enum):
     PENDING = 'PENDING'
-    CONFIRMED = 'CONFIRMED'
-    PENDING_CANCELLATION = 'PENDING_CANCELLATION'
+    PARTIAL_PAID = 'PARTIAL_PAID'
+    FULLY_PAID = 'FULLY_PAID'
     CANCELLED = 'CANCELLED'
     REFUNDED = 'REFUNDED'
-    FAILED = 'FAILED'
+    CONFIRMED = 'FULLY_PAID' # Backwards compatibility alias
 
 class PaymentStatus(str, enum.Enum):
     CREATED = 'CREATED'

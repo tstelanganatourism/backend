@@ -132,6 +132,7 @@ def _build_token_response(user, response: Response, admin: bool = False) -> dict
             "role": user.role,
             "account_status": user.account_status,
             "phone_number": user.phone_number,
+            "avatar_url": user.avatar_url,
         },
     }
 
@@ -182,16 +183,17 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
 
 async def _send_admin_otp_email(email: str, full_name: str, otp: str):
     """Send an OTP email via Resend."""
-    logger.info(f"===========================================================")
-    logger.info(f"ADMIN LOGIN OTP FOR {email}: {otp}")
-    logger.info(f"===========================================================")
-    
-    # Write to current_otp.txt in development mode for programmatic verification
-    try:
-        with open("current_otp.txt", "w") as f:
-            f.write(otp)
-    except Exception as e:
-        logger.error(f"Failed to write OTP to current_otp.txt: {str(e)}")
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"===========================================================")
+        logger.info(f"ADMIN LOGIN OTP FOR {email}: {otp}")
+        logger.info(f"===========================================================")
+        
+        # Write to current_otp.txt in development mode for programmatic verification
+        try:
+            with open("current_otp.txt", "w") as f:
+                f.write(otp)
+        except Exception as e:
+            logger.error(f"Failed to write OTP to current_otp.txt: {str(e)}")
 
     if not settings.RESEND_API_KEY:
         logger.warning("No RESEND_API_KEY found, skipping actual email send.")
@@ -329,7 +331,8 @@ async def forgot_password(
     # Generate and store OTP (10 min expiry)
     otp = generate_otp()
     await store_otp(user.id, otp, expire_seconds=600)
-    logger.info(f"Generated OTP {otp} for user {user.email}")
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"Generated OTP {otp} for user {user.email}")
     
     # Send email
     success = await _send_password_reset_otp_email(user.email, user.full_name, otp)
@@ -571,7 +574,7 @@ async def admin_verify_otp(
 # SHARED ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@router.post("/refresh", response_model=RefreshResponse)
+@router.post("/refresh", response_model=TokenResponse)
 async def refresh_access_token(
     request: Request,
     response: Response,
@@ -632,7 +635,19 @@ async def refresh_access_token(
     # Set the new refresh token in the cookie
     _set_refresh_cookie(response, new_refresh_token, max_age_seconds=refresh_max_age)
 
-    return {"access_token": new_access_token, "token_type": "bearer"}
+    return {
+        "access_token": new_access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": user.role,
+            "account_status": user.account_status,
+            "phone_number": user.phone_number,
+            "avatar_url": user.avatar_url,
+        },
+    }
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -685,8 +700,9 @@ async def update_me(
     db: AsyncSession = Depends(get_db)
 ):
     """Update the authenticated user's profile."""
+    import bleach
     if body.full_name is not None:
-        current_user.full_name = body.full_name
+        current_user.full_name = bleach.clean(body.full_name, tags=[], strip=True).strip()
     if body.phone_number is not None:
         current_user.phone_number = body.phone_number
     if body.avatar_url is not None:

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text
 from typing import List, Optional
 from datetime import time
 
@@ -103,12 +103,9 @@ async def list_rooms(
     base_query = select(Room).where(Room.deleted_at.is_(None))
     
     if search:
+        fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
         base_query = base_query.where(
-            or_(
-                Room.lodge_name.ilike(f"%{search}%"),
-                Room.description.ilike(f"%{search}%"),
-                Room.address.ilike(f"%{search}%")
-            )
+            fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), search))
         )
         
     if status_filter:

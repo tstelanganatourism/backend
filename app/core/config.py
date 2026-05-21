@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
+
+    # Sentry
+    SENTRY_DSN: Optional[str] = None
     
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

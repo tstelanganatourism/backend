@@ -26,6 +26,7 @@ from app.schemas.agent import (
     AgentDetailResponse,
     AgentBookingMetrics,
     AgentResetPassword,
+    AgentPaginatedResponse,
 )
 from app.middleware.auth import require_admin
 from app.core.security import get_password_hash
@@ -41,7 +42,7 @@ router = APIRouter(
 
 # ─── List Agents ─────────────────────────────────────────────────────────────
 
-@router.get("", response_model=List[AgentResponse])
+@router.get("", response_model=AgentPaginatedResponse)
 async def list_agents(
     search: Optional[str] = Query(None, description="Search by name, email, or phone"),
     status_filter: Optional[str] = Query(None, description="ACTIVE, BLOCKED, DISABLED"),
@@ -52,6 +53,12 @@ async def list_agents(
     db: AsyncSession = Depends(get_db),
 ):
     """List all agents with optional search, filtering, and sorting."""
+    # Count Query
+    count_query = select(func.count(User.id)).where(
+        User.role == UserRole.AGENT,
+        User.deleted_at.is_(None)
+    )
+
     query = select(User).where(
         User.role == UserRole.AGENT,
         User.deleted_at.is_(None),
@@ -68,16 +75,31 @@ async def list_agents(
                 User.company_name.ilike(search_term),
             )
         )
+        count_query = count_query.where(
+            or_(
+                User.full_name.ilike(search_term),
+                User.email.ilike(search_term),
+                User.phone_number.ilike(search_term),
+                User.company_name.ilike(search_term),
+            )
+        )
 
     # Status filter
     if status_filter:
         status_upper = status_filter.upper()
         if status_upper == "ACTIVE":
             query = query.where(User.account_status == AccountStatus.ACTIVE)
+            count_query = count_query.where(User.account_status == AccountStatus.ACTIVE)
         elif status_upper == "BLOCKED":
             query = query.where(User.account_status == AccountStatus.BLOCKED)
+            count_query = count_query.where(User.account_status == AccountStatus.BLOCKED)
         elif status_upper == "DISABLED":
             query = query.where(User.account_status == AccountStatus.DISABLED)
+            count_query = count_query.where(User.account_status == AccountStatus.DISABLED)
+
+    # Execute count
+    total_result = await db.execute(count_query)
+    total_count = total_result.scalar_one()
 
     # Sorting
     sort_column = getattr(User, sort_by, User.created_at)
@@ -90,7 +112,12 @@ async def list_agents(
     result = await db.execute(query)
     agents = result.scalars().all()
 
-    return [_to_response(a) for a in agents]
+    return {
+        "items": [_to_response(a) for a in agents],
+        "total": total_count,
+        "page": (offset // limit) + 1 if limit > 0 else 1,
+        "size": limit
+    }
 
 
 # ─── Get Single Agent (with metrics) ─────────────────────────────────────────
@@ -150,7 +177,9 @@ async def create_agent(
         role=UserRole.AGENT,
         account_status=AccountStatus.ACTIVE,
         is_active=True,
+        commission_type=body.commission_type,
         commission_percentage=body.commission_percentage,
+        commission_fixed_amount=body.commission_fixed_amount,
         company_name=body.company_name,
         gst_number=body.gst_number,
         address=body.address,
@@ -383,7 +412,9 @@ def _to_response(agent: User) -> AgentResponse:
         role=agent.role.value if hasattr(agent.role, 'value') else str(agent.role),
         account_status=agent.account_status.value if hasattr(agent.account_status, 'value') else str(agent.account_status),
         is_active=agent.is_active,
+        commission_type=agent.commission_type or "PERCENTAGE",
         commission_percentage=agent.commission_percentage,
+        commission_fixed_amount=agent.commission_fixed_amount,
         company_name=agent.company_name,
         gst_number=agent.gst_number,
         address=agent.address,

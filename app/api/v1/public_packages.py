@@ -2,7 +2,7 @@ from typing import Optional, List
 from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, and_
+from sqlalchemy import select, func, or_, and_, text
 from sqlalchemy.orm import selectinload
 
 from app.core.timezone import ist_date_today
@@ -13,6 +13,7 @@ from app.models.enums import PackageType, RegionType, PublishStatus
 from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO
 from app.schemas.inventory import PublicDateAvailability, PublicPackageAvailabilityResponse
 from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
+from app.utils.pricing import get_effective_package_prices
 
 router = APIRouter()
 PUBLIC_CACHE_TTL_SECONDS = 60
@@ -31,11 +32,12 @@ async def get_packages(
     response: Response,
     db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1, description="Page number"),
-    size: int = Query(10, ge=1, le=50, description="Items per page"),
+    size: int = Query(10, ge=1, le=100, description="Items per page"),
     type: Optional[PackageType] = Query(None, description="Filter by TOUR or TRIP"),
     region: Optional[RegionType] = Query(None, description="Filter by AP or TS"),
     is_featured: Optional[bool] = Query(None, description="Filter featured only"),
     tags: Optional[List[str]] = Query(None, description="Filter by tags"),
+    place: Optional[str] = Query(None, description="Filter by place"),
     sort: Optional[str] = Query("priority", description="Sort by: priority, price_low, price_high"),
     q: Optional[str] = Query(None, description="Search term for title/description")
 ):
@@ -43,7 +45,7 @@ async def get_packages(
     Public Package Discovery API.
     Returns a paginated list of active packages, properly eagerly loading variants for starting_price.
     """
-    cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{sort}:{q or ''}"
+    cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}"
     set_public_cache_headers(response)
 
     async def load_packages() -> PaginatedResponse[PackageListDTO]:
@@ -63,14 +65,18 @@ async def get_packages(
             base_query = base_query.where(Package.region == region)
         if is_featured is not None:
             base_query = base_query.where(Package.is_featured == is_featured)
-        
-        if q:
-            search_pattern = f"%{q}%"
+        if place:
             base_query = base_query.where(
                 or_(
-                    Package.title.ilike(search_pattern),
-                    Package.description.ilike(search_pattern)
+                    Package.place == place,
+                    Package.tags.any(Tag.name.ilike(f"%{place}%"))
                 )
+            )
+        
+        if q:
+            fts_vector = func.to_tsvector(text("'english'::regconfig"), Package.title + ' ' + func.coalesce(Package.description, ''))
+            base_query = base_query.where(
+                fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
             )
         
         if tags:
@@ -134,6 +140,8 @@ async def get_packages(
                 slug=pkg.slug,
                 title=pkg.title,
                 type=pkg.type,
+                duration=pkg.duration,
+                place=pkg.place,
                 region=pkg.region,
                 cover_image_url=pkg.cover_image_url,
                 is_featured=pkg.is_featured,
@@ -227,16 +235,14 @@ async def get_package_detail(
             slug=pkg.slug,
             title=pkg.title,
             type=pkg.type,
+            duration=pkg.duration,
+            place=pkg.place,
             region=pkg.region,
             description=pkg.description,
             brochure_pdf_url=brochure_url,
             generated_brochure_url=gen_brochure_url,
             cover_image_url=pkg.cover_image_url,
-            order_priority=pkg.order_priority,
             is_featured=pkg.is_featured,
-            is_active=pkg.is_active,
-            created_at=pkg.created_at,
-            updated_at=pkg.updated_at,
             tags=[tag.name for tag in pkg.tags if tag.is_active],
             starting_price=starting_price,
             meta_title=pkg.meta_title,
@@ -310,6 +316,12 @@ async def get_package_availability(
     set_no_store_headers(response)
     today = ist_date_today()
 
+    # Check Redis cache first
+    from app.services.redis_client import get_cached_availability
+    cached = await get_cached_availability(slug, month)
+    if cached is not None:
+        return cached
+
     # Validate month format
     try:
         year, mon = int(month[:4]), int(month[5:7])
@@ -338,9 +350,12 @@ async def get_package_availability(
 
     active_variants = get_active_paid_variants(pkg)
     if not active_variants:
-        return PublicPackageAvailabilityResponse(
+        res_data = PublicPackageAvailabilityResponse(
             package_id=pkg.id, slug=pkg.slug, month=month, dates=[]
         )
+        from app.services.redis_client import set_cached_availability
+        await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+        return res_data
 
     variant_ids = [v.id for v in active_variants]
     variant_map = {v.id: v for v in active_variants}
@@ -379,6 +394,7 @@ async def get_package_availability(
             base_child = variant.child_price
 
             if inv is None:
+                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, None)
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -386,13 +402,15 @@ async def get_package_availability(
                         variant_title=variant.title,
                         adult_price=base_adult,
                         child_price=base_child,
-                        effective_adult_price=base_adult,
+                        effective_adult_price=eff_adult,
+                        effective_child_price=eff_child,
                         available_seats=0,
                         is_closed=False,
                         status="NO_INVENTORY",
                     )
                 )
             elif inv.is_closed:
+                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, inv.price_override)
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -400,14 +418,16 @@ async def get_package_availability(
                         variant_title=variant.title,
                         adult_price=base_adult,
                         child_price=base_child,
-                        effective_adult_price=inv.price_override or base_adult,
-                        available_seats=max(0, inv.total_capacity - inv.booked_count),
+                        effective_adult_price=eff_adult,
+                        effective_child_price=eff_child,
+                        available_seats=max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count)),
                         is_closed=True,
                         status="CLOSED",
                     )
                 )
             else:
-                avail_seats = max(0, inv.total_capacity - inv.booked_count)
+                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, inv.price_override)
+                avail_seats = max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count))
                 slot_status = "OPEN" if avail_seats > 0 else "SOLD_OUT"
                 availability.append(
                     PublicDateAvailability(
@@ -416,7 +436,8 @@ async def get_package_availability(
                         variant_title=variant.title,
                         adult_price=base_adult,
                         child_price=base_child,
-                        effective_adult_price=inv.price_override or base_adult,
+                        effective_adult_price=eff_adult,
+                        effective_child_price=eff_child,
                         available_seats=avail_seats,
                         is_closed=False,
                         status=slot_status,
@@ -425,9 +446,48 @@ async def get_package_availability(
 
         current += timedelta(days=1)
 
-    return PublicPackageAvailabilityResponse(
+    res_data = PublicPackageAvailabilityResponse(
         package_id=pkg.id,
         slug=pkg.slug,
         month=month,
         dates=availability,
     )
+    from app.services.redis_client import set_cached_availability
+    await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+    return res_data
+
+
+@router.get("/places/all", response_model=List[str])
+async def get_unique_places(db: AsyncSession = Depends(get_db)):
+    """
+    Returns a distinct list of all places dynamically configured in the active packages database,
+    falling back to known place tags to bootstrap immediately.
+    """
+    # 1. Get explicit places from Package.place column
+    result = await db.execute(
+        select(Package.place)
+        .where(
+            Package.status == PublishStatus.PUBLISHED,
+            Package.is_active == True,
+            Package.deleted_at.is_(None),
+            Package.place.is_not(None),
+            Package.place != ""
+        )
+        .distinct()
+    )
+    explicit_places = [row[0] for row in result.all() if row[0]]
+    
+    # 2. Add dynamic fallback/bootstrap place tags that actually exist in tags table
+    bootstrap_names = ["Rajahmundry", "Bhadrachalam", "Papikondalu", "Kolluru"]
+    tag_result = await db.execute(
+        select(Tag.name)
+        .where(Tag.name.in_(bootstrap_names))
+    )
+    existing_tags = [row[0] for row in tag_result.all() if row[0]]
+    
+    all_places = list(set(explicit_places + existing_tags))
+    if not all_places:
+        all_places = bootstrap_names
+        
+    return sorted(all_places)
+

@@ -161,6 +161,8 @@ class PackageBase(AppBaseModel):
     type: PackageType
     region: Optional[RegionType] = None
     description: Optional[str] = None
+    duration: Optional[str] = None
+    place: Optional[str] = None
     cover_image_url: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
@@ -202,6 +204,8 @@ class PackageUpdate(AppBaseModel):
     type: Optional[PackageType] = None
     region: Optional[RegionType] = None
     description: Optional[str] = None
+    duration: Optional[str] = None
+    place: Optional[str] = None
     cover_image_url: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
