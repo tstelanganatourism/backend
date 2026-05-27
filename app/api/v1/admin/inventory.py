@@ -57,16 +57,19 @@ def _compute_row(row: PackageVariantInventory) -> PackageInventoryRow:
 
 async def _clear_package_cache_for_variant(db: AsyncSession, variant_id: int) -> None:
     result = await db.execute(
-        select(Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
+        select(Package.id, Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
             PackageVariant.id == variant_id
         )
     )
-    slug = result.scalar_one_or_none()
-    clear_cache_prefix("packages:list:")
-    if slug:
+    row = result.first()
+    if row:
+        pkg_id, slug = row
+        clear_cache_prefix("packages:list:")
         clear_cache_prefix(f"packages:detail:{slug}")
         from app.services.redis_client import invalidate_cached_availability
         await invalidate_cached_availability(slug)
+        from app.utils.cache import trigger_frontend_revalidation
+        trigger_frontend_revalidation(tags=[f"package-{pkg_id}"])
 
 
 # ─── Generate inventory rows ──────────────────────────────────────────────────
@@ -96,10 +99,10 @@ async def generate_package_inventory(
         raise HTTPException(status_code=404, detail="Package variant not found.")
 
     # Date range validation
-    if body.from_date <= today:
+    if body.from_date < today:
         raise HTTPException(
             status_code=400,
-            detail=f"from_date must be a future date (after today: {today})."
+            detail=f"from_date must be today or a future date (today: {today})."
         )
     if body.to_date < body.from_date:
         raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
@@ -252,10 +255,10 @@ async def update_inventory_row(
     The date must already exist (generated first).
     """
     today = ist_date_today()
-    if inv_date <= today:
+    if inv_date < today:
         raise HTTPException(
             status_code=400,
-            detail="Cannot modify inventory for today or past dates."
+            detail="Cannot modify inventory for past dates."
         )
 
     result = await db.execute(
@@ -290,6 +293,30 @@ async def update_inventory_row(
 
     await db.commit()
     await db.refresh(row)
+    
+    # Broadcast SSE for Admin Inventory Edit
+    import time
+    from app.core.timezone import get_ist_now
+    from app.utils.sse import sse_manager
+    variant_res = await db.execute(select(PackageVariant).where(PackageVariant.id == variant_id))
+    variant = variant_res.scalar_one_or_none()
+    if variant:
+        from app.api.v1.public_packages import get_effective_package_prices
+        eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, row.price_override)
+        sse_payload = {
+            "version": int(time.time() * 1000),
+            "timestamp": get_ist_now().isoformat(),
+            "package_id": variant.package_id,
+            "travel_date": str(inv_date),
+            "available": row.total_capacity - (row.booked_count + row.reserved_count),
+            "reserved": row.reserved_count,
+            "booked": row.booked_count,
+            "is_closed": row.is_closed,
+            "effective_adult_price": float(eff_adult),
+            "effective_child_price": float(eff_child),
+            "variant_id": variant_id
+        }
+        await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
 
     await log_action(
         db=db,
@@ -427,10 +454,10 @@ async def generate_room_inventory(
             )
         )
 
-    if body.from_date <= today:
+    if body.from_date < today:
         raise HTTPException(
             status_code=400,
-            detail=f"from_date must be a future date (after today: {today})."
+            detail=f"from_date must be today or a future date (today: {today})."
         )
     if body.to_date < body.from_date:
         raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
@@ -450,8 +477,34 @@ async def generate_room_inventory(
         else variant.total_rooms
     )
 
+    from datetime import time
+
+    # Parse room.booking_slots if present, else fallback to parent room.slot_start/slot_end
+    slots_to_generate = []
+    if room.booking_slots and isinstance(room.booking_slots, list):
+        for slot in room.booking_slots:
+            if isinstance(slot, dict) and "slot_start" in slot and "slot_end" in slot:
+                try:
+                    def parse_time(t_str: str) -> time:
+                        parts = [int(p) for p in t_str.split(':')]
+                        if len(parts) == 2:
+                            return time(parts[0], parts[1])
+                        elif len(parts) >= 3:
+                            return time(parts[0], parts[1], parts[2])
+                        else:
+                            raise ValueError()
+                    start_t = parse_time(slot["slot_start"])
+                    end_t = parse_time(slot["slot_end"])
+                    slots_to_generate.append((start_t, end_t))
+                except Exception:
+                    pass
+
+    if not slots_to_generate:
+        slots_to_generate.append((room.slot_start, room.slot_end))
+
+    # Query existing (date, slot_start, slot_end) combinations for idempotency
     existing_result = await db.execute(
-        select(RoomSlotInventory.date).where(
+        select(RoomSlotInventory.date, RoomSlotInventory.slot_start, RoomSlotInventory.slot_end).where(
             and_(
                 RoomSlotInventory.room_variant_id == body.room_variant_id,
                 RoomSlotInventory.date >= body.from_date,
@@ -459,26 +512,28 @@ async def generate_room_inventory(
             )
         )
     )
-    existing_dates = {r for (r,) in existing_result.all()}
+    existing_slots = {(r[0], r[1], r[2]) for r in existing_result.all()}
 
     created = 0
     skipped = 0
     current = body.from_date
 
     while current <= body.to_date:
-        if current in existing_dates:
-            skipped += 1
-        else:
-            db.add(RoomSlotInventory(
-                room_variant_id=body.room_variant_id,
-                date=current,
-                slot_start=room.slot_start,
-                slot_end=room.slot_end,
-                total_rooms=effective_total_rooms,
-                booked_rooms=0,
-                is_closed=False,
-            ))
-            created += 1
+        for s_start, s_end in slots_to_generate:
+            if (current, s_start, s_end) in existing_slots:
+                skipped += 1
+            else:
+                db.add(RoomSlotInventory(
+                    room_variant_id=body.room_variant_id,
+                    date=current,
+                    slot_start=s_start,
+                    slot_end=s_end,
+                    total_rooms=effective_total_rooms,
+                    booked_rooms=0,
+                    reserved_rooms=0,
+                    is_closed=False,
+                ))
+                created += 1
         current += timedelta(days=1)
 
     await db.commit()
@@ -565,10 +620,10 @@ async def update_room_inventory_row(
     Hard rule: total_rooms cannot be reduced below booked_rooms.
     """
     today = ist_date_today()
-    if inv_date <= today:
+    if inv_date < today:
         raise HTTPException(
             status_code=400,
-            detail="Cannot modify inventory for today or past dates."
+            detail="Cannot modify inventory for past dates."
         )
 
     result = await db.execute(

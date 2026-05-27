@@ -309,6 +309,8 @@ async def update_package(
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{old_slug}")
     clear_cache_prefix(f"packages:detail:{package.slug}")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
     
     return package
 
@@ -342,6 +344,8 @@ async def delete_package(
     await db.commit()
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{package.slug}")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
     
     return None
 
@@ -450,6 +454,8 @@ async def publish_package(
     await db.commit()
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{package.slug}")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
     
     # ─── Document Architecture Trigger ─────────────────────────────
     from app.models.enums import DocumentGenerationStatus

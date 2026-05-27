@@ -130,10 +130,15 @@ async def get_packages(
         packages = result.scalars().all()
 
         # Map to DTOs
+        from app.services.r2_storage import r2_service
+
         dto_list = []
         for pkg in packages:
             # Calculate Starting Price
             starting_price = min((v.adult_price for v in pkg.variants), default=None)
+            active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
+            brochure_url = await r2_service.get_public_url(active_brochure_key)
+            gen_brochure_url = await r2_service.get_public_url(pkg.generated_brochure_url)
             
             dto = PackageListDTO(
                 id=pkg.id,
@@ -143,6 +148,8 @@ async def get_packages(
                 duration=pkg.duration,
                 place=pkg.place,
                 region=pkg.region,
+                brochure_pdf_url=brochure_url,
+                generated_brochure_url=gen_brochure_url,
                 cover_image_url=pkg.cover_image_url,
                 is_featured=pkg.is_featured,
                 tags=[tag.name for tag in pkg.tags if tag.is_active],
@@ -382,8 +389,8 @@ async def get_package_availability(
     # Walk every date in the month, for every variant
     current = from_date
     while current <= to_date:
-        # Skip today and past dates — no same-day booking allowed
-        if current <= today:
+        # Skip past dates
+        if current < today:
             current += timedelta(days=1)
             continue
 
@@ -490,4 +497,3 @@ async def get_unique_places(db: AsyncSession = Depends(get_db)):
         all_places = bootstrap_names
         
     return sorted(all_places)
-

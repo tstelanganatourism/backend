@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from decimal import Decimal
 import uuid
 import json
 from loguru import logger
+from sqlalchemy import select, text
 from pydantic import BaseModel
 
 from app.db.session import get_db
@@ -24,7 +25,13 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
     razorpay_signature: str
 
-async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession) -> str:
+async def _finalize_draft(
+    draft: BookingDraft,
+    payment_id: str,
+    db: AsyncSession,
+    background_tasks: BackgroundTasks | None = None,
+    sse_payloads: list = None
+) -> str:
     """
     Idempotent function to convert BookingDraft to Booking.
     Returns the public_id of the generated Booking.
@@ -50,6 +57,32 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
             # Shift quantity from reserved to booked
             inventory.reserved_count = max(0, inventory.reserved_count - draft.quantity)
             inventory.booked_count += draft.quantity
+            
+            await db.flush()
+            if sse_payloads is not None:
+                import time
+                from app.core.timezone import get_ist_now
+                # effective price lookup requires PackageVariant. We can retrieve it, or just omit if frontend handles patch
+                # But strict payload rule says full payload. Let's fetch it.
+                from app.models.package import PackageVariant
+                v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == draft.variant_id))
+                variant = v_res.scalar_one_or_none()
+                if variant:
+                    from app.api.v1.public_packages import get_effective_package_prices
+                    eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, inventory.price_override)
+                    sse_payloads.append({
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "package_id": variant.package_id,
+                        "travel_date": str(draft.travel_date),
+                        "available": inventory.total_capacity - (inventory.booked_count + inventory.reserved_count),
+                        "reserved": inventory.reserved_count,
+                        "booked": inventory.booked_count,
+                        "is_closed": inventory.is_closed,
+                        "effective_adult_price": float(eff_adult),
+                        "effective_child_price": float(eff_child),
+                        "variant_id": draft.variant_id
+                    })
 
     elif draft.target_type == 'room':
         # Re-evaluate stay dates from payload
@@ -88,7 +121,15 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
                 inv.reserved_rooms = max(0, inv.reserved_rooms - required_rooms)
                 inv.booked_rooms += required_rooms
 
-    # 3. Increment coupon usage
+    # 3. Prepare pricing snapshot
+    snapshot = draft.pricing_snapshot
+    snapshot["razorpay_order_id"] = draft.razorpay_order_id
+    snapshot["razorpay_payment_id"] = payment_id
+    if draft.target_type == 'room':
+        snapshot["slot_start"] = draft.checkout_payload.get('slot_start')
+        snapshot["slot_end"] = draft.checkout_payload.get('slot_end')
+
+    # 4. Increment coupon usage
     if draft.coupon_applied:
         coupon_query = select(Coupon).where(Coupon.code == draft.coupon_applied).with_for_update()
         c_res = await db.execute(coupon_query)
@@ -96,13 +137,53 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
         if coupon:
             coupon.usage_count += 1
 
-    # 4. Generate actual Booking
-    snapshot = draft.pricing_snapshot
-    snapshot["razorpay_order_id"] = draft.razorpay_order_id
-    snapshot["razorpay_payment_id"] = payment_id
+    # 5. Calculate payment status based on TOURIST perspective
+    # The database must explicitly reflect what the tourist sees (the full amount).
+    # The agent's actual payment amount is properly tracked via the Payment table records.
+    tourist_total = Decimal(snapshot['tourist_total'])
+    tourist_amount_payable = Decimal(snapshot.get('tourist_amount_payable', str(draft.amount_payable)))
+    
+    tourist_remaining = (tourist_total - tourist_amount_payable).quantize(Decimal("0.01"))
+    tourist_remaining = max(Decimal("0.00"), tourist_remaining)
+    
+    if tourist_remaining <= Decimal("0.01"):
+        booking_status = BookingStatus.FULLY_PAID
+        tourist_remaining = Decimal("0.00")
+    else:
+        booking_status = BookingStatus.PARTIAL_PAID
 
+    # Determine prefix and sequence
+    public_id = ""
+    if draft.target_type == 'room':
+        seq_res = await db.execute(text("SELECT nextval('booking_seq_ac')"))
+        seq_val = seq_res.scalar()
+        public_id = f"TBT_AC_{seq_val}"
+    else:
+        # Determine if Boat Ride (TRIP -> SS, TOUR -> BT based on previous discussion, wait:
+        # user said: "as we did a tour and trip", I proposed TOUR = BT, TRIP = SS
+        # Let's fetch PackageType
+        from app.models.package import PackageVariant, Package
+        from app.models.enums import PackageType
+        pkg_res = await db.execute(
+            select(Package.type)
+            .join(PackageVariant, PackageVariant.package_id == Package.id)
+            .where(PackageVariant.id == draft.variant_id)
+        )
+        pkg_type = pkg_res.scalar_one_or_none()
+        
+        if pkg_type == PackageType.TRIP:
+            seq_res = await db.execute(text("SELECT nextval('booking_seq_ss')"))
+            seq_val = seq_res.scalar()
+            public_id = f"TBT_SS_{seq_val}"
+        else:
+            # Default to Boat Ride (TOUR)
+            seq_res = await db.execute(text("SELECT nextval('booking_seq_bt')"))
+            seq_val = seq_res.scalar()
+            public_id = f"TBT_BT_{seq_val}"
+
+    # 6. Generate actual Booking
     booking = Booking(
-        public_id="BK-" + str(uuid.uuid4())[:8].upper(),
+        public_id=public_id,
         user_id=draft.user_id,
         agent_id=draft.agent_id,
         source=BookingSource.AGENT if draft.agent_id else BookingSource.PUBLIC,
@@ -117,11 +198,11 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
         coupon_applied=draft.coupon_applied,
         gst_amount=Decimal(snapshot['gst_amount']),
         gateway_fee=Decimal(snapshot['gateway_fee']),
-        total_amount=Decimal(snapshot['tourist_total']),
-        paid_amount=draft.amount_payable,
-        remaining_balance=(Decimal(snapshot['tourist_total']) - draft.amount_payable).quantize(Decimal("0.01")) if not draft.agent_id else Decimal("0.00"),
-        agent_commission=Decimal(snapshot['agent_discount']),
-        status=BookingStatus.FULLY_PAID if (draft.agent_id or (Decimal(snapshot['tourist_total']) - draft.amount_payable) <= Decimal("0.01")) else BookingStatus.PARTIAL_PAID,
+        total_amount=tourist_total,
+        paid_amount=tourist_amount_payable,
+        remaining_balance=tourist_remaining,
+        agent_commission=Decimal(snapshot.get('agent_discount', "0.00")),
+        status=booking_status,
         pricing_snapshot=snapshot
     )
     db.add(booking)
@@ -174,16 +255,18 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
         for sd in stay_dates:
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
-    # 7. Trigger ticket and invoice PDF generation tasks
-    try:
-        from app.worker import get_arq_pool
-        arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("generate_booking_ticket_task", booking.id)
-        if booking.status == BookingStatus.FULLY_PAID:
-            await arq_pool.enqueue_job("generate_booking_invoice_task", booking.id)
-        logger.info(f"Successfully enqueued PDF generation tasks for booking {booking.public_id}")
-    except Exception as arq_err:
-        logger.warning(f"Failed to enqueue PDF generation background tasks: {arq_err}")
+    # 7. Trigger ticket and invoice PDF generation tasks asynchronously (fire and forget)
+    async def _enqueue_documents_task_safe(b_id: int, p_id: str, is_fully_paid: bool):
+        try:
+            from app.worker import get_arq_pool
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
+            logger.info(f"Successfully enqueued post-booking documents task for booking {p_id}")
+        except Exception as arq_err:
+            logger.warning(f"Failed to enqueue post-booking documents background task: {arq_err}")
+
+    if background_tasks:
+        background_tasks.add_task(_enqueue_documents_task_safe, booking.id, booking.public_id, booking.status == BookingStatus.FULLY_PAID)
 
     # 8. Delete Draft
     await db.delete(draft)
@@ -194,6 +277,7 @@ async def _finalize_draft(draft: BookingDraft, payment_id: str, db: AsyncSession
 @router.post("/verify-payment")
 async def verify_payment(
     request: VerifyPaymentRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -262,22 +346,30 @@ async def verify_payment(
                 
                 await db.flush()
                 
+            # Use background tasks for balance payments too to prevent blocking
+            async def _enqueue_bal_task(b_id: int, is_fully_paid: bool):
                 try:
                     from app.worker import get_arq_pool
                     arq_pool = await get_arq_pool()
-                    await arq_pool.enqueue_job("generate_booking_ticket_task", booking.id)
-                    if booking.status == BookingStatus.FULLY_PAID:
-                        await arq_pool.enqueue_job("generate_booking_invoice_task", booking.id)
+                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
                 except Exception as arq_err:
-                    logger.warning(f"Failed to enqueue PDF tasks for balance payment: {arq_err}")
+                    logger.warning(f"Failed to enqueue post-booking documents task for balance payment: {arq_err}")
+                    
+            if payment.status == PaymentStatus.CAPTURED:
+                background_tasks.add_task(_enqueue_bal_task, booking.id, booking.status == BookingStatus.FULLY_PAID)
             
             await db.commit()
             return {"status": "success", "booking_id": booking.public_id}
             
         raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
 
-    public_id = await _finalize_draft(draft, request.razorpay_payment_id, db)
+    sse_payloads = []
+    public_id = await _finalize_draft(draft, request.razorpay_payment_id, db, background_tasks, sse_payloads)
     await db.commit()
+    
+    from app.utils.sse import sse_manager
+    for p in sse_payloads:
+        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
     
     return {"status": "success", "booking_id": public_id}
 
@@ -315,8 +407,24 @@ async def razorpay_webhook(
                 draft = res.scalar_one_or_none()
 
                 if draft:
-                    await _finalize_draft(draft, payment_id, db)
+                    sse_payloads = []
+                    public_id = await _finalize_draft(draft, payment_id, db, sse_payloads=sse_payloads)
                     await db.commit()
+                    
+                    from app.utils.sse import sse_manager
+                    for p in sse_payloads:
+                        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                    finalized_booking = await db.execute(
+                        select(Booking).where(Booking.public_id == public_id).limit(1)
+                    )
+                    booking = finalized_booking.scalar_one_or_none()
+                    if booking:
+                        try:
+                            from app.worker import get_arq_pool
+                            arq_pool = await get_arq_pool()
+                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                        except Exception as arq_err:
+                            logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
                     logger.info(f"Webhook finalized booking for order {order_id}")
                 else:
                     # Check if this is a balance payment
@@ -357,11 +465,9 @@ async def razorpay_webhook(
                             try:
                                 from app.worker import get_arq_pool
                                 arq_pool = await get_arq_pool()
-                                await arq_pool.enqueue_job("generate_booking_ticket_task", booking.id)
-                                if booking.status == BookingStatus.FULLY_PAID:
-                                    await arq_pool.enqueue_job("generate_booking_invoice_task", booking.id)
+                                await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
                             except Exception as arq_err:
-                                logger.warning(f"Failed to enqueue PDF tasks for balance payment webhook: {arq_err}")
+                                logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
                                 
                             await db.commit()
                             logger.info(f"Webhook finalized balance payment for order {order_id}")

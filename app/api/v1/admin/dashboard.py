@@ -22,10 +22,10 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     """
     result = await db.execute(
         select(
-            select(func.count()).select_from(Package).scalar_subquery(),
-            select(func.count()).select_from(Room).scalar_subquery(),
-            select(func.count()).select_from(Booking).scalar_subquery(),
-            select(func.count()).select_from(User).scalar_subquery(),
+            select(func.count()).select_from(Package).where(Package.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(Room).where(Room.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(Booking).where(Booking.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(User).where(User.deleted_at.is_(None)).scalar_subquery(),
         )
     )
     packages_count, rooms_count, bookings_count, users_count = result.one()

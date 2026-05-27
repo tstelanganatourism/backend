@@ -55,8 +55,8 @@ class Booking(BaseModel):
 
     passengers = relationship("BookingPassenger", back_populates="booking", cascade="all, delete-orphan")
     stay_dates = relationship("BookingStayDate", back_populates="booking", cascade="all, delete-orphan")
-    payments = relationship("Payment", back_populates="booking")
-    cancellation_requests = relationship("CancellationRequest", back_populates="booking")
+    payments = relationship("Payment", back_populates="booking", cascade="all, delete-orphan")
+    cancellation_requests = relationship("CancellationRequest", back_populates="booking", cascade="all, delete-orphan")
     agent = relationship("User", foreign_keys=[agent_id], back_populates="agent_bookings")
 
 class BookingStayDate(BaseModel):
@@ -93,7 +93,7 @@ class BookingPassenger(BaseModel):
 class CancellationRequest(BaseModel):
     __tablename__ = "cancellation_requests"
 
-    booking_id = Column(ForeignKey("bookings.id"), nullable=False, index=True)
+    booking_id = Column(ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True)
     reason = Column(String, nullable=False)
     status = Column(SQLEnum(CancellationStatus), default=CancellationStatus.PENDING, server_default="PENDING", nullable=False)
     requested_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -133,3 +133,16 @@ class BookingDraft(BaseModel):
     coupon_applied = Column(String(50), nullable=True)
     
     expires_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+class EmailLog(BaseModel):
+    __tablename__ = "email_logs"
+
+    booking_id = Column(ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True)
+    recipient_email = Column(String, nullable=True)
+    email_type = Column(String, nullable=False) # e.g. "PARTIAL_PAYMENT", "FULL_PAYMENT"
+    delivery_status = Column(String, nullable=False) # e.g. "SENT", "FAILED", "SKIPPED"
+    failure_reason = Column(String, nullable=True)
+    sent_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    booking = relationship("Booking")
+

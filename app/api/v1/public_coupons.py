@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from decimal import Decimal
@@ -7,6 +8,7 @@ from app.db.session import get_db
 from app.models.coupon import Coupon
 from app.schemas.coupon import CouponValidateRequest, CouponValidateResponse
 from app.core.timezone import get_ist_now
+from app.utils.cache import ttl_cache_get_or_set
 
 router = APIRouter(
     prefix="/coupons",
@@ -33,7 +35,12 @@ async def validate_coupon(
             reason="Coupon not found or invalid"
         )
         
-    is_valid = coupon.is_valid(booking_amount=body.booking_amount, target_type=body.target_type, target_id=body.target_id)
+    is_valid = coupon.is_valid(
+        booking_amount=body.booking_amount, 
+        target_type=body.target_type, 
+        target_id=body.target_id,
+        ticket_count=body.ticket_count
+    )
     if not is_valid:
         # Determine specific reason for UX
         reason = "Coupon criteria not met"
@@ -46,6 +53,8 @@ async def validate_coupon(
             reason = "Coupon is not yet valid"
         elif coupon.usage_limit is not None and coupon.usage_count >= coupon.usage_limit:
             reason = "Coupon usage limit reached"
+        elif coupon.min_tickets is not None and body.ticket_count < coupon.min_tickets:
+            reason = f"Minimum {coupon.min_tickets} tickets/passengers required"
         elif coupon.min_booking_amount is not None and body.booking_amount < float(coupon.min_booking_amount):
             reason = f"Minimum booking amount of ₹{coupon.min_booking_amount} required"
         elif body.target_type == 'PACKAGE' and coupon.applicable_package_ids and body.target_id not in coupon.applicable_package_ids:
@@ -65,6 +74,63 @@ async def validate_coupon(
         discount_amount=discount,
         discounted_subtotal=max(0.0, body.booking_amount - discount)
     )
+
+# Cache active coupons for 60 s — these change rarely and are called on every page load.
+_COUPON_CACHE_TTL = 60
+
+@router.get("/active")
+async def get_active_coupons(
+    target_type: str = None,
+    target_id: int = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Public endpoint to get active coupons, optionally filtered by target.
+    Cached in-process for 60 s to reduce live DB queries on page renders.
+    """
+    # Use target_type + target_id as part of the cache key for correct per-target caching.
+    cache_key = f"coupons:active:{target_type}:{target_id}"
+
+    async def _load():
+        now = get_ist_now()
+        query = select(Coupon).where(
+            Coupon.is_active == True,
+            Coupon.deleted_at.is_(None)
+        ).where(
+            (Coupon.valid_from.is_(None) | (Coupon.valid_from <= now)) &
+            (Coupon.valid_until.is_(None) | (Coupon.valid_until >= now))
+        )
+        
+        result = await db.execute(query)
+        coupons = result.scalars().all()
+        
+        valid_coupons = []
+        for c in coupons:
+            is_global = not c.applicable_package_ids and not c.applicable_room_ids
+            if is_global:
+                valid_coupons.append(c)
+            elif target_type == 'PACKAGE' and target_id in (c.applicable_package_ids or []):
+                valid_coupons.append(c)
+            elif target_type == 'ROOM' and target_id in (c.applicable_room_ids or []):
+                valid_coupons.append(c)
+
+        return [
+            {
+                "code": c.code,
+                "discount_type": c.discount_type,
+                "discount_value": float(c.discount_value),
+                "min_booking_amount": float(c.min_booking_amount) if c.min_booking_amount else None,
+                "max_discount_amount": float(c.max_discount_amount) if c.max_discount_amount else None,
+            }
+            for c in valid_coupons
+        ]
+
+    data = await ttl_cache_get_or_set(cache_key, _COUPON_CACHE_TTL, _load)
+    response = JSONResponse(content=data)
+    # Coupons change rarely — allow a 60 s public cache with a 120 s stale window.
+    response.headers["Cache-Control"] = "public, max-age=60, s-maxage=60, stale-while-revalidate=120"
+    return response
+
 
 # =====================================================================
 # BOOKING SAFETY - FUTURE REDEMPTION IMPLEMENTATION GUIDE

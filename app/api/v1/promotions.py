@@ -43,84 +43,92 @@ from sqlalchemy import select
 
 # ─── Public ───────────────────────────────────────────────────────────────────
 
+from app.utils.cache import ttl_cache_get_or_set
+
+# Cache the serialised public promo list for 30 s to avoid hitting Neon on every render.
+_PROMO_CACHE_TTL = 30
+
 @router.get("/active", response_model=List[PromotionPublicResponse])
 async def get_active_promotions_public(db: AsyncSession = Depends(get_db)):
     """
     Return all currently active promotions for the public scrolling banner.
     Automatically excludes expired and inactive promotions.
     Also merges and displays active discount coupons as scrollable promotions!
+
+    Cached in-process for 30 s to prevent live DB queries on every banner render.
     """
-    promotions = await get_active_promotions(db)
-    # Exclude DB promotions (placeholders) as requested by the user
-    # public_promos = [PromotionPublicResponse.model_validate(p) for p in promotions]
-    public_promos = []
 
-    try:
-        now = get_ist_now()
-        coupon_query = select(Coupon).where(
-            Coupon.is_active == True,
-            Coupon.deleted_at.is_(None)
-        ).where(
-            (Coupon.valid_from.is_(None) | (Coupon.valid_from <= now)) &
-            (Coupon.valid_until.is_(None) | (Coupon.valid_until >= now))
-        )
-        result = await db.execute(coupon_query)
-        active_coupons = result.scalars().all()
+    async def _build_promos():
+        promotions = await get_active_promotions(db)
+        # Exclude DB promotions (placeholders) as requested by the user.
+        public_promos: list[PromotionPublicResponse] = []
 
-        for c in active_coupons:
-            discount_type = (
-                PromotionType.PERCENT_DISCOUNT
-                if c.discount_type == 'PERCENTAGE'
-                else PromotionType.FLAT_DISCOUNT
+        try:
+            now = get_ist_now()
+            coupon_query = select(Coupon).where(
+                Coupon.is_active == True,
+                Coupon.deleted_at.is_(None)
+            ).where(
+                (Coupon.valid_from.is_(None) | (Coupon.valid_from <= now)) &
+                (Coupon.valid_until.is_(None) | (Coupon.valid_until >= now))
             )
-            
-            is_global = (not c.applicable_package_ids or len(c.applicable_package_ids) == 0) and (not c.applicable_room_ids or len(c.applicable_room_ids) == 0)
-            
-            target_type = PromotionTarget.ALL if is_global else PromotionTarget.SPECIFIC_PACKAGES
-            
-            disc_label = f"{float(c.discount_value)}% Off" if c.discount_type == 'PERCENTAGE' else f"₹{int(c.discount_value)} Off"
-            subtitle = f"Use code {c.code} at checkout to save {disc_label}!"
-            if c.min_booking_amount:
-                subtitle += f" Min booking: ₹{int(c.min_booking_amount)}."
+            result = await db.execute(coupon_query)
+            active_coupons = result.scalars().all()
 
-            styles = [
-                {"icon_emoji": "🔥", "badge": PromotionBadge.BESTSELLER, "bg_gradient": "from-orange-600 to-red-800"},
-                {"icon_emoji": "✨", "badge": PromotionBadge.NEW_OFFER, "bg_gradient": "from-blue-600 to-indigo-800"},
-                {"icon_emoji": "🎁", "badge": PromotionBadge.FESTIVAL_OFFER, "bg_gradient": "from-purple-600 to-fuchsia-800"},
-                {"icon_emoji": "🎟️", "badge": PromotionBadge.LIMITED_TIME, "bg_gradient": "from-emerald-600 to-teal-800"},
-                {"icon_emoji": "☀️", "badge": PromotionBadge.SUMMER_SPECIAL, "bg_gradient": "from-amber-500 to-orange-700"},
-                {"icon_emoji": "💎", "badge": PromotionBadge.BESTSELLER, "bg_gradient": "from-slate-700 to-slate-900"},
-                {"icon_emoji": "🚀", "badge": PromotionBadge.LIMITED_TIME, "bg_gradient": "from-pink-600 to-rose-800"},
-            ]
-            style = styles[c.id % len(styles)]
+            for c in active_coupons:
+                discount_type = (
+                    PromotionType.PERCENT_DISCOUNT
+                    if c.discount_type == 'PERCENTAGE'
+                    else PromotionType.FLAT_DISCOUNT
+                )
 
-            coupon_promo = PromotionPublicResponse(
-                id=100000 + c.id,
-                title=f"PROMO CODE: {c.code}",
-                subtitle=subtitle,
-                icon_emoji=style["icon_emoji"],
-                badge=style["badge"],
-                type=discount_type,
-                target=target_type,
-                discount_value=float(c.discount_value),
-                cta_label="Copy Code & Book",
-                cta_url="/boat-rides",
-                bg_gradient=style["bg_gradient"],
-                sort_order=50
-            )
-            public_promos.append(coupon_promo)
-    except Exception as e:
-        from loguru import logger
-        logger.error(f"Failed to fetch active coupons for public banner: {e}")
-        # Fallback to avoid breaking public API in case of migration mismatches
+                is_global = (not c.applicable_package_ids or len(c.applicable_package_ids) == 0) and (not c.applicable_room_ids or len(c.applicable_room_ids) == 0)
+                target_type = PromotionTarget.ALL if is_global else PromotionTarget.SPECIFIC_PACKAGES
 
-    # Sort public_promos by sort_order
-    public_promos.sort(key=lambda x: x.sort_order)
+                disc_label = f"{float(c.discount_value)}% Off" if c.discount_type == 'PERCENTAGE' else f"₹{int(c.discount_value)} Off"
+                subtitle = f"Use code {c.code} at checkout to save {disc_label}!"
+                if c.min_booking_amount:
+                    subtitle += f" Min booking: ₹{int(c.min_booking_amount)}."
 
-    response = JSONResponse(
-        content=[p.model_dump(mode="json") for p in public_promos]
-    )
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                styles = [
+                    {"icon_emoji": "🔥", "badge": PromotionBadge.BESTSELLER, "bg_gradient": "from-orange-600 to-red-800"},
+                    {"icon_emoji": "✨", "badge": PromotionBadge.NEW_OFFER, "bg_gradient": "from-blue-600 to-indigo-800"},
+                    {"icon_emoji": "🎁", "badge": PromotionBadge.FESTIVAL_OFFER, "bg_gradient": "from-purple-600 to-fuchsia-800"},
+                    {"icon_emoji": "🎟️", "badge": PromotionBadge.LIMITED_TIME, "bg_gradient": "from-emerald-600 to-teal-800"},
+                    {"icon_emoji": "☀️", "badge": PromotionBadge.SUMMER_SPECIAL, "bg_gradient": "from-amber-500 to-orange-700"},
+                    {"icon_emoji": "💎", "badge": PromotionBadge.BESTSELLER, "bg_gradient": "from-slate-700 to-slate-900"},
+                    {"icon_emoji": "🚀", "badge": PromotionBadge.LIMITED_TIME, "bg_gradient": "from-pink-600 to-rose-800"},
+                ]
+                style = styles[c.id % len(styles)]
+
+                coupon_promo = PromotionPublicResponse(
+                    id=100000 + c.id,
+                    title=f"PROMO CODE: {c.code}",
+                    subtitle=subtitle,
+                    icon_emoji=style["icon_emoji"],
+                    badge=style["badge"],
+                    type=discount_type,
+                    target=target_type,
+                    discount_value=float(c.discount_value),
+                    cta_label="Copy Code & Book",
+                    cta_url="/boat-rides",
+                    bg_gradient=style["bg_gradient"],
+                    sort_order=50
+                )
+                public_promos.append(coupon_promo)
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Failed to fetch active coupons for public banner: {e}")
+            # Fallback to avoid breaking public API in case of migration mismatches.
+
+        public_promos.sort(key=lambda x: x.sort_order)
+        return [p.model_dump(mode="json") for p in public_promos]
+
+    data = await ttl_cache_get_or_set("promotions:active", _PROMO_CACHE_TTL, _build_promos)
+
+    response = JSONResponse(content=data)
+    # Short public cache: CDN/browser can hold for 30 s; stale-while-revalidate extends to 120 s.
+    response.headers["Cache-Control"] = "public, max-age=30, s-maxage=30, stale-while-revalidate=120"
     return response
 
 

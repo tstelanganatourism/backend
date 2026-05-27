@@ -22,10 +22,11 @@ Endpoints:
 """
 from loguru import logger
 from datetime import timedelta
+from html import escape
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, UploadFile, File, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -82,9 +83,14 @@ router = APIRouter()
 REFRESH_COOKIE_NAME = "refresh_token"
 COOKIE_SECURE = settings.ENVIRONMENT == "production"
 COOKIE_SAMESITE = "lax"
+AP_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358705/b66b077a-69fa-4625-8b49-9a168efde88f.png"
+TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png"
 
+
+from datetime import datetime, timezone, timedelta
 
 def _set_refresh_cookie(response: Response, token: str, max_age_seconds: int) -> None:
+    expires_dt = datetime.now(timezone.utc) + timedelta(seconds=max_age_seconds)
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=token,
@@ -92,6 +98,7 @@ def _set_refresh_cookie(response: Response, token: str, max_age_seconds: int) ->
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
         max_age=max_age_seconds,
+        expires=expires_dt,
         path="/",
     )
 
@@ -137,42 +144,155 @@ def _build_token_response(user, response: Response, admin: bool = False) -> dict
     }
 
 
-# ─── Send OTP email via Resend ────────────────────────────────────────────────
+# ─── Send OTP email via Brevo ─────────────────────────────────────────────────
+
+def _build_otp_email_html(
+    *,
+    full_name: str,
+    otp: str,
+    title: str,
+    eyebrow: str,
+    intro: str,
+    expiry_text: str,
+    security_note: str,
+    accent_color: str = "#075b60",
+) -> str:
+    """Build a responsive, email-client-safe OTP email."""
+    safe_name = escape(full_name or "there")
+    safe_otp = escape(otp)
+    safe_title = escape(title)
+    safe_eyebrow = escape(eyebrow)
+    safe_intro = escape(intro)
+    safe_expiry_text = escape(expiry_text)
+    safe_security_note = escape(security_note)
+    safe_logo1_url = escape(AP_TOURISM_EMAIL_LOGO_URL, quote=True)
+    safe_logo2_url = escape(TS_TOURISM_EMAIL_LOGO_URL, quote=True)
+    safe_accent_color = escape(accent_color, quote=True)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="x-apple-disable-message-reformatting">
+        <title>{safe_title}</title>
+        <style>
+            body, table, td, a {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+            table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+            img {{ -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }}
+            @media only screen and (max-width: 620px) {{
+                .email-shell {{ width: 100% !important; }}
+                .mobile-pad {{ padding-left: 20px !important; padding-right: 20px !important; }}
+                .brand-title {{ font-size: 24px !important; line-height: 30px !important; }}
+                .otp-code {{ font-size: 34px !important; letter-spacing: 8px !important; }}
+                .logo-img {{ width: 74px !important; height: 74px !important; }}
+            }}
+        </style>
+    </head>
+    <body style="margin:0; padding:0; background-color:#eef3f6;">
+        <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
+            Your TS Boating &amp; Tourism security code is {safe_otp}. It expires soon.
+        </div>
+        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#eef3f6; margin:0; padding:0;">
+            <tr>
+                <td align="center" style="padding:28px 12px;">
+                    <table role="presentation" class="email-shell" width="640" border="0" cellpadding="0" cellspacing="0" style="width:640px; max-width:640px; background-color:#ffffff; border:1px solid #dbe6ea; border-radius:18px; overflow:hidden;">
+                        <tr>
+                            <td align="center" class="mobile-pad" style="background-color:#075b60; padding:30px 34px 28px 34px;">
+                                <table role="presentation" width="190" border="0" cellpadding="0" cellspacing="0" style="width:190px; margin:0 auto 16px auto;">
+                                    <tr>
+                                        <td align="center" width="95" style="padding:0 7px;">
+                                            <img class="logo-img" src="{safe_logo1_url}" width="82" height="82" alt="APTDC" style="display:block; width:82px; height:82px; border-radius:41px;">
+                                        </td>
+                                        <td align="center" width="95" style="padding:0 7px;">
+                                            <img class="logo-img" src="{safe_logo2_url}" width="82" height="82" alt="Telangana Tourism" style="display:block; width:82px; height:82px; border-radius:41px;">
+                                        </td>
+                                    </tr>
+                                </table>
+                                <div class="brand-title" style="font-family:Arial, Helvetica, sans-serif; color:#ffffff; font-size:28px; line-height:34px; font-weight:800; letter-spacing:0; margin:0 0 6px 0;">TS Boating &amp; Tourism</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:#d6f4ef; font-size:14px; line-height:20px; font-weight:800;">{safe_eyebrow}</div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td class="mobile-pad" style="padding:38px 42px 30px 42px; font-family:Arial, Helvetica, sans-serif; color:#14313a;">
+                                <div style="font-size:12px; line-height:17px; font-weight:800; letter-spacing:0.8px; text-transform:uppercase; color:{safe_accent_color}; margin:0 0 10px 0;">Secure verification</div>
+                                <h1 style="margin:0 0 16px 0; color:#102f3a; font-size:25px; line-height:32px; font-weight:800; letter-spacing:0;">{safe_title}</h1>
+                                <p style="margin:0 0 14px 0; color:#415865; font-size:15px; line-height:24px;">Hello {safe_name},</p>
+                                <p style="margin:0 0 26px 0; color:#415865; font-size:15px; line-height:24px;">{safe_intro}</p>
+
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border:1px solid #dbe6ea; border-radius:16px; background-color:#f8fbfc;">
+                                    <tr>
+                                        <td align="center" style="padding:24px 18px 10px 18px;">
+                                            <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase; letter-spacing:1px;">One-time code</div>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td align="center" style="padding:0 18px 24px 18px;">
+                                            <div class="otp-code" style="display:inline-block; background-color:#ffffff; border:1px solid #cfe0e5; border-radius:12px; color:{safe_accent_color}; font-family:Arial, Helvetica, sans-serif; font-size:42px; line-height:52px; font-weight:900; letter-spacing:12px; padding:12px 20px 12px 30px;">{safe_otp}</div>
+                                        </td>
+                                    </tr>
+                                </table>
+
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:22px 0 0 0;">
+                                    <tr>
+                                        <td style="background-color:#fff8e7; border:1px solid #f1d89a; border-radius:12px; padding:14px 16px; font-family:Arial, Helvetica, sans-serif;">
+                                            <div style="color:#7a4c00; font-size:13px; line-height:20px; font-weight:800;">{safe_expiry_text}</div>
+                                            <div style="color:#8b6b2d; font-size:12px; line-height:18px; margin-top:4px;">{safe_security_note}</div>
+                                        </td>
+                                    </tr>
+                                </table>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td align="center" class="mobile-pad" style="background-color:#f7fafb; border-top:1px solid #dbe6ea; padding:24px 34px 28px 34px; font-family:Arial, Helvetica, sans-serif;">
+                                <div style="color:#102f3a; font-size:14px; line-height:21px; font-weight:800; margin-bottom:6px;">TS Tourism Services</div>
+                                <div style="color:#526a76; font-size:12px; line-height:18px;">This security email was sent to protect your account. Never share this code with anyone.</div>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>s
+    </body>
+    </html>
+    """
+
 
 async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
-    """Send a password reset OTP email via Resend."""
-    if not settings.RESEND_API_KEY:
+    """Send a password reset OTP email via Brevo."""
+    if not settings.BREVO_API_KEY:
         return
 
     payload = {
-        "from": settings.RESEND_FROM_EMAIL,
-        "to": [email],
+        "sender": {"email": settings.BREVO_FROM_EMAIL, "name": "TS Tourism"},
+        "to": [{"email": email, "name": full_name}],
         "subject": "Password Reset Code - TS Tourism",
-        "html": f"""
-        <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; border: 1px solid #eee; padding: 40px; border-radius: 16px;">
-          <h2 style="color: #0f3d56; margin-top: 0;">Password Reset</h2>
-          <p style="color: #555;">Hello {full_name},</p>
-          <p style="color: #555;">You requested a password reset. Use the following code to set a new password:</p>
-          <div style="background: #fdf2f2; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
-            <span style="font-size: 36px; font-weight: 900; letter-spacing: 12px; color: #dc2626;">{otp}</span>
-          </div>
-          <p style="color: #888; font-size: 13px;">This code expires in 10 minutes. If you did not request this, please secure your account.</p>
-          <hr style="border: 0; border-top: 1px solid #eee; margin: 24px 0;" />
-          <p style="color: #bbb; font-size: 11px;">TS Tourism &bull; Account Security</p>
-        </div>
-        """,
+        "htmlContent": _build_otp_email_html(
+            full_name=full_name,
+            otp=otp,
+            title="Password Reset Code",
+            eyebrow="Account recovery",
+            intro="We received a request to reset your TS Boating & Tourism password. Enter the code below to continue and create a new password.",
+            expiry_text="This code expires in 10 minutes.",
+            security_note="If you did not request a password reset, ignore this email and keep your current password unchanged.",
+            accent_color="#b42318",
+        ),
     }
     
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.resend.com/emails",
+                "https://api.brevo.com/v3/smtp/email",
                 json=payload,
-                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+                headers={
+                    "api-key": settings.BREVO_API_KEY,
+                    "Content-Type": "application/json"
+                },
                 timeout=10.0,
             )
-            if resp.status_code != 200:
-                logger.error(f"Resend API Error (Password Reset): {resp.status_code} - {resp.text}")
+            if resp.status_code not in (200, 201):
+                logger.error(f"Brevo API Error (Password Reset): {resp.status_code} - {resp.text}")
                 return False
             logger.info(f"Password reset email sent to {email} successfully.")
             return True
@@ -182,7 +302,7 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
 
 
 async def _send_admin_otp_email(email: str, full_name: str, otp: str):
-    """Send an OTP email via Resend."""
+    """Send an OTP email via Brevo."""
     if settings.ENVIRONMENT == "development":
         logger.info(f"===========================================================")
         logger.info(f"ADMIN LOGIN OTP FOR {email}: {otp}")
@@ -195,39 +315,39 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
         except Exception as e:
             logger.error(f"Failed to write OTP to current_otp.txt: {str(e)}")
 
-    if not settings.RESEND_API_KEY:
-        logger.warning("No RESEND_API_KEY found, skipping actual email send.")
+    if not settings.BREVO_API_KEY:
+        logger.warning("No BREVO_API_KEY found, skipping actual email send.")
         return
 
     payload = {
-        "from": settings.RESEND_FROM_EMAIL,
-        "to": [email],
+        "sender": {"email": settings.BREVO_FROM_EMAIL, "name": "TS Tourism Services"},
+        "to": [{"email": email, "name": full_name}],
         "subject": "Verification Code - TS Tourism Admin",
-        "html": f"""
-        <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; border: 1px solid #eee; padding: 40px; border-radius: 16px;">
-          <h2 style="color: #0f3d56; margin-top: 0;">Admin Verification</h2>
-          <p style="color: #555;">Hello {full_name},</p>
-          <p style="color: #555;">Your one-time security code to access the TS Tourism Admin Portal is:</p>
-          <div style="background: #f0f9ff; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0;">
-            <span style="font-size: 36px; font-weight: 900; letter-spacing: 12px; color: #0f3d56;">{otp}</span>
-          </div>
-          <p style="color: #888; font-size: 13px;">This code expires in 5 minutes. If you did not request this, please ignore this email.</p>
-          <hr style="border: 0; border-top: 1px solid #eee; margin: 24px 0;" />
-          <p style="color: #bbb; font-size: 11px;">TS Tourism Services &bull; Secure Admin Portal</p>
-        </div>
-        """,
+        "htmlContent": _build_otp_email_html(
+            full_name=full_name,
+            otp=otp,
+            title="Admin Verification Code",
+            eyebrow="Secure admin portal",
+            intro="Use this one-time security code to finish signing in to the TS Tourism Admin Portal.",
+            expiry_text="This code expires in 5 minutes.",
+            security_note="If you did not try to sign in, ignore this email and review access to your admin account.",
+            accent_color="#075b60",
+        ),
     }
     
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                "https://api.resend.com/emails",
+                "https://api.brevo.com/v3/smtp/email",
                 json=payload,
-                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+                headers={
+                    "api-key": settings.BREVO_API_KEY,
+                    "Content-Type": "application/json"
+                },
                 timeout=10.0,
             )
-            if resp.status_code != 200:
-                logger.error(f"Resend API Error: {resp.status_code} - {resp.text}")
+            if resp.status_code not in (200, 201):
+                logger.error(f"Brevo API Error: {resp.status_code} - {resp.text}")
     except Exception as e:
         logger.error(f"Failed to send OTP email: {str(e)}")
 
@@ -235,6 +355,7 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
 @router.post("/admin/resend-otp")
 async def admin_resend_otp(
     body: AdminLoginRequest, # Reuse email/password for security context
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Resend a fresh OTP to the admin if requested."""
@@ -250,7 +371,7 @@ async def admin_resend_otp(
     await store_otp(user.id, otp)
     
     # Send email
-    await _send_admin_otp_email(user.email, user.full_name, otp)
+    background_tasks.add_task(_send_admin_otp_email, user.email, user.full_name, otp)
     
     return {"message": "OTP resent successfully."}
 
@@ -513,6 +634,7 @@ async def agent_login(
 @router.post("/admin/login", response_model=OTPInitiatedResponse)
 async def admin_login(
     body: AdminLoginRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -540,7 +662,7 @@ async def admin_login(
     await store_otp(user.id, otp)
 
     # Send OTP via Resend email
-    await _send_admin_otp_email(user.email, user.full_name, otp)
+    background_tasks.add_task(_send_admin_otp_email, user.email, user.full_name, otp)
 
     return OTPInitiatedResponse(user_id=user.id)
 
@@ -671,7 +793,7 @@ async def logout(
             exp = payload.get("exp", 0)
             remaining = max(0, int(exp - get_ist_now().timestamp()))
             if jti and remaining > 0:
-                await blacklist_token(jti, remaining)
+                await blacklist_token(jti, remaining, is_logout=True)
         except Exception:
             pass  # Expired or tampered — safe to ignore, just clear the cookie
 

@@ -38,13 +38,11 @@ CLEANUP_INTERVAL_SECONDS = 300  # Run every 5 minutes
 
 # ── Inventory release helper ──────────────────────────────────────────────────
 
-async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> None:
+async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> list:
     """
     Release the reserved inventory that was locked when this draft was created.
-
-    Safe to call multiple times — uses max(0, ...) clamping.
-    All SELECT FOR UPDATE calls happen *inside* the caller's transaction.
     """
+    sse_payloads = []
     if draft.target_type == "package" and draft.variant_id:
         inv_result = await db.execute(
             select(PackageVariantInventory)
@@ -62,6 +60,29 @@ async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> None
                 f"[DraftCleanup] Package inventory released: "
                 f"variant={draft.variant_id} date={draft.travel_date} qty={released}"
             )
+            await db.flush()
+            
+            import time as builtin_time
+            from app.core.timezone import get_ist_now
+            from app.models.package import PackageVariant
+            v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == draft.variant_id))
+            variant = v_res.scalar_one_or_none()
+            if variant:
+                from app.api.v1.public_packages import get_effective_package_prices
+                eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, inventory.price_override)
+                sse_payloads.append({
+                    "version": int(builtin_time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": variant.package_id,
+                    "travel_date": str(draft.travel_date),
+                    "available": inventory.total_capacity - (inventory.booked_count + inventory.reserved_count),
+                    "reserved": inventory.reserved_count,
+                    "booked": inventory.booked_count,
+                    "is_closed": inventory.is_closed,
+                    "effective_adult_price": float(eff_adult),
+                    "effective_child_price": float(eff_child),
+                    "variant_id": draft.variant_id
+                })
 
     elif draft.target_type == "room" and draft.room_variant_id:
         payload = draft.checkout_payload or {}
@@ -123,6 +144,8 @@ async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> None
                     f"[DraftCleanup] Room inventory released: "
                     f"room_variant={draft.room_variant_id} date={stay_date} rooms={required_rooms}"
                 )
+
+    return sse_payloads
 
 
 # ── Main cleanup coroutine ────────────────────────────────────────────────────
@@ -186,9 +209,13 @@ async def cleanup_expired_drafts() -> int:
                     )
                 else:
                     # Normal expiry: release inventory then delete.
-                    await release_draft_inventory(draft, db)
+                    sse_payloads = await release_draft_inventory(draft, db)
                     await db.delete(draft)
                     await db.commit()
+                    
+                    from app.utils.sse import sse_manager
+                    for p in sse_payloads:
+                        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
                     logger.info(
                         f"[DraftCleanup] Expired draft {draft.draft_id} cleaned: "
                         f"type={draft.target_type} qty={draft.quantity} "

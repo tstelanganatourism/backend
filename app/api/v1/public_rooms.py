@@ -313,7 +313,7 @@ async def get_room_availability(
     # Walk every date in the month, for every variant
     current = from_date
     while current <= to_date:
-        if current <= today:
+        if current < today:
             current += timedelta(days=1)
             continue
 

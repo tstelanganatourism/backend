@@ -81,3 +81,27 @@ async def get_signed_url(
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to generate secure URL")
 
+from fastapi.responses import RedirectResponse
+
+@router.get("/download")
+async def download_document(
+    key: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Directly download a document (specifically public brochures) by redirecting to a fresh presigned URL.
+    This prevents presigned URLs from expiring when baked into statically cached HTML.
+    """
+    if ".." in key or key.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid object key")
+        
+    if key.startswith("private/brochures/"):
+        try:
+            url = await r2_service.generate_presigned_url(key, expires_in=900)
+            return RedirectResponse(url=url, status_code=307)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail="Failed to generate secure URL")
+    else:
+        # Require strict auth for tickets/invoices through the signed-url endpoint
+        raise HTTPException(status_code=403, detail="Direct download only supported for public brochures. Use POST /signed-url for private documents.")
+

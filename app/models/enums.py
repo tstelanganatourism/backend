@@ -73,6 +73,11 @@ class PolicyType(str, enum.Enum):
     WEATHER = 'WEATHER'
     BOARDING = 'BOARDING'
     STAY_RULES = 'STAY_RULES'
+    REFUND = 'REFUND'
+    CHILD_POLICY = 'CHILD_POLICY'
+    PETS = 'PETS'
+    SMOKING = 'SMOKING'
+    OTHER = 'OTHER'
 
 # ─── Promotion Enums (Phase-3) ────────────────────────────────────────────────
 

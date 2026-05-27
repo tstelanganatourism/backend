@@ -26,6 +26,8 @@ def get_redis() -> aioredis.Redis:
             settings.REDIS_URL,
             encoding="utf-8",
             decode_responses=True,
+            socket_connect_timeout=2.5,
+            socket_timeout=2.5,
         )
     return _redis_client
 
@@ -65,21 +67,35 @@ async def verify_otp_only(user_id: int, submitted_otp: str) -> bool:
     return bool(stored_otp and stored_otp == submitted_otp)
 
 
-# ─── Token Blacklist Operations ───────────────────────────────────────────────
+import time
 
-async def blacklist_token(jti: str, expire_seconds: int) -> None:
+async def blacklist_token(jti: str, expire_seconds: int, is_logout: bool = False) -> None:
     """Blacklist a JWT by its JTI. TTL matches original token expiry."""
     client = get_redis()
     key = f"blacklist:{jti}"
-    await client.setex(key, expire_seconds, "1")
+    value = "logout" if is_logout else str(time.time())
+    await client.setex(key, expire_seconds, value)
 
 
 async def is_token_blacklisted(jti: str) -> bool:
     """Return True if the given JTI has been blacklisted (i.e., token revoked)."""
     client = get_redis()
     key = f"blacklist:{jti}"
-    result = await client.exists(key)
-    return bool(result)
+    value = await client.get(key)
+    if not value:
+        return False
+    if value == "logout":
+        return True
+    
+    # Grace period logic: bypass blacklist for 30s during rotation race conditions
+    try:
+        blacklist_time = float(value)
+        if time.time() - blacklist_time < 30.0:
+            return False
+    except ValueError:
+        pass
+        
+    return True
 
 
 # ─── Package Availability Caching ────────────────────────────────────────────

@@ -127,16 +127,16 @@ class R2StorageService:
 
     async def get_public_url(self, object_name: Optional[str]) -> Optional[str]:
         """
-        Resolves a private R2 object key into a signed download URL.
-        If it's already an HTTP URL or blank, returns as is.
+        Resolves a private R2 object key into a public download URL.
+        Instead of returning a short-lived presigned URL (which expires in 15 mins
+        and breaks statically cached pages), it returns a stable backend endpoint 
+        that will dynamically redirect to a fresh presigned URL upon click.
         """
         if not object_name:
             return None
         if object_name.startswith("private/"):
-            try:
-                return await self.generate_presigned_url(object_name)
-            except Exception:
-                return None
+            # Return a relative URL so it goes through the frontend proxy
+            return f"/api/v1/documents/download?key={object_name}"
         return object_name
 
 r2_service = R2StorageService()

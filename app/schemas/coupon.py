@@ -10,6 +10,7 @@ class CouponBase(AppBaseModel):
     discount_value: Decimal = Field(..., ge=0)
     min_booking_amount: Optional[Decimal] = Field(None, ge=0)
     max_discount_amount: Optional[Decimal] = Field(None, ge=0)
+    min_tickets: Optional[int] = Field(None, ge=1)
     usage_limit: Optional[int] = Field(None, ge=1)
     applicable_package_ids: list[int] = Field(default_factory=list)
     applicable_room_ids: list[int] = Field(default_factory=list)
@@ -34,6 +35,7 @@ class CouponUpdate(AppBaseModel):
     discount_value: Optional[Decimal] = Field(None, ge=0)
     min_booking_amount: Optional[Decimal] = Field(None, ge=0)
     max_discount_amount: Optional[Decimal] = Field(None, ge=0)
+    min_tickets: Optional[int] = Field(None, ge=1)
     usage_limit: Optional[int] = Field(None, ge=1)
     applicable_package_ids: Optional[list[int]] = None
     applicable_room_ids: Optional[list[int]] = None
@@ -60,6 +62,7 @@ class CouponValidateRequest(AppBaseModel):
     target_type: Optional[str] = None
     target_id: Optional[int] = None
     booking_amount: float
+    ticket_count: int = 0
 
 class CouponValidateResponse(AppBaseModel):
     valid: bool

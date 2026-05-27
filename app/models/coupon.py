@@ -11,6 +11,7 @@ class Coupon(BaseModel):
     discount_value = Column(Numeric(10, 2), nullable=False)
     min_booking_amount = Column(Numeric(10, 2), nullable=True)
     max_discount_amount = Column(Numeric(10, 2), nullable=True) # for percentage max cap
+    min_tickets = Column(Integer, nullable=True)
     usage_limit = Column(Integer, nullable=True)
     usage_count = Column(Integer, default=0, nullable=False)
     applicable_package_ids = Column(ARRAY(Integer), default=[], nullable=False, server_default='{}')
@@ -19,7 +20,7 @@ class Coupon(BaseModel):
     valid_until = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
 
-    def is_valid(self, booking_amount: float = 0.0, target_type: str = None, target_id: int = None) -> bool:
+    def is_valid(self, booking_amount: float = 0.0, target_type: str = None, target_id: int = None, ticket_count: int = 0) -> bool:
         """
         Evaluate if this coupon is active and valid for redemption.
         Enforces:
@@ -29,7 +30,8 @@ class Coupon(BaseModel):
         4. valid_until >= now (if set)
         5. usage_count < usage_limit (if usage_limit set)
         6. booking_amount >= min_booking_amount (if min_booking_amount set)
-        7. package_id matches (if package_id set)
+        7. ticket_count >= min_tickets (if min_tickets set)
+        8. package_id matches (if package_id set)
         """
         from app.core.timezone import get_ist_now
         
@@ -52,7 +54,11 @@ class Coupon(BaseModel):
         if self.min_booking_amount is not None and booking_amount < float(self.min_booking_amount):
             return False
             
-        # 5. Target product constraints check
+        # 5. Minimum tickets check
+        if self.min_tickets is not None and ticket_count < self.min_tickets:
+            return False
+            
+        # 6. Target product constraints check
         is_global = not self.applicable_package_ids and not self.applicable_room_ids
         if is_global:
             pass # Applies to all

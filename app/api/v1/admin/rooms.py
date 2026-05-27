@@ -211,6 +211,8 @@ async def create_room(
     )
     await db.commit()
     clear_cache_prefix("rooms:")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
     return room
 
@@ -286,6 +288,8 @@ async def update_room(
     clear_cache_prefix("rooms:list:")
     clear_cache_prefix(f"rooms:detail:{old_slug}")
     clear_cache_prefix(f"rooms:detail:{room.slug}")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
     return room
 
@@ -319,6 +323,8 @@ async def delete_room(
     await db.commit()
     clear_cache_prefix("rooms:list:")
     clear_cache_prefix(f"rooms:detail:{room.slug}")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
     return None
 

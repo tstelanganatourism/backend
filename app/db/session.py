@@ -27,3 +27,4 @@ async def get_db():
             yield session
         finally:
             await session.close()
+# Force uvicorn reload comment for clearing in-memory cache

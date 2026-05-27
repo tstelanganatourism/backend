@@ -89,6 +89,11 @@ app.include_router(
     prefix="/api/v1/payments",
     tags=["Payments & Webhooks"]
 )
+from app.api.v1 import stream
+app.include_router(
+    stream.router,
+    prefix="/api/v1"
+)
 from app.api.v1 import documents
 
 # ─── Documents Routes (Phase-3) ───────────────────────────────────────────────────
@@ -103,11 +108,75 @@ app.include_router(
     prefix="/api/v1/admin",
 )
 
-# --- Rate Limiting Scaffold (Phase-4) ----------------------------------------
-# @app.middleware("http")
-# async def rate_limit_middleware(request, call_next):
-#     response = await call_next(request)
-#     return response
+from fastapi import Request, Response
+from app.services.redis_client import get_redis
+
+# --- Rate Limiting Middleware (Phase-4) --------------------------------------
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+    
+    # Exempt routes (health, API documentation, and static assets)
+    static_extensions = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf")
+    if (
+        path.startswith("/health")
+        or path.startswith("/docs")
+        or path.startswith("/openapi.json")
+        or path.startswith("/static")
+        or path.startswith("/_next")
+        or path.endswith(static_extensions)
+    ):
+        return await call_next(request)
+
+    # Determine route-based thresholds
+    limit = 100        # Public browsing: 100 requests/min/IP
+    category = "public"
+
+    # OTP resend: 5-10 requests/min/IP -> set to 10
+    if "/admin/resend-otp" in path or "/resend-otp" in path:
+        limit = 10
+        category = "otp_resend"
+    
+    # Admin login / OTP routes: 10-20 requests/min/IP -> set to 20
+    elif (
+        "/admin/login" in path
+        or "/admin/verify-otp" in path
+        or "/forgot-password" in path
+        or "/verify-reset-otp" in path
+        or "/reset-password" in path
+    ):
+        limit = 20
+        category = "admin_login_otp"
+        
+    # Booking checkout: 20-30 requests/min/IP -> set to 30
+    elif "/bookings" in path or "/payments" in path:
+        limit = 30
+        category = "checkout"
+
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"ratelimit:{client_ip}:{category}"
+
+    try:
+        r = get_redis()
+        # Redis pipeline for atomic increment and expiry
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.incr(key)
+            pipe.expire(key, 60, nx=True)
+            res = await pipe.execute()
+            
+        current = res[0]
+        if current > limit:
+            logger.warning(f"Rate limit exceeded for IP {client_ip} on {path} (Category: {category}, Current: {current}, Limit: {limit})")
+            return Response(
+                content="Too Many Requests",
+                status_code=429,
+            )
+    except Exception as e:
+        logger.error(f"Rate Limiter Redis Error: {e}")
+        # Fail open if Redis is down
+        pass
+
+    return await call_next(request)
 # -----------------------------------------------------------------------------
 
 @app.get("/health")
@@ -176,9 +245,3 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
         logger.info("[DraftCleanup] Background worker task cancelled on shutdown.")
-
-
-
-
-
-

@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 from typing import Optional, List
 from decimal import Decimal
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from app.db.session import get_db
 from app.middleware.auth import require_admin
@@ -320,6 +321,8 @@ class AdminCreateBookingRequest(BaseModel):
     departure_date: Optional[str] = None
     slot_start: Optional[str] = None
     slot_end: Optional[str] = None
+    # Payment
+    amount_paid: Optional[float] = None
 
 @router.post("/create")
 async def admin_create_booking(
@@ -441,21 +444,24 @@ async def admin_create_booking(
     else:
         raise HTTPException(status_code=400, detail="Invalid target_type. Must be 'package' or 'room'.")
 
-    # Admin bookings: no GST, no gateway fee, no coupon
-    gst_amount = Decimal("0.00")
-    gateway_fee = Decimal("0.00")
-    total_amount = subtotal_amount
+    # Admin bookings: calculate GST (5%) and Gateway Fee (1%)
+    gst_amount = (subtotal_amount * Decimal("0.05")).quantize(Decimal("0.01"))
+    gateway_fee = ((subtotal_amount + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
+    total_amount = subtotal_amount + gst_amount + gateway_fee
 
     # Agent commission (if booking under an agent)
     agent_commission = Decimal("0.00")
     agent_id_val = request.agent_id
 
+    paid_amount_val = Decimal(str(request.amount_paid)).quantize(Decimal("0.01")) if request.amount_paid is not None else total_amount
+    remaining_balance_val = max(Decimal("0.00"), total_amount - paid_amount_val)
+
     pricing_snapshot = {
         "subtotal_amount": str(subtotal_amount),
         "coupon_discount": "0.00",
         "coupon_applied": None,
-        "gst_amount": "0.00",
-        "gateway_fee": "0.00",
+        "gst_amount": str(gst_amount),
+        "gateway_fee": str(gateway_fee),
         "tourist_total": str(total_amount),
         "agent_discount": "0.00",
         "agent_payable": str(total_amount),
@@ -464,8 +470,33 @@ async def admin_create_booking(
         "admin_name": current_admin.full_name,
     }
 
+    # Determine prefix and sequence for Admin booking
+    public_id_val = ""
+    if request.target_type == 'room':
+        seq_res = await db.execute(text("SELECT nextval('booking_seq_ac')"))
+        seq_val = seq_res.scalar()
+        public_id_val = f"TBT_AC_{seq_val}"
+    else:
+        # Determine if Boat Ride (TOUR) or Sightseeing (TRIP)
+        from app.models.enums import PackageType
+        pkg_res = await db.execute(
+            select(Package.type)
+            .join(PackageVariant, PackageVariant.package_id == Package.id)
+            .where(PackageVariant.id == request.variant_id)
+        )
+        pkg_type = pkg_res.scalar_one_or_none()
+        
+        if pkg_type == PackageType.TRIP:
+            seq_res = await db.execute(text("SELECT nextval('booking_seq_ss')"))
+            seq_val = seq_res.scalar()
+            public_id_val = f"TBT_SS_{seq_val}"
+        else:
+            seq_res = await db.execute(text("SELECT nextval('booking_seq_bt')"))
+            seq_val = seq_res.scalar()
+            public_id_val = f"TBT_BT_{seq_val}"
+
     booking = Booking(
-        public_id="BK-" + str(uuid.uuid4())[:8].upper(),
+        public_id=public_id_val,
         user_id=request.user_id,
         agent_id=agent_id_val,
         source=BookingSource.ADMIN_DIRECT,
@@ -480,10 +511,10 @@ async def admin_create_booking(
         gst_amount=gst_amount,
         gateway_fee=gateway_fee,
         total_amount=total_amount,
-        paid_amount=Decimal("0.00"),
-        remaining_balance=Decimal("0.00"),
+        paid_amount=paid_amount_val,
+        remaining_balance=remaining_balance_val,
         agent_commission=agent_commission,
-        status=BookingStatus.CONFIRMED,
+        status=BookingStatus.PARTIAL_PAID if remaining_balance_val > 0 else BookingStatus.FULLY_PAID,
         pricing_snapshot=pricing_snapshot,
     )
     db.add(booking)
@@ -552,15 +583,15 @@ async def admin_generate_ticket(
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("generate_booking_ticket_task", booking.id)
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == "FULLY_PAID" or booking.status == "CONFIRMED")
         return {
             "status": "success",
-            "message": f"Ticket PDF generation successfully queued for booking {booking.public_id}."
+            "message": f"Post-booking documents task successfully queued for booking {booking.public_id}."
         }
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to enqueue ticket generation task: {str(e)}"
+            detail=f"Failed to enqueue post-booking documents task: {str(e)}"
         )
 
 @router.post("/{id}/generate-invoice")
@@ -578,15 +609,15 @@ async def admin_generate_invoice(
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("generate_booking_invoice_task", booking.id)
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == "FULLY_PAID" or booking.status == "CONFIRMED")
         return {
             "status": "success",
-            "message": f"Invoice PDF generation successfully queued for booking {booking.public_id}."
+            "message": f"Post-booking documents task successfully queued for booking {booking.public_id}."
         }
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to enqueue invoice generation task: {str(e)}"
+            detail=f"Failed to enqueue post-booking documents task: {str(e)}"
         )
 
 @router.patch("/{id}/cancel")
@@ -608,7 +639,9 @@ async def admin_cancel_booking(
     from loguru import logger
     from datetime import date, timedelta, time
 
-    booking = await db.get(Booking, id)
+    booking_stmt = select(Booking).where(Booking.id == id).with_for_update()
+    booking_res = await db.execute(booking_stmt)
+    booking = booking_res.scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -652,6 +685,8 @@ async def admin_cancel_booking(
     paid_amount = Decimal(str(booking.paid_amount or 0.00))
     refund_amount = max(Decimal("0.00"), paid_amount - cancellation_fee).quantize(Decimal("0.01"))
 
+    sse_payload = None
+
     # Release reserved seats/rooms back to availability pool
     if booking.variant_id:
         from app.models.package import PackageVariantInventory
@@ -665,6 +700,29 @@ async def admin_cancel_booking(
             quantity = booking.adult_count + booking.child_count
             inv.booked_count = max(0, inv.booked_count - quantity)
             logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
+            
+            await db.flush()
+            import time
+            from app.core.timezone import get_ist_now
+            from app.models.package import PackageVariant
+            v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == booking.variant_id))
+            variant = v_res.scalar_one_or_none()
+            if variant:
+                from app.api.v1.public_packages import get_effective_package_prices
+                eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, inv.price_override)
+                sse_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": variant.package_id,
+                    "travel_date": str(booking.travel_date),
+                    "available": inv.total_capacity - (inv.booked_count + inv.reserved_count),
+                    "reserved": inv.reserved_count,
+                    "booked": inv.booked_count,
+                    "is_closed": inv.is_closed,
+                    "effective_adult_price": float(eff_adult),
+                    "effective_child_price": float(eff_child),
+                    "variant_id": booking.variant_id
+                }
 
     elif booking.room_variant_id:
         # 1. Fetch stay dates
@@ -674,7 +732,7 @@ async def admin_cancel_booking(
         )
         stay_dates = [row[0] for row in dates_res.all()]
         
-        # 2. Fetch standard slot_start / slot_end from the parent room
+        # 2. Fetch room variant and default times
         from app.models.room import RoomVariant, Room
         rv_res = await db.execute(
             select(RoomVariant, Room.slot_start, Room.slot_end)
@@ -683,7 +741,15 @@ async def admin_cancel_booking(
         )
         rv_row = rv_res.first()
         if rv_row:
-            rv, slot_start, slot_end = rv_row
+            rv, default_slot_start, default_slot_end = rv_row
+            
+            pricing = booking.pricing_snapshot or {}
+            slot_start_str = pricing.get("slot_start")
+            slot_end_str = pricing.get("slot_end")
+            
+            slot_start = time.fromisoformat(slot_start_str) if slot_start_str else default_slot_start
+            slot_end = time.fromisoformat(slot_end_str) if slot_end_str else default_slot_end
+            
             from app.services.room_calculation import calculate_required_rooms
             total_qty = booking.adult_count + booking.child_count
             required_rooms = calculate_required_rooms(total_qty, rv.capacity_per_room)
@@ -700,7 +766,7 @@ async def admin_cancel_booking(
                 inv = inv_res.scalar_one_or_none()
                 if inv:
                     inv.booked_rooms = max(0, inv.booked_rooms - required_rooms)
-                    logger.info(f"Released {required_rooms} rooms for room variant inventory {booking.room_variant_id} on {stay_date}")
+                    logger.info(f"Released {required_rooms} rooms for room variant inventory {booking.room_variant_id} on {stay_date} for slot {slot_start} -> {slot_end}")
 
     # Update states
     booking.status = BookingStatus.CANCELLED
@@ -727,6 +793,10 @@ async def admin_cancel_booking(
         db.add(cancellation_req)
 
     await db.commit()
+    
+    if sse_payload:
+        from app.utils.sse import sse_manager
+        await sse_manager.broadcast_event("package", str(sse_payload["package_id"]), "INVENTORY_UPDATE", sse_payload)
 
     return {
         "status": "success",
@@ -799,7 +869,9 @@ async def admin_mark_balance_paid(
     import uuid
 
     # 1. Fetch booking with locking
-    booking = await db.get(Booking, id)
+    booking_stmt = select(Booking).where(Booking.id == id).with_for_update()
+    booking_res = await db.execute(booking_stmt)
+    booking = booking_res.scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
@@ -839,18 +911,15 @@ async def admin_mark_balance_paid(
     booking.remaining_balance = Decimal("0.00")
     booking.status = BookingStatus.FULLY_PAID
 
-    await db.flush()
+    await db.commit()
 
-    # 5. Queue ticket and invoice generation tasks
+    # 5. Queue ticket and invoice generation tasks after the paid state is committed.
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("generate_booking_ticket_task", booking.id)
-        await arq_pool.enqueue_job("generate_booking_invoice_task", booking.id)
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == "FULLY_PAID" or booking.status == "CONFIRMED")
     except Exception as arq_err:
         logger.warning(f"Failed to enqueue PDF tasks for admin balance payment: {arq_err}")
-
-    await db.commit()
 
     return {
         "status": "success",

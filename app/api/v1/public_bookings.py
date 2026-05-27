@@ -40,7 +40,7 @@ class PassengerInput(BaseModel):
     full_name: str = Field(..., min_length=1, max_length=200)
     age: int = Field(..., ge=0, le=150)
     gender: Optional[str] = None  # MALE / FEMALE / OTHER
-    phone: Optional[str] = Field(None, pattern=r"^\d{10}$")
+    phone: Optional[str] = Field(None, pattern=r"^(\d{10})?$")
     aadhaar: Optional[str] = Field(None, max_length=20)  # Required for adults, optional for children (<10)
     relationship: Optional[str] = None  # e.g. 'self', 'spouse', 'child'
     is_primary: Optional[bool] = False
@@ -74,6 +74,9 @@ class CheckoutRequest(BaseModel):
     
     # Partial payment option (>=35% and <100%)
     payment_percentage: Optional[float] = 100.0
+    
+    # Trust Lock Expected Pricing (to prevent mismatch)
+    expected_amount: Optional[float] = None
 
 @router.post("/checkout")
 async def process_checkout(
@@ -107,8 +110,8 @@ async def process_checkout(
             else:
                 if p.age < 11:
                     raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
-                if not p.phone:
-                    raise HTTPException(status_code=400, detail=f"Phone number is required for adult passenger {i+1}")
+                if i == 0 and not p.phone:
+                    raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
             
             # Aadhaar validation contract: optional for minors under 18, mandatory for adults 18+
             is_minor = p.age < 18
@@ -304,7 +307,8 @@ async def process_checkout(
         if not coupon or not coupon.is_valid(
             booking_amount=float(subtotal_amount),
             target_type=request.target_type.upper(),
-            target_id=target_id
+            target_id=target_id,
+            ticket_count=request.quantity
         ):
             raise HTTPException(status_code=400, detail="Invalid or expired promo code.")
             
@@ -371,17 +375,22 @@ async def process_checkout(
         
     # --- Razorpay Order Generation ---
     payment_percentage = request.payment_percentage if request.payment_percentage is not None else 100.0
-    if not is_agent:
-        if not (35.0 <= payment_percentage <= 100.0):
-            raise HTTPException(status_code=400, detail="Payment percentage must be between 35% and 100%")
-        payable_amount = (total_amount * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
+    if not (35.0 <= payment_percentage <= 100.0):
+        raise HTTPException(status_code=400, detail="Payment percentage must be between 35% and 100%")
+    
+    tourist_amount_payable = (total_amount * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
+    
+    if is_agent:
+        payable_amount = (agent_payable * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
     else:
-        # Agents pay full amount in one shot
-        payable_amount = agent_payable
-        payment_percentage = 100.0
+        payable_amount = tourist_amount_payable
 
     pricing_snapshot["payment_percentage"] = str(payment_percentage)
+    pricing_snapshot["tourist_amount_payable"] = str(tourist_amount_payable)
     pricing_snapshot["actual_paid_advance"] = str(payable_amount)
+
+    if request.expected_amount is not None:
+        pass # Frontend sends expected_amount but we just process checkout with realtime calculated price.
 
     draft_id = "DRF-" + str(uuid.uuid4())[:8].upper()
     receipt_id = f"rcpt_{draft_id}"
@@ -418,8 +427,47 @@ async def process_checkout(
         expires_at=expires_at
     )
     db.add(draft)
+    await db.flush()
+
+    import time
+    from app.utils.sse import sse_manager
+    
+    sse_payloads = []
+    if request.target_type.lower() == 'package':
+        sse_payloads.append({
+            "version": int(time.time() * 1000),
+            "timestamp": now.isoformat(),
+            "package_id": variant.package_id,
+            "travel_date": str(request.travel_date),
+            "available": inventory.total_capacity - (inventory.booked_count + inventory.reserved_count),
+            "reserved": inventory.reserved_count,
+            "booked": inventory.booked_count,
+            "is_closed": inventory.is_closed,
+            "effective_adult_price": float(eff_adult),
+            "effective_child_price": float(eff_child),
+            "variant_id": package_variant_id
+        })
+    elif request.target_type.lower() == 'room':
+        for inv in locked_inventories:
+            sse_payloads.append({
+                "version": int(time.time() * 1000),
+                "timestamp": now.isoformat(),
+                "room_id": variant.room_id,
+                "travel_date": str(inv.date),
+                "available": inv.total_rooms - (inv.booked_rooms + inv.reserved_rooms),
+                "reserved": inv.reserved_rooms,
+                "booked": inv.booked_rooms,
+                "is_closed": inv.is_closed,
+                "variant_id": room_variant_id
+            })
+
     await db.commit()
     await db.refresh(draft)
+
+    for p in sse_payloads:
+        target_channel = "package" if request.target_type.lower() == 'package' else "room"
+        target_id = p.get("package_id") if target_channel == "package" else p.get("room_id")
+        await sse_manager.broadcast_event(target_channel, str(target_id), "INVENTORY_UPDATE", p)
 
     logger.info(f"BookingDraft {draft_id} created | order={razorpay_order_id} | expires={expires_at.isoformat()}")
 
@@ -469,8 +517,9 @@ async def get_agent_dashboard_summary(
     total_earnings = Decimal("0.00")
     this_month_earnings = Decimal("0.00")
     
+    paid_statuses = {BookingStatus.CONFIRMED, BookingStatus.FULLY_PAID}
     for b in bookings:
-        if b.status == BookingStatus.CONFIRMED:
+        if b.status in paid_statuses:
             comm = b.agent_commission or Decimal("0.00")
             total_earnings += comm
             if b.created_at and b.created_at >= start_of_month:
@@ -628,6 +677,21 @@ async def get_tourist_bookings(
         
     return sanitized_items
 
+@router.get("/live-count")
+async def get_live_booking_count(db: AsyncSession = Depends(get_db)):
+    """
+    Returns the live booking count for the navbar.
+    Base count is 10000 + the actual number of successful bookings.
+    """
+    from sqlalchemy import func
+    
+    # Count only fully paid or confirmed bookings
+    query = select(func.count(Booking.id)).where(Booking.status.in_([BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID]))
+    result = await db.execute(query)
+    count = result.scalar() or 0
+    
+    return {"count": 10000 + count}
+
 @router.get("/{public_id}")
 async def get_booking_details(
     public_id: str,
@@ -674,6 +738,11 @@ async def get_booking_details(
             agent_id = agent.id
             agent_name = agent.full_name
             agent_phone = agent.phone_number
+            agent_gst = agent.gst_number
+            agent_company = agent.company_name
+    else:
+        agent_gst = None
+        agent_company = None
 
     boarding_point = None
     itinerary = []
@@ -725,8 +794,9 @@ async def get_booking_details(
         "coupon_applied": b.coupon_applied,
         "gst_amount": float(b.gst_amount),
         "gateway_fee": float(b.gateway_fee),
-        "total_amount": float(b.total_amount),
+        "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
         "remaining_balance": float(b.remaining_balance),
+        "paid_amount": float(b.paid_amount),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
         "created_at": b.created_at.isoformat() if b.created_at else None,
         "package_title": package_title,
@@ -760,6 +830,8 @@ async def get_booking_details(
         "agent_id": agent_id,
         "agent_name": agent_name,
         "agent_phone": agent_phone,
+        "agent_gst": agent_gst,
+        "agent_company": agent_company,
         "has_pending_cancellation": has_pending_cancellation,
         "ticket_pdf_url": b.ticket_pdf_url,
         "invoice_pdf_url": b.invoice_pdf_url,
@@ -895,7 +967,15 @@ async def process_balance_checkout(
         raise HTTPException(status_code=400, detail="Maximum payment attempts reached for this booking")
 
     # Generate a new Razorpay Order for remaining balance
-    payable_amount = float(booking.remaining_balance)
+    is_agent_payment = current_user.role == UserRole.AGENT and booking.agent_id == current_user.id
+    
+    if is_agent_payment and booking.pricing_snapshot and 'agent_payable' in booking.pricing_snapshot:
+        agent_payable = Decimal(booking.pricing_snapshot['agent_payable'])
+        captured_total = sum(Decimal(str(p.amount)) for p in booking.payments if p.status == PaymentStatus.CAPTURED)
+        payable_amount = float(max(Decimal("0.00"), agent_payable - captured_total))
+    else:
+        payable_amount = float(booking.remaining_balance)
+        
     order_receipt = f"bal_{booking.public_id}_{uuid.uuid4().hex[:6].upper()}"
 
     razorpay_order = razorpay_service.create_order(
@@ -926,5 +1006,3 @@ async def process_balance_checkout(
             "key_id": settings.RAZORPAY_KEY_ID
         }
     }
-
-

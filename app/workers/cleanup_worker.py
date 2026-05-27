@@ -9,7 +9,7 @@ from loguru import logger
 # Ensure backend root is in PYTHONPATH
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from app.db.session import SessionLocal
+from app.db.session import AsyncSessionLocal
 from app.models.booking import BookingDraft
 from app.models.package import PackageVariantInventory
 from app.models.room import RoomSlotInventory
@@ -20,7 +20,7 @@ async def release_expired_drafts():
     Finds expired BookingDrafts, releases their reserved inventory, and deletes them.
     """
     logger.info("Running expired drafts cleanup worker...")
-    async with SessionLocal() as db:
+    async with AsyncSessionLocal() as db:
         now = get_ist_now()
         
         # Find all expired drafts

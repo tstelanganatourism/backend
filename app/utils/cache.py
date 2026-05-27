@@ -1,6 +1,10 @@
 import time
+import asyncio
+import httpx
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import TypeVar, List
+import os
+from app.core.config import settings
 
 T = TypeVar("T")
 
@@ -41,3 +45,29 @@ def clear_cache_prefix(prefix: str) -> None:
     for key in list(_cache):
         if key.startswith(prefix):
             _cache.pop(key, None)
+
+def trigger_frontend_revalidation(tags: List[str] = None, paths: List[str] = None) -> None:
+    """
+    Triggers Next.js On-Demand Revalidation via Webhook.
+    """
+    frontend_url = settings.FRONTEND_URL
+    url = f"{frontend_url}/api/revalidate"
+    payload = {
+        "secret": os.getenv("REVALIDATE_SECRET", "ts-tourism-revalidate-2024"),
+        "tags": tags or [],
+        "paths": paths or []
+    }
+    
+    async def _ping():
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(url, json=payload, timeout=5.0)
+        except Exception as e:
+            print(f"Failed to trigger revalidation: {e}")
+            
+    # Fire and forget
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_ping())
+    except RuntimeError:
+        asyncio.run(_ping())

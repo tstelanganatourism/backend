@@ -372,18 +372,19 @@ async def _get_agent_or_404(db: AsyncSession, agent_id: int) -> User:
 
 async def _compute_agent_metrics(db: AsyncSession, agent_id: int) -> AgentBookingMetrics:
     """Compute real booking metrics for an agent via SQL aggregation."""
+    paid_statuses = (BookingStatus.CONFIRMED, BookingStatus.FULLY_PAID)
     result = await db.execute(
         select(
             func.count(Booking.id).label("total"),
-            func.count(case((Booking.status == BookingStatus.CONFIRMED, 1))).label("confirmed"),
+            func.count(case((Booking.status.in_(paid_statuses), 1))).label("confirmed"),
             func.count(case((Booking.status == BookingStatus.CANCELLED, 1))).label("cancelled"),
             func.count(case((Booking.status == BookingStatus.PENDING, 1))).label("pending"),
             func.coalesce(
-                func.sum(case((Booking.status == BookingStatus.CONFIRMED, Booking.total_amount))),
+                func.sum(case((Booking.status.in_(paid_statuses), Booking.total_amount))),
                 0,
             ).label("revenue"),
             func.coalesce(
-                func.sum(case((Booking.status == BookingStatus.CONFIRMED, Booking.agent_commission))),
+                func.sum(case((Booking.status.in_(paid_statuses), Booking.agent_commission))),
                 0,
             ).label("commission"),
         ).where(

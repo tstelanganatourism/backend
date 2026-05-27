@@ -15,6 +15,7 @@ class RoomVariantBase(AppBaseModel):
     weekday_price: Decimal
     weekend_price: Decimal
     capacity_per_room: int
+    total_rooms: int = 0  # How many physical rooms of this type the hotel has
     is_active: bool = True
 
 class RoomVariantResponse(RoomVariantBase, TimestampSchema):
@@ -53,6 +54,7 @@ class RoomVariantInput(AppBaseModel):
     weekday_price: Decimal
     weekend_price: Decimal
     capacity_per_room: int
+    total_rooms: int = 0  # How many physical rooms of this type the hotel has
     is_active: bool = True
 
 class RoomGalleryImageInput(AppBaseModel):

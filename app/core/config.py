@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     REDIS_URL: str
     
     # Frontend (for OAuth redirects and CORS)
-    FRONTEND_URL: str = "http://localhost:3000"
-    GOOGLE_REDIRECT_URI: str = "http://localhost:3000/auth/callback/google"
+    FRONTEND_URL: str
+    GOOGLE_REDIRECT_URI: str
     
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: Optional[str] = None
@@ -43,9 +43,9 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: Optional[str] = None
     RAZORPAY_KEY_SECRET: Optional[str] = None
     
-    # Resend
-    RESEND_API_KEY: Optional[str] = None
-    RESEND_FROM_EMAIL: str = "onboarding@resend.dev"
+    # Brevo (Email Sending)
+    BREVO_API_KEY: Optional[str] = None
+    BREVO_FROM_EMAIL: str = "no-reply@tstours.in"
     
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None
