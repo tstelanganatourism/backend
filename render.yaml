@@ -1,0 +1,34 @@
+services:
+  # FastAPI Web Service
+  - type: web
+    name: ts-tours-api
+    env: python
+    region: singapore # Closest to India for lowest latency
+    buildCommand: "pip install -r requirements.txt && playwright install chromium --with-deps"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: ALLOWED_HOSTS
+        value: "*"
+      - key: CORS_ORIGINS
+        value: "*"
+
+  # ARQ Background Worker (Brochure PDF Generation)
+  - type: worker
+    name: ts-tours-worker
+    env: python
+    region: singapore
+    buildCommand: "pip install -r requirements.txt && playwright install chromium --with-deps"
+    startCommand: "arq app.worker.WorkerSettings"
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
