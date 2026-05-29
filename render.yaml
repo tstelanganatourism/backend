@@ -5,7 +5,7 @@ services:
     env: python
     region: singapore # Closest to India for lowest latency
     plan: free # Explicitly use the 100% free plan
-    buildCommand: "pip install -r requirements.txt && playwright install chromium --with-deps"
+    buildCommand: "pip install -r requirements.txt && playwright install chromium"
     startCommand: "bash start.sh"
     envVars:
       - key: ENVIRONMENT
