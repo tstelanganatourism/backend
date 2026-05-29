@@ -111,7 +111,7 @@ async def list_rooms(
     if status_filter:
         base_query = base_query.where(Room.status == status_filter)
         
-    count_query = select(func.count()).select_from(base_query.subquery())
+    count_query = base_query.with_only_columns(func.count()).order_by(None)
     total_result = await db.execute(count_query)
     total_count = total_result.scalar_one()
 
@@ -182,6 +182,16 @@ async def create_room(
     await sync_nested_relation(db, room, "highlights", RoomHighlight, body.highlights)
     await sync_nested_relation(db, room, "faqs", RoomFAQ, body.faqs)
     await sync_nested_relation(db, room, "policies", RoomPolicy, body.policies)
+
+    # Compute starting_price
+    room.starting_price = min(
+        (v.weekday_price for v in room.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'weekday_price', 0) > 0),
+        default=0
+    )
+    room.starting_weekend_price = min(
+        (v.weekend_price for v in room.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'weekend_price', 0) > 0),
+        default=None
+    )
 
     db.add(room)
     await db.commit()
@@ -273,8 +283,17 @@ async def update_room(
     if body.policies is not None:
         await sync_nested_relation(db, room, "policies", RoomPolicy, body.policies)
 
+    # Recompute starting_price
+    room.starting_price = min(
+        (v.weekday_price for v in room.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'weekday_price', 0) > 0),
+        default=0
+    )
+    room.starting_weekend_price = min(
+        (v.weekend_price for v in room.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'weekend_price', 0) > 0),
+        default=None
+    )
+
     await db.commit()
-    await db.refresh(room)
     
     await log_action(
         db=db,
@@ -285,6 +304,20 @@ async def update_room(
         details=update_data
     )
     await db.commit()
+    
+    # Broadcast SSE for Admin Room Edit if inactive
+    if not room.is_active:
+        import time
+        from app.core.timezone import get_ist_now
+        from app.utils.sse import sse_manager
+        sse_payload = {
+            "version": int(time.time() * 1000),
+            "timestamp": get_ist_now().isoformat(),
+            "room_id": room.id,
+            "status": "INACTIVE"
+        }
+        await sse_manager.broadcast_event("room", str(room.id), "ENTITY_STATUS_UPDATE", sse_payload)
+        
     clear_cache_prefix("rooms:list:")
     clear_cache_prefix(f"rooms:detail:{old_slug}")
     clear_cache_prefix(f"rooms:detail:{room.slug}")
@@ -321,6 +354,19 @@ async def delete_room(
         details={"lodge_name": room.lodge_name}
     )
     await db.commit()
+    
+    # Broadcast SSE for Admin Room Delete
+    import time
+    from app.core.timezone import get_ist_now
+    from app.utils.sse import sse_manager
+    sse_payload = {
+        "version": int(time.time() * 1000),
+        "timestamp": get_ist_now().isoformat(),
+        "room_id": room_id,
+        "status": "DELETED"
+    }
+    await sse_manager.broadcast_event("room", str(room_id), "ENTITY_STATUS_UPDATE", sse_payload)
+    
     clear_cache_prefix("rooms:list:")
     clear_cache_prefix(f"rooms:detail:{room.slug}")
     from app.utils.cache import trigger_frontend_revalidation

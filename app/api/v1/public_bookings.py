@@ -7,10 +7,11 @@ from typing import Optional, List
 import uuid
 from decimal import Decimal
 from loguru import logger
+import asyncio
 
 from app.db.session import get_db
 from app.models.package import PackageVariantInventory, PackageVariant, Package
-from app.models.room import RoomSlotInventory, RoomVariant
+from app.models.room import Room, RoomSlotInventory, RoomVariant
 from app.models.booking import Booking, BookingPassenger, BookingStayDate
 from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType
 from app.models.user import User
@@ -98,31 +99,42 @@ async def process_checkout(
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
     child_count = request.child_count if request.child_count is not None else 0
     
+    if request.target_type == 'package' and (adult_count + child_count) != request.quantity:
+        raise HTTPException(status_code=400, detail="Adult and child count must equal total quantity")
+        
+    if not request.passengers or len(request.passengers) != request.quantity:
+        raise HTTPException(status_code=400, detail="Passenger details must be provided for all guests")
+    
     # Validate passenger Aadhaar and Age data strictly
     if request.passengers:
         for i, p in enumerate(request.passengers):
             is_child = i >= adult_count
             
             # Age constraints
-            if is_child:
-                if not (4 <= p.age <= 10):
-                    raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
+            if request.target_type == 'package':
+                if is_child:
+                    if not (4 <= p.age <= 10):
+                        raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
+                else:
+                    if p.age < 11:
+                        raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
+                    if i == 0 and not p.phone:
+                        raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
             else:
-                if p.age < 11:
-                    raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
+                # Room bookings treat all guests generically, but still need phone for primary
                 if i == 0 and not p.phone:
-                    raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
+                    raise HTTPException(status_code=400, detail=f"Phone number is required for the primary passenger")
             
-            # Aadhaar validation contract: optional for minors under 18, mandatory for adults 18+
-            is_minor = p.age < 18
-            if not is_minor:
-                # Adults MUST provide a valid Aadhaar
+            # Aadhaar validation contract: optional for children <= 10, mandatory for anyone >= 11
+            is_child_age = p.age <= 10
+            if not is_child_age:
+                # 11+ MUST provide a valid Aadhaar
                 if not p.aadhaar or not p.aadhaar.strip():
-                    raise HTTPException(status_code=400, detail=f"Aadhaar is required for adult passenger {i+1}")
+                    raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
                 if not is_valid_aadhaar(p.aadhaar.strip()):
                     raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
             else:
-                # Minors: validate only if provided
+                # Children (<= 10): validate only if provided
                 if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
                     raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
     
@@ -163,8 +175,19 @@ async def process_checkout(
         if available < request.quantity:
             raise HTTPException(status_code=400, detail=f"Insufficient inventory. Requested: {request.quantity}, Available: {available}")
             
-        # 2. Get base variant details
-        variant_query = select(PackageVariant).where(PackageVariant.id == request.variant_id).limit(1)
+        # 2. Get base variant details and verify parent package is active/not deleted
+        variant_query = (
+            select(PackageVariant)
+            .join(Package, Package.id == PackageVariant.package_id)
+            .where(
+                PackageVariant.id == request.variant_id,
+                PackageVariant.is_active == True,
+                PackageVariant.deleted_at.is_(None),
+                Package.status == 'ACTIVE',
+                Package.deleted_at.is_(None)
+            )
+            .limit(1)
+        )
         v_res = await db.execute(variant_query)
         variant = v_res.scalar_one_or_none()
         if not variant:
@@ -185,17 +208,33 @@ async def process_checkout(
         if not request.slot_start or not request.slot_end:
             raise HTTPException(status_code=400, detail="slot_start and slot_end are required for room")
 
-        # 1. Fetch RoomVariant
+        # 1. Fetch RoomVariant and verify parent room is active/not deleted
         if request.room_variant_id:
-            variant_query = select(RoomVariant).where(
-                RoomVariant.id == request.room_variant_id,
-                RoomVariant.deleted_at.is_(None)
-            ).limit(1)
+            variant_query = (
+                select(RoomVariant)
+                .join(Room, Room.id == RoomVariant.room_id)
+                .where(
+                    RoomVariant.id == request.room_variant_id,
+                    RoomVariant.is_active == True,
+                    RoomVariant.deleted_at.is_(None),
+                    Room.is_active == True,
+                    Room.deleted_at.is_(None)
+                )
+                .limit(1)
+            )
         else:
-            variant_query = select(RoomVariant).where(
-                RoomVariant.room_id == request.room_id,
-                RoomVariant.deleted_at.is_(None)
-            ).limit(1)
+            variant_query = (
+                select(RoomVariant)
+                .join(Room, Room.id == RoomVariant.room_id)
+                .where(
+                    RoomVariant.room_id == request.room_id,
+                    RoomVariant.is_active == True,
+                    RoomVariant.deleted_at.is_(None),
+                    Room.is_active == True,
+                    Room.deleted_at.is_(None)
+                )
+                .limit(1)
+            )
 
         v_res = await db.execute(variant_query)
         variant = v_res.scalar_one_or_none()
@@ -215,14 +254,17 @@ async def process_checkout(
         # 3. Generate stay date range (arrival inclusive, departure exclusive)
         arrival = request.travel_date
         departure = request.departure_date or (arrival + timedelta(days=1))
-        if departure <= arrival:
-            raise HTTPException(status_code=400, detail="departure_date must be after travel_date")
+        if departure < arrival:
+            raise HTTPException(status_code=400, detail="departure_date cannot be before travel_date")
 
         stay_dates = []
-        current = arrival
-        while current < departure:
-            stay_dates.append(current)
-            current += timedelta(days=1)
+        if departure == arrival:
+            stay_dates.append(arrival)
+        else:
+            current = arrival
+            while current < departure:
+                stay_dates.append(current)
+                current += timedelta(days=1)
 
         # 4. Lock ALL inventory slots across the entire stay with SELECT FOR UPDATE
         locked_inventories = []
@@ -372,6 +414,11 @@ async def process_checkout(
             "commission_percentage": str(commission_percentage),
         }
         
+    if request.target_type == 'room':
+        if request.slot_start:
+            pricing_snapshot["slot_start"] = str(request.slot_start)
+        if request.slot_end:
+            pricing_snapshot["slot_end"] = str(request.slot_end)
         
     # --- Razorpay Order Generation ---
     payment_percentage = request.payment_percentage if request.payment_percentage is not None else 100.0
@@ -395,7 +442,8 @@ async def process_checkout(
     draft_id = "DRF-" + str(uuid.uuid4())[:8].upper()
     receipt_id = f"rcpt_{draft_id}"
     
-    razorpay_order = razorpay_service.create_order(
+    razorpay_order = await asyncio.to_thread(
+        razorpay_service.create_order,
         amount=float(payable_amount),
         receipt=receipt_id,
         notes={"draft_id": draft_id}
@@ -517,7 +565,7 @@ async def get_agent_dashboard_summary(
     total_earnings = Decimal("0.00")
     this_month_earnings = Decimal("0.00")
     
-    paid_statuses = {BookingStatus.CONFIRMED, BookingStatus.FULLY_PAID}
+    paid_statuses = {BookingStatus.FULLY_PAID}
     for b in bookings:
         if b.status in paid_statuses:
             comm = b.agent_commission or Decimal("0.00")
@@ -590,6 +638,7 @@ async def get_agent_bookings(
             "package_title": package_title,
             "variant_title": variant_title,
             "passenger_names": [p.full_name for p in b.passengers],
+            "agent_commission": float(b.agent_commission or 0),
         })
         
     return sanitized_items
@@ -620,7 +669,7 @@ async def get_tourist_dashboard_summary(
     from datetime import date
     today = date.today()
     for b in bookings:
-        if b.status == BookingStatus.CONFIRMED or b.status == BookingStatus.FULLY_PAID:
+        if b.status == BookingStatus.FULLY_PAID:
             if b.travel_date < today:
                 past_trips += 1
             else:
@@ -682,23 +731,31 @@ async def get_live_booking_count(db: AsyncSession = Depends(get_db)):
     """
     Returns the live booking count for the navbar.
     Base count is 10000 + the actual number of successful bookings.
+    Uses L1/L2 cache to keep navbar loads under 1ms.
     """
-    from sqlalchemy import func
-    
-    # Count only fully paid or confirmed bookings
-    query = select(func.count(Booking.id)).where(Booking.status.in_([BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID]))
-    result = await db.execute(query)
-    count = result.scalar() or 0
-    
+    from app.utils.cache import ttl_cache_get_or_set
+
+    async def _fetch_count():
+        from sqlalchemy import func
+        query = select(func.count(Booking.id)).where(
+            Booking.status.in_([BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID])
+        )
+        result = await db.execute(query)
+        return result.scalar() or 0
+
+    count = await ttl_cache_get_or_set("bookings:live_count", 30, _fetch_count)
     return {"count": 10000 + count}
 
 @router.get("/{public_id}")
 async def get_booking_details(
     public_id: str,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional),
 ):
     """
-    Retrieve booking detail by its public ID, securely sanitizing any internal agent commission info.
+    Retrieve booking detail by its public ID.
+    Commission fields are ONLY included when the authenticated user owns the booking as an agent or is an admin.
+    Public users and tourists never receive agent_commission or agent_payable.
     """
     from app.models.room import Room, RoomVariant
     query = (
@@ -723,8 +780,22 @@ async def get_booking_details(
     package_title = row[1] if b.variant_id else row[3]
     variant_title = row[2] if b.variant_id else row[4]
     
-    room_checkin = row[5].strftime('%I:%M %p') if row[5] else None
-    room_checkout = row[6].strftime('%I:%M %p') if row[6] else None
+    room_checkin = None
+    room_checkout = None
+    
+    if b.pricing_snapshot and b.pricing_snapshot.get('slot_start'):
+        from datetime import datetime
+        try:
+            # Parse from "%H:%M:%S" to "%I:%M %p"
+            room_checkin = datetime.strptime(b.pricing_snapshot.get('slot_start'), "%H:%M:%S").strftime('%I:%M %p')
+            room_checkout = datetime.strptime(b.pricing_snapshot.get('slot_end'), "%H:%M:%S").strftime('%I:%M %p')
+        except:
+            pass
+            
+    if not room_checkin:
+        room_checkin = row[5].strftime('%I:%M %p') if row[5] else None
+        room_checkout = row[6].strftime('%I:%M %p') if row[6] else None
+
     room_address = row[7] if row[7] else None
     
     agent_id = None
@@ -782,6 +853,41 @@ async def get_booking_details(
     cancel_result = await db.execute(cancel_query)
     has_pending_cancellation = cancel_result.scalar_one_or_none() is not None
 
+    # ─── Build Payment Ledger ─────────────────────────────────────────────────
+    from app.models.payment import Payment
+    from app.models.enums import PaymentStatus
+    payment_ledger_stmt = select(Payment).where(
+        Payment.booking_id == b.id,
+        Payment.deleted_at.is_(None)
+    ).order_by(Payment.created_at.asc())
+    p_result = await db.execute(payment_ledger_stmt)
+    raw_payments = p_result.scalars().all()
+
+    payment_ledger = []
+    for p in raw_payments:
+        collected_by_label = p.collected_by_label
+        if not collected_by_label:
+            collected_by_label = "Razorpay" if p.collected_by_type == "RAZORPAY" else "Admin (Cash)"
+        payment_ledger.append({
+            "id": p.id,
+            "amount": float(p.amount),
+            "payment_method": p.payment_method,
+            "status": p.status.value if hasattr(p.status, "value") else str(p.status),
+            "collected_by_type": p.collected_by_type,
+            "collected_by_label": collected_by_label,
+            "payment_reference_id": p.payment_reference_id,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        })
+
+    # ─── Commission Gate: Only for owning agent or admin ─────────────────────
+    is_agent_owner = (
+        current_user is not None
+        and current_user.role == UserRole.AGENT
+        and b.agent_id == current_user.id
+    )
+    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+    show_commission = is_agent_owner or is_admin
+
     return {
         "id": b.id,
         "public_id": b.public_id,
@@ -795,7 +901,11 @@ async def get_booking_details(
         "gst_amount": float(b.gst_amount),
         "gateway_fee": float(b.gateway_fee),
         "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
-        "remaining_balance": float(b.remaining_balance),
+        "remaining_balance": (
+            float(max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")) - Decimal(str(b.paid_amount))))
+            if show_commission
+            else float(b.remaining_balance)
+        ),
         "paid_amount": float(b.paid_amount),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
         "created_at": b.created_at.isoformat() if b.created_at else None,
@@ -836,7 +946,16 @@ async def get_booking_details(
         "ticket_pdf_url": b.ticket_pdf_url,
         "invoice_pdf_url": b.invoice_pdf_url,
         "ticket_generation_status": b.ticket_generation_status.value if hasattr(b.ticket_generation_status, "value") else str(b.ticket_generation_status),
-        "invoice_generation_status": b.invoice_generation_status.value if hasattr(b.invoice_generation_status, "value") else str(b.invoice_generation_status)
+        "invoice_generation_status": b.invoice_generation_status.value if hasattr(b.invoice_generation_status, "value") else str(b.invoice_generation_status),
+        # Commission fields: only for owning agent or admin
+        "agent_commission": float(b.agent_commission or 0) if show_commission else None,
+        "agent_payable": (
+            float(Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
+            if show_commission
+            else None
+        ),
+        # Immutable payment history — always returned
+        "payment_ledger": payment_ledger,
     }
 
 class CancellationRequestInput(BaseModel):
@@ -949,9 +1068,11 @@ async def process_balance_checkout(
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required to perform balance payment")
 
-    # Verify ownership
-    is_owner = (booking.user_id == current_user.id or booking.agent_id == current_user.id)
-    if not is_owner:
+    # Verify ownership or admin access
+    is_owner = current_user is not None and (booking.user_id == current_user.id or booking.agent_id == current_user.id)
+    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+    
+    if not (is_owner or is_admin):
         raise HTTPException(status_code=403, detail="Not authorized to pay balance for this booking")
 
     if booking.status != BookingStatus.PARTIAL_PAID:
@@ -967,10 +1088,10 @@ async def process_balance_checkout(
         raise HTTPException(status_code=400, detail="Maximum payment attempts reached for this booking")
 
     # Generate a new Razorpay Order for remaining balance
-    is_agent_payment = current_user.role == UserRole.AGENT and booking.agent_id == current_user.id
+    is_agent_payment = current_user is not None and current_user.role == UserRole.AGENT and booking.agent_id == current_user.id
     
-    if is_agent_payment and booking.pricing_snapshot and 'agent_payable' in booking.pricing_snapshot:
-        agent_payable = Decimal(booking.pricing_snapshot['agent_payable'])
+    if is_agent_payment:
+        agent_payable = Decimal(str(booking.total_amount)) - Decimal(str(booking.agent_commission or "0.00"))
         captured_total = sum(Decimal(str(p.amount)) for p in booking.payments if p.status == PaymentStatus.CAPTURED)
         payable_amount = float(max(Decimal("0.00"), agent_payable - captured_total))
     else:
@@ -978,20 +1099,23 @@ async def process_balance_checkout(
         
     order_receipt = f"bal_{booking.public_id}_{uuid.uuid4().hex[:6].upper()}"
 
-    razorpay_order = razorpay_service.create_order(
+    razorpay_order = await asyncio.to_thread(
+        razorpay_service.create_order,
         amount=payable_amount,
         receipt=order_receipt,
         notes={"booking_id": booking.id, "type": "balance"}
     )
     razorpay_order_id = razorpay_order.get("id")
 
-    # Create CREATED payment record to track this attempt
+    # Create CREATED payment ledger row to track this attempt
     payment = Payment(
         booking_id=booking.id,
+        payment_reference_id=razorpay_order_id,  # idempotency key
         razorpay_order_id=razorpay_order_id,
         amount=booking.remaining_balance,
         status=PaymentStatus.CREATED,
-        payment_method="RAZORPAY"
+        payment_method="RAZORPAY",
+        collected_by_type="RAZORPAY",
     )
     db.add(payment)
     await db.commit()

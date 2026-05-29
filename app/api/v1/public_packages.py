@@ -3,11 +3,11 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_, text
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
 
 from app.core.timezone import ist_date_today
 from app.db.session import get_db
-from app.models.package import Package, PackageVariant, PackageVariantInventory
+from app.models.package import Package, PackageVariant, PackageVariantInventory, package_tags
 from app.models.tag import Tag
 from app.models.enums import PackageType, RegionType, PublishStatus
 from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO
@@ -51,10 +51,9 @@ async def get_packages(
     async def load_packages() -> PaginatedResponse[PackageListDTO]:
         offset = (page - 1) * size
 
-        # Base Query (Only ACTIVE and PUBLISHED packages)
+        # Base Query (Only PUBLISHED packages)
         base_query = select(Package).where(
             Package.status == PublishStatus.PUBLISHED,
-            Package.is_active == True,
             Package.deleted_at.is_(None)
         )
 
@@ -84,63 +83,76 @@ async def get_packages(
             base_query = base_query.where(Package.tags.any(Tag.name.in_(tags)))
 
         # Count Query
-        count_query = select(func.count()).select_from(base_query.subquery())
-        total_result = await db.execute(count_query)
-        total_count = total_result.scalar_one()
+        count_query = base_query.with_only_columns(func.count()).order_by(None)
 
-        # Subquery to get minimum price per package
-        price_subquery = (
-            select(
-                PackageVariant.package_id,
-                func.min(PackageVariant.adult_price).label("min_price")
-            )
-            .where(
-                PackageVariant.is_active == True,
-                PackageVariant.deleted_at == None,
-                PackageVariant.adult_price > 0
-            )
-            .group_by(PackageVariant.package_id)
-            .subquery()
-        )
-
+        # Projection Query to avoid ORM Hydration overhead
         data_query = (
             base_query
-            .outerjoin(price_subquery, Package.id == price_subquery.c.package_id)
-            .options(
-                selectinload(Package.variants.and_(
-                    PackageVariant.is_active == True,
-                    PackageVariant.deleted_at == None,
-                    PackageVariant.adult_price > 0,
-                )),
-                selectinload(Package.tags)
+            .outerjoin(package_tags, Package.id == package_tags.c.package_id)
+            .outerjoin(Tag, package_tags.c.tag_id == Tag.id)
+            .with_only_columns(
+                Package.id,
+                Package.slug,
+                Package.title,
+                Package.type,
+                Package.duration,
+                Package.place,
+                Package.region,
+                Package.cover_image_url,
+                Package.brochure_pdf_url,
+                Package.generated_brochure_url,
+                Package.is_featured,
+                Package.starting_price,
+                Package.transport_info,
+                func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
             )
+            .group_by(Package.id)
         )
 
         # Sorting
         if sort == "price_low":
-            data_query = data_query.order_by(price_subquery.c.min_price.asc().nulls_last(), Package.id.desc())
+            data_query = data_query.order_by(Package.starting_price.asc().nulls_last(), Package.id.desc())
         elif sort == "price_high":
-            data_query = data_query.order_by(price_subquery.c.min_price.desc().nulls_last(), Package.id.desc())
+            data_query = data_query.order_by(Package.starting_price.desc().nulls_last(), Package.id.desc())
         else: # Default: priority
             data_query = data_query.order_by(Package.order_priority.asc(), Package.id.desc())
 
         data_query = data_query.offset(offset).limit(size)
         
-        result = await db.execute(data_query)
-        packages = result.scalars().all()
+        total_count = (await db.execute(count_query)).scalar_one()
+        packages = (await db.execute(data_query)).all()
+
+        # Fetch variants manually in one go to avoid ORM hydration penalty while giving frontend child pricing
+        package_ids = [pkg.id for pkg in packages]
+        variants_by_pkg = {}
+        if package_ids:
+            from app.models.package import PackageVariant
+            variants_query = select(PackageVariant).where(
+                PackageVariant.package_id.in_(package_ids),
+                PackageVariant.is_active == True,
+                PackageVariant.deleted_at.is_(None)
+            )
+            all_variants = (await db.execute(variants_query)).scalars().all()
+            for v in all_variants:
+                variants_by_pkg.setdefault(v.package_id, []).append(PackageVariantPublicDTO(
+                    id=v.id,
+                    title=v.title,
+                    adult_price=v.adult_price,
+                    child_price=v.child_price,
+                    transport_info=v.transport_info
+                ))
 
         # Map to DTOs
         from app.services.r2_storage import r2_service
+        import asyncio
 
-        dto_list = []
-        for pkg in packages:
-            # Calculate Starting Price
-            starting_price = min((v.adult_price for v in pkg.variants), default=None)
+        async def build_dto(pkg):
             active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
-            brochure_url = await r2_service.get_public_url(active_brochure_key)
-            gen_brochure_url = await r2_service.get_public_url(pkg.generated_brochure_url)
-            
-            dto = PackageListDTO(
+            brochure_url, gen_brochure_url = await asyncio.gather(
+                r2_service.get_public_url(active_brochure_key),
+                r2_service.get_public_url(pkg.generated_brochure_url)
+            )
+            return PackageListDTO(
                 id=pkg.id,
                 slug=pkg.slug,
                 title=pkg.title,
@@ -152,20 +164,13 @@ async def get_packages(
                 generated_brochure_url=gen_brochure_url,
                 cover_image_url=pkg.cover_image_url,
                 is_featured=pkg.is_featured,
-                tags=[tag.name for tag in pkg.tags if tag.is_active],
-                starting_price=starting_price,
-                variants=[
-                    PackageVariantPublicDTO(
-                        id=v.id,
-                        title=v.title,
-                        adult_price=v.adult_price,
-                        child_price=v.child_price,
-                        transport_info=v.transport_info
-                    )
-                    for v in pkg.variants
-                ]
+                tags=pkg.tags_list or [],
+                starting_price=pkg.starting_price,
+                transport_info=pkg.transport_info,
+                variants=variants_by_pkg.get(pkg.id, [])
             )
-            dto_list.append(dto)
+
+        dto_list = await asyncio.gather(*(build_dto(pkg) for pkg in packages))
 
         has_next = (offset + size) < total_count
         has_prev = page > 1
@@ -200,37 +205,55 @@ async def get_package_detail(
             .where(
                 Package.slug == slug,
                 Package.status == PublishStatus.PUBLISHED,
-                Package.is_active == True,
                 Package.deleted_at.is_(None)
-            )
-            .options(
-                selectinload(Package.variants.and_(
-                    PackageVariant.is_active == True,
-                    PackageVariant.deleted_at == None,
-                    PackageVariant.adult_price > 0,
-                )),
-                selectinload(Package.tags),
-                selectinload(Package.gallery),
-                selectinload(Package.itinerary),
-                selectinload(Package.highlights),
-                selectinload(Package.inclusions),
-                selectinload(Package.exclusions),
-                selectinload(Package.boarding_points),
-                selectinload(Package.faqs),
-                selectinload(Package.policies)
             )
         )
         
-        result = await db.execute(query)
-        pkg = result.scalar_one_or_none()
+        pkg = (await db.execute(query)).unique().scalar_one_or_none()
         
         if not pkg:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Package not found or inactive"
             )
+
+        import asyncio
+        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy
+
+        # Fetch all relationships concurrently to eliminate 11 sequential roundtrips
+        async def fetch_rel(model, active_filter=None):
+            q = select(model).where(model.package_id == pkg.id)
+            if active_filter is not None:
+                q = q.where(active_filter)
+            return (await db.execute(q)).scalars().all()
+
+        results = await asyncio.gather(
+            fetch_rel(PackageVariant, and_(PackageVariant.is_active == True, PackageVariant.deleted_at == None)),
+            fetch_rel(PackageGalleryImage),
+            fetch_rel(PackageItineraryDay),
+            fetch_rel(PackageHighlight),
+            fetch_rel(PackageInclusion),
+            fetch_rel(PackageExclusion),
+            fetch_rel(PackageBoardingPoint),
+            fetch_rel(PackageFAQ),
+            fetch_rel(PackagePolicy)
+        )
+
+        pkg_variants = results[0]
+        # For tags, we must join the association table
+        tags_query = select(Tag).join(package_tags).where(package_tags.c.package_id == pkg.id, Tag.is_active == True)
+        pkg_tags = (await db.execute(tags_query)).scalars().all()
+        
+        pkg_gallery = results[1]
+        pkg_itinerary = results[2]
+        pkg_highlights = results[3]
+        pkg_inclusions = results[4]
+        pkg_exclusions = results[5]
+        pkg_boarding_points = results[6]
+        pkg_faqs = results[7]
+        pkg_policies = results[8]
             
-        starting_price = min((v.adult_price for v in pkg.variants), default=None)
+        starting_price = min((v.adult_price for v in pkg_variants), default=None)
         
         from app.services.r2_storage import r2_service
         active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
@@ -250,7 +273,7 @@ async def get_package_detail(
             generated_brochure_url=gen_brochure_url,
             cover_image_url=pkg.cover_image_url,
             is_featured=pkg.is_featured,
-            tags=[tag.name for tag in pkg.tags if tag.is_active],
+            tags=[tag.name for tag in pkg_tags if tag.is_active],
             starting_price=starting_price,
             meta_title=pkg.meta_title,
             meta_description=pkg.meta_description,
@@ -263,38 +286,38 @@ async def get_package_detail(
                     adult_price=v.adult_price,
                     child_price=v.child_price,
                     transport_info=v.transport_info
-                ) for v in pkg.variants
+                ) for v in pkg_variants
             ],
             gallery=[
-                item for item in pkg.gallery
+                item for item in pkg_gallery
                 if not item.deleted_at and has_text(item.image_url)
             ],
             itinerary=[
-                item for item in pkg.itinerary
+                item for item in pkg_itinerary
                 if not item.deleted_at and has_text(item.title)
             ],
             highlights=[
-                item for item in pkg.highlights
+                item for item in pkg_highlights
                 if not item.deleted_at and has_text(item.title)
             ],
             inclusions=[
-                item for item in pkg.inclusions
+                item for item in pkg_inclusions
                 if not item.deleted_at and has_text(item.label)
             ],
             exclusions=[
-                item for item in pkg.exclusions
+                item for item in pkg_exclusions
                 if not item.deleted_at and has_text(item.label)
             ],
             boarding_points=[
-                item for item in pkg.boarding_points
+                item for item in pkg_boarding_points
                 if not item.deleted_at and has_text(item.title)
             ],
             faqs=[
-                item for item in pkg.faqs
+                item for item in pkg_faqs
                 if not item.deleted_at and has_text(item.question) and has_text(item.answer)
             ],
             policies=[
-                item for item in pkg.policies
+                item for item in pkg_policies
                 if not item.deleted_at and has_text(item.title) and has_text(item.description)
             ]
         )
@@ -346,7 +369,6 @@ async def get_package_availability(
         .where(
             Package.slug == slug,
             Package.status == PublishStatus.PUBLISHED,
-            Package.is_active == True,
             Package.deleted_at.is_(None),
         )
         .options(selectinload(Package.variants))
@@ -475,7 +497,6 @@ async def get_unique_places(db: AsyncSession = Depends(get_db)):
         select(Package.place)
         .where(
             Package.status == PublishStatus.PUBLISHED,
-            Package.is_active == True,
             Package.deleted_at.is_(None),
             Package.place.is_not(None),
             Package.place != ""

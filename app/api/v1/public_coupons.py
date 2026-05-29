@@ -104,15 +104,18 @@ async def get_active_coupons(
         result = await db.execute(query)
         coupons = result.scalars().all()
         
-        valid_coupons = []
+        specific_coupons = []
+        global_coupons = []
         for c in coupons:
             is_global = not c.applicable_package_ids and not c.applicable_room_ids
             if is_global:
-                valid_coupons.append(c)
+                global_coupons.append(c)
             elif target_type == 'PACKAGE' and target_id in (c.applicable_package_ids or []):
-                valid_coupons.append(c)
+                specific_coupons.append(c)
             elif target_type == 'ROOM' and target_id in (c.applicable_room_ids or []):
-                valid_coupons.append(c)
+                specific_coupons.append(c)
+
+        valid_coupons = specific_coupons + global_coupons
 
         return [
             {
@@ -121,6 +124,7 @@ async def get_active_coupons(
                 "discount_value": float(c.discount_value),
                 "min_booking_amount": float(c.min_booking_amount) if c.min_booking_amount else None,
                 "max_discount_amount": float(c.max_discount_amount) if c.max_discount_amount else None,
+                "min_tickets": c.min_tickets if c.min_tickets else None,
             }
             for c in valid_coupons
         ]

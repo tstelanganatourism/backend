@@ -32,30 +32,48 @@ async def get_current_user_optional(
 ) -> Optional[User]:
     """
     Optionally fetch the current authenticated user if the Bearer token is provided.
-    Does not raise exceptions if the user is unauthenticated (returns None instead).
+    If a token is provided but is invalid/expired, it raises a 401 so the frontend
+    can trigger a token refresh, rather than silently failing to anonymous.
     """
     if not credentials:
         return None
+        
+    # If a token is provided, it MUST be valid, otherwise we want the 401 interceptor to catch it.
+    token = credentials.credentials
     try:
-        token = credentials.credentials
         payload = decode_token(token, expected_type="access")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is invalid or expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
         
-        jti: str = payload.get("jti", "")
-        if jti and await is_token_blacklisted(jti):
-            return None
-            
-        user_id: int = int(payload["sub"])
-        user = await get_user_by_id(db, user_id)
+    jti: str = payload.get("jti", "")
+    if jti and await is_token_blacklisted(jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
         
-        if user is None:
-            return None
-            
-        if user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
-            return None
-            
-        return user
-    except Exception:
-        return None
+    user_id: int = int(payload["sub"])
+    user = await get_user_by_id(db, user_id)
+    
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account not found.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    if user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been suspended.",
+        )
+        
+    return user
 
 
 async def get_current_user(

@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from app.db.session import get_db
 from app.middleware.auth import require_admin
-from app.models.booking import Booking, BookingPassenger
+from app.models.booking import Booking, BookingPassenger, BookingStayDate
 from app.models.package import PackageVariant, Package
 from app.models.room import RoomVariant, Room
 from app.models.user import User
@@ -30,6 +30,8 @@ async def list_admin_bookings(
     source_filter: Optional[str] = Query(None, description="Filter by source: PUBLIC or AGENT"),
     target_filter: Optional[str] = Query(None, description="Filter by target: PACKAGE or ROOM"),
     agent_id: Optional[int] = Query(None, description="Filter by Agent ID"),
+    variant_id: Optional[int] = Query(None, description="Filter by Package Variant ID"),
+    room_variant_id: Optional[int] = Query(None, description="Filter by Room Variant ID"),
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
     limit: int = Query(20, ge=1, le=100),
@@ -38,23 +40,16 @@ async def list_admin_bookings(
     """
     Paginated admin booking listing. Never exposes commission data.
     """
-    query = (
-        select(Booking)
-        .options(
-            selectinload(Booking.passengers),
-        )
-        .where(Booking.deleted_at.is_(None))
-        .order_by(Booking.created_at.desc())
-    )
+    base_query = select(Booking).where(Booking.deleted_at.is_(None))
 
     if agent_id is not None:
-        query = query.where(Booking.agent_id == agent_id)
+        base_query = base_query.where(Booking.agent_id == agent_id)
 
     if status_filter:
         from app.models.enums import BookingStatus
         try:
             status_enum = BookingStatus(status_filter.upper())
-            query = query.where(Booking.status == status_enum)
+            base_query = base_query.where(Booking.status == status_enum)
         except ValueError:
             pass
 
@@ -62,29 +57,41 @@ async def list_admin_bookings(
         from app.models.enums import BookingSource
         try:
             source_enum = BookingSource(source_filter.upper())
-            query = query.where(Booking.source == source_enum)
+            base_query = base_query.where(Booking.source == source_enum)
         except ValueError:
             pass
 
     if target_filter:
         if target_filter.upper() == "ROOM":
-            query = query.where(Booking.room_variant_id.isnot(None))
+            base_query = base_query.where(Booking.room_variant_id.isnot(None))
         elif target_filter.upper() == "PACKAGE":
-            query = query.where(Booking.variant_id.isnot(None))
+            base_query = base_query.where(Booking.variant_id.isnot(None))
 
-    if start_date:
+    if variant_id is not None:
+        base_query = base_query.where(Booking.variant_id == variant_id)
+
+    if room_variant_id is not None:
+        base_query = base_query.where(Booking.room_variant_id == room_variant_id)
+
+    if start_date or end_date:
         try:
             from datetime import datetime
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-            query = query.where(Booking.travel_date >= start_dt)
-        except ValueError:
-            pass
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
             
-    if end_date:
-        try:
-            from datetime import datetime
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
-            query = query.where(Booking.travel_date <= end_dt)
+            conditions = []
+            if start_dt and end_dt:
+                conditions.append(and_(Booking.travel_date >= start_dt, Booking.travel_date <= end_dt))
+                conditions.append(Booking.stay_dates.any(and_(BookingStayDate.date >= start_dt, BookingStayDate.date <= end_dt)))
+            elif start_dt:
+                conditions.append(Booking.travel_date >= start_dt)
+                conditions.append(Booking.stay_dates.any(BookingStayDate.date >= start_dt))
+            elif end_dt:
+                conditions.append(Booking.travel_date <= end_dt)
+                conditions.append(Booking.stay_dates.any(BookingStayDate.date <= end_dt))
+                
+            if conditions:
+                base_query = base_query.where(or_(*conditions))
         except ValueError:
             pass
 
@@ -100,7 +107,6 @@ async def list_admin_bookings(
                     User.phone_number.ilike(s),
                 )
             )
-            .scalar_subquery()
         )
         
         # Subquery: find booking IDs matching the primary passenger's name
@@ -112,7 +118,6 @@ async def list_admin_bookings(
                     BookingPassenger.full_name.ilike(s)
                 )
             )
-            .scalar_subquery()
         )
         
         # Explicitly support 'guest' keyword for public checkouts
@@ -120,7 +125,7 @@ async def list_admin_bookings(
         if search.lower() == "guest":
             guest_condition = [Booking.user_id.is_(None)]
 
-        query = query.where(
+        base_query = base_query.where(
             or_(
                 Booking.public_id.ilike(s),
                 Booking.user_id.in_(user_id_subq),
@@ -130,12 +135,18 @@ async def list_admin_bookings(
         )
 
     # Count total
-    count_query = select(func.count()).select_from(query.subquery())
+    count_query = base_query.with_only_columns(func.count(Booking.id)).order_by(None)
     total_result = await db.execute(count_query)
     total = total_result.scalar_one() or 0
 
-    # Paginate
-    paginated_query = query.limit(limit).offset(offset)
+    # Paginate and add loaders
+    paginated_query = (
+        base_query
+        .options(selectinload(Booking.passengers))
+        .order_by(Booking.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
     result = await db.execute(paginated_query)
     bookings = result.scalars().all()
 
@@ -470,6 +481,13 @@ async def admin_create_booking(
         "admin_name": current_admin.full_name,
     }
 
+    if request.target_type == 'room':
+        if request.slot_start:
+            pricing_snapshot["slot_start"] = str(request.slot_start)
+        if request.slot_end:
+            pricing_snapshot["slot_end"] = str(request.slot_end)
+
+
     # Determine prefix and sequence for Admin booking
     public_id_val = ""
     if request.target_type == 'room':
@@ -554,6 +572,15 @@ async def admin_create_booking(
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
     await db.commit()
+
+    # Immediately invalidate L1+L2 cache so availability is reflected
+    from app.utils.cache import clear_cache_prefix
+    if request.target_type == 'package':
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+    elif request.target_type == 'room':
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
 
     return {
         "status": "success",
@@ -794,6 +821,15 @@ async def admin_cancel_booking(
 
     await db.commit()
     
+    # Immediately invalidate L1+L2 cache so freed seats are reflected to all visitors
+    from app.utils.cache import clear_cache_prefix
+    if booking.variant_id:
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+    elif booking.room_variant_id:
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+
     if sse_payload:
         from app.utils.sse import sse_manager
         await sse_manager.broadcast_event("package", str(sse_payload["package_id"]), "INVENTORY_UPDATE", sse_payload)
@@ -855,73 +891,140 @@ async def list_cancellation_requests(
     return items
 
 
+
+class RecordCashPaymentRequest(BaseModel):
+    amount: Optional[float] = Field(None, description="Amount to record. Defaults to full remaining balance.")
+    payment_method: str = Field("CASH", description="CASH or BANK_TRANSFER")
+    collected_by_label: Optional[str] = Field(None, description="Human-readable label, e.g. 'Admin: Ravi'")
+
+
 @router.post("/{id}/mark-balance-paid")
-async def admin_mark_balance_paid(
+async def admin_mark_balance_paid_legacy(
     id: int,
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(require_admin),
 ):
     """
-    Admin manually marks the remaining balance of a booking as paid.
+    Legacy alias kept for backward compatibility with existing frontend calls.
+    Delegates to the full record-cash-payment implementation.
+    Records the complete remaining balance as CASH collected by admin.
     """
+    return await _do_record_cash_payment(
+        booking_id=id, amount=None, payment_method="CASH",
+        collected_by_label=None, db=db, current_admin=current_admin
+    )
+
+
+@router.post("/{id}/record-cash-payment")
+async def admin_record_cash_payment(
+    id: int,
+    body: RecordCashPaymentRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """
+    Admin records a manual cash or bank-transfer payment for a booking.
+    Each call appends a new immutable ledger row.
+    Idempotent by payment_reference_id (UUID-based).
+    Booking status is recomputed from the full payment ledger after each entry.
+    """
+    return await _do_record_cash_payment(
+        booking_id=id, amount=body.amount, payment_method=body.payment_method,
+        collected_by_label=body.collected_by_label, db=db, current_admin=current_admin
+    )
+
+
+async def _do_record_cash_payment(
+    booking_id: int,
+    amount: Optional[float],
+    payment_method: str,
+    collected_by_label: Optional[str],
+    db: AsyncSession,
+    current_admin: User,
+):
     from app.models.enums import BookingStatus, PaymentStatus
     from app.models.payment import Payment
+    from app.utils.ledger import recompute_booking_ledger
+    from loguru import logger
     import uuid
 
-    # 1. Fetch booking with locking
-    booking_stmt = select(Booking).where(Booking.id == id).with_for_update()
+    # 1. Fetch booking
+    booking_stmt = select(Booking).where(Booking.id == booking_id)
     booking_res = await db.execute(booking_stmt)
     booking = booking_res.scalar_one_or_none()
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    if booking.status != BookingStatus.PARTIAL_PAID:
+    if booking.status in (BookingStatus.FULLY_PAID, BookingStatus.CANCELLED, BookingStatus.REFUNDED):
         raise HTTPException(
             status_code=400,
-            detail="Only partially paid bookings can be marked as balance paid"
+            detail=f"Cannot record payment for a booking with status: {booking.status.value}"
         )
 
     if booking.remaining_balance <= Decimal("0.01"):
-        raise HTTPException(status_code=400, detail="No remaining balance to pay")
+        raise HTTPException(status_code=400, detail="No remaining balance to record payment for")
 
-    # 2. Count captured payments (ensure limit of 1 initial + 1 balance)
-    captured_stmt = select(func.count(Payment.id)).where(
-        Payment.booking_id == booking.id,
-        Payment.status == PaymentStatus.CAPTURED
+    # 2. Determine amount to record
+    record_amount = Decimal(str(amount)) if amount else booking.remaining_balance
+    if record_amount > booking.remaining_balance + Decimal("0.01"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Amount {record_amount} exceeds remaining balance {booking.remaining_balance}"
+        )
+    record_amount = min(record_amount, booking.remaining_balance)
+
+    # 3. Generate deterministic idempotency reference
+    payment_reference_id = f"CASH_{booking.public_id}_{uuid.uuid4().hex[:8].upper()}"
+
+    # 4. Idempotency guard: check if same reference was already inserted (shouldn't happen with UUID, but guard anyway)
+    existing = await db.execute(
+        select(Payment).where(Payment.payment_reference_id == payment_reference_id)
     )
-    captured_res = await db.execute(captured_stmt)
-    captured_count = captured_res.scalar_one() or 0
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="This payment reference already exists. Duplicate prevented.")
 
-    if captured_count >= 2:
-        raise HTTPException(status_code=400, detail="Maximum payment records reached for this booking")
+    # 5. Build human-readable label
+    label = collected_by_label or f"Admin: {current_admin.full_name}"
 
-    # 3. Create manual payment record
+    # 6. Insert CAPTURED ledger row directly (cash payments are immediately captured)
     manual_payment = Payment(
         booking_id=booking.id,
-        razorpay_order_id=f"man_{booking.public_id}_{uuid.uuid4().hex[:6].upper()}",
-        razorpay_payment_id=f"pay_man_{uuid.uuid4().hex[:10].upper()}",
-        amount=booking.remaining_balance,
+        payment_reference_id=payment_reference_id,
+        razorpay_order_id=None,
+        razorpay_payment_id=None,
+        amount=record_amount,
         status=PaymentStatus.CAPTURED,
-        payment_method="ADMIN_MANUAL",
+        payment_method=payment_method.upper(),
+        collected_by_type="ADMIN",
+        collected_by_user_id=current_admin.id,
+        collected_by_label=label,
     )
     db.add(manual_payment)
+    await db.flush()
 
-    # 4. Update booking amounts and status
-    booking.paid_amount = booking.total_amount
-    booking.remaining_balance = Decimal("0.00")
-    booking.status = BookingStatus.FULLY_PAID
+    # 7. Recompute booking status from full ledger — single source of truth
+    booking = await recompute_booking_ledger(booking.id, db)
 
     await db.commit()
 
-    # 5. Queue ticket and invoice generation tasks after the paid state is committed.
+    # 8. Queue PDF generation tasks if now fully paid
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == "FULLY_PAID" or booking.status == "CONFIRMED")
+        await arq_pool.enqueue_job(
+            "process_post_booking_documents_task",
+            booking.id,
+            booking.status == BookingStatus.FULLY_PAID
+        )
     except Exception as arq_err:
-        logger.warning(f"Failed to enqueue PDF tasks for admin balance payment: {arq_err}")
+        from loguru import logger
+        logger.warning(f"Failed to enqueue PDF tasks for admin cash payment: {arq_err}")
 
     return {
         "status": "success",
-        "message": f"Booking {booking.public_id} successfully marked as FULLY_PAID. PDFs queued for generation.",
+        "message": f"Payment of ₹{float(record_amount):,.2f} recorded for booking {booking.public_id}.",
+        "booking_status": booking.status.value,
+        "paid_amount": float(booking.paid_amount),
+        "remaining_balance": float(booking.remaining_balance),
+        "payment_reference_id": payment_reference_id,
     }

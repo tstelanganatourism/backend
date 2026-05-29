@@ -24,6 +24,8 @@ class Room(BaseModel, SEOMixin):
     address = Column(String, nullable=True)
     map_url = Column(String, nullable=True)
     facilities = Column(JSONB, nullable=True) # Array of strings
+    starting_price = Column(Numeric(12, 2), nullable=False, server_default="0.00", index=True)
+    starting_weekend_price = Column(Numeric(12, 2), nullable=True)
     cover_image_url = Column(String, nullable=True)
     brochure_pdf_url = Column(String, nullable=True)
     generated_brochure_url = Column(String, nullable=True)

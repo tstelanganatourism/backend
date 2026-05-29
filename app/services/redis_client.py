@@ -26,10 +26,23 @@ def get_redis() -> aioredis.Redis:
             settings.REDIS_URL,
             encoding="utf-8",
             decode_responses=True,
-            socket_connect_timeout=2.5,
-            socket_timeout=2.5,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
         )
     return _redis_client
+
+_redis_client_raw: Optional[aioredis.Redis] = None
+
+def get_redis_raw() -> aioredis.Redis:
+    """Return the process-level Redis client for raw bytes (no string decoding)."""
+    global _redis_client_raw
+    if _redis_client_raw is None:
+        _redis_client_raw = aioredis.from_url(
+            settings.REDIS_URL,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        )
+    return _redis_client_raw
 
 
 # ─── OTP Operations ──────────────────────────────────────────────────────────

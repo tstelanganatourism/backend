@@ -237,16 +237,18 @@ async def _finalize_draft(
         )
         db.add(passenger)
 
-    # 5b. Create Payment record for audit trail
+    # 5b. Create Payment ledger row for audit trail
     from app.models.payment import Payment
     from app.models.enums import PaymentStatus
     payment_record = Payment(
         booking_id=booking.id,
+        payment_reference_id=draft.razorpay_order_id,  # idempotency key
         razorpay_order_id=draft.razorpay_order_id,
         razorpay_payment_id=payment_id,
         amount=draft.amount_payable,
         status=PaymentStatus.CAPTURED,
         payment_method="RAZORPAY",
+        collected_by_type="RAZORPAY",
     )
     db.add(payment_record)
 
@@ -322,30 +324,26 @@ async def verify_payment(
             booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
             bk_res = await db.execute(booking_stmt)
             booking = bk_res.scalar_one()
-            
+
             if payment.status == PaymentStatus.CREATED:
-                captured_stmt = select(func.count(Payment.id)).where(
-                    Payment.booking_id == booking.id,
-                    Payment.status == PaymentStatus.CAPTURED
+                # Idempotency: check if this razorpay_payment_id was already captured
+                already_captured = await db.execute(
+                    select(Payment).where(
+                        Payment.razorpay_payment_id == request.razorpay_payment_id,
+                        Payment.status == PaymentStatus.CAPTURED
+                    )
                 )
-                captured_res = await db.execute(captured_stmt)
-                captured_count = captured_res.scalar_one() or 0
-                
-                if captured_count >= 2:
-                    raise HTTPException(status_code=400, detail="Maximum payment attempts reached for this booking")
-                
+                if already_captured.scalar_one_or_none():
+                    return {"status": "success", "booking_id": booking.public_id}
+
                 payment.status = PaymentStatus.CAPTURED
                 payment.razorpay_payment_id = request.razorpay_payment_id
                 payment.razorpay_signature = request.razorpay_signature
-                
-                booking.paid_amount += payment.amount
-                booking.remaining_balance = max(Decimal("0.00"), booking.total_amount - booking.paid_amount)
-                
-                if booking.remaining_balance <= Decimal("0.01"):
-                    booking.status = BookingStatus.FULLY_PAID
-                
-                await db.flush()
-                
+
+                # Recompute all balances from ledger — no manual arithmetic
+                from app.utils.ledger import recompute_booking_ledger
+                booking = await recompute_booking_ledger(booking.id, db)
+
             # Use background tasks for balance payments too to prevent blocking
             async def _enqueue_bal_task(b_id: int, is_fully_paid: bool):
                 try:
@@ -354,10 +352,10 @@ async def verify_payment(
                     await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
                 except Exception as arq_err:
                     logger.warning(f"Failed to enqueue post-booking documents task for balance payment: {arq_err}")
-                    
+
             if payment.status == PaymentStatus.CAPTURED:
                 background_tasks.add_task(_enqueue_bal_task, booking.id, booking.status == BookingStatus.FULLY_PAID)
-            
+
             await db.commit()
             return {"status": "success", "booking_id": booking.public_id}
             
@@ -366,6 +364,15 @@ async def verify_payment(
     sse_payloads = []
     public_id = await _finalize_draft(draft, request.razorpay_payment_id, db, background_tasks, sse_payloads)
     await db.commit()
+    
+    # Immediately invalidate L1+L2 cache so inventory/availability is live for next visitor
+    from app.utils.cache import clear_cache_prefix
+    if draft.target_type == 'package':
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix(f"packages:detail:")
+    elif draft.target_type == 'room':
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
     
     from app.utils.sse import sse_manager
     for p in sse_payloads:
@@ -408,8 +415,18 @@ async def razorpay_webhook(
 
                 if draft:
                     sse_payloads = []
+                    target_type = draft.target_type
                     public_id = await _finalize_draft(draft, payment_id, db, sse_payloads=sse_payloads)
                     await db.commit()
+                    
+                    # Invalidate L1+L2 cache immediately
+                    from app.utils.cache import clear_cache_prefix
+                    if target_type == 'package':
+                        clear_cache_prefix("packages:list:")
+                        clear_cache_prefix("packages:detail:")
+                    elif target_type == 'room':
+                        clear_cache_prefix("rooms:list:")
+                        clear_cache_prefix("rooms:detail:")
                     
                     from app.utils.sse import sse_manager
                     for p in sse_payloads:
@@ -430,45 +447,32 @@ async def razorpay_webhook(
                     # Check if this is a balance payment
                     from app.models.payment import Payment
                     from app.models.enums import PaymentStatus
-                    from sqlalchemy import func
-                    
+
                     payment_stmt = select(Payment).where(
                         Payment.razorpay_order_id == order_id
                     ).with_for_update()
                     p_res = await db.execute(payment_stmt)
                     payment = p_res.scalar_one_or_none()
-                    
+
                     if payment and payment.status == PaymentStatus.CREATED:
-                        booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
-                        bk_res = await db.execute(booking_stmt)
-                        booking = bk_res.scalar_one()
-                        
-                        captured_stmt = select(func.count(Payment.id)).where(
-                            Payment.booking_id == booking.id,
-                            Payment.status == PaymentStatus.CAPTURED
-                        )
-                        captured_res = await db.execute(captured_stmt)
-                        captured_count = captured_res.scalar_one() or 0
-                        
-                        if captured_count < 2:
+                        # Idempotency: ensure payment_id not already captured
+                        if payment_id and payment.razorpay_payment_id == payment_id:
+                            logger.info(f"Webhook: balance payment {payment_id} already captured, skipping")
+                        else:
                             payment.status = PaymentStatus.CAPTURED
                             payment.razorpay_payment_id = payment_id
-                            
-                            booking.paid_amount += payment.amount
-                            booking.remaining_balance = max(Decimal("0.00"), booking.total_amount - booking.paid_amount)
-                            
-                            if booking.remaining_balance <= Decimal("0.01"):
-                                booking.status = BookingStatus.FULLY_PAID
-                            
-                            await db.flush()
-                            
+
+                            # Recompute balances from ledger
+                            from app.utils.ledger import recompute_booking_ledger
+                            booking = await recompute_booking_ledger(payment.booking_id, db)
+
                             try:
                                 from app.worker import get_arq_pool
                                 arq_pool = await get_arq_pool()
                                 await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
                             except Exception as arq_err:
                                 logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
-                                
+
                             await db.commit()
                             logger.info(f"Webhook finalized balance payment for order {order_id}")
                     

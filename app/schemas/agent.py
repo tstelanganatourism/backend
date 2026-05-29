@@ -106,6 +106,7 @@ class AgentResponse(AppBaseModel):
     address: Optional[str] = None
     admin_notes: Optional[str] = None
     last_login: Optional[datetime] = None
+    total_bookings: int = 0
     created_at: datetime
     updated_at: datetime
 

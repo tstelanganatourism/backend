@@ -59,7 +59,6 @@ async def upload_media(
             await r2_service.upload_file(file_bytes, object_name, content_type="application/pdf")
             
             # Log the audit event for PDF upload
-            # TODO: Add to proper audit log table later
             
             return {
                 "url": object_name,

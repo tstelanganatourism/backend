@@ -40,7 +40,6 @@ class BookingStatus(str, enum.Enum):
     FULLY_PAID = 'FULLY_PAID'
     CANCELLED = 'CANCELLED'
     REFUNDED = 'REFUNDED'
-    CONFIRMED = 'FULLY_PAID' # Backwards compatibility alias
 
 class PaymentStatus(str, enum.Enum):
     CREATED = 'CREATED'

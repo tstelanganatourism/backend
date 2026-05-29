@@ -26,6 +26,8 @@ class Package(BaseModel, SEOMixin):
     brochure_generation_status = Column(SQLEnum(DocumentGenerationStatus), default=DocumentGenerationStatus.MISSING, server_default="MISSING", nullable=False)
     region = Column(SQLEnum(RegionType), nullable=True)
     order_priority = Column(Integer, default=0)
+    starting_price = Column(Numeric(12, 2), nullable=False, server_default="0.00", index=True)
+    transport_info = Column(String, nullable=True)
     is_featured = Column(Boolean, default=False, server_default="false", nullable=False)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
     status = Column(SQLEnum(PublishStatus), default=PublishStatus.DRAFT, server_default="DRAFT", nullable=False, index=True)

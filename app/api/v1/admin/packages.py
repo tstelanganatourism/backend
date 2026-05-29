@@ -88,7 +88,7 @@ async def list_packages(
     if status_filter:
         base_query = base_query.where(Package.status == status_filter)
         
-    count_query = select(func.count()).select_from(base_query.subquery())
+    count_query = base_query.with_only_columns(func.count()).order_by(None)
     total_result = await db.execute(count_query)
     total_count = total_result.scalar_one()
 
@@ -169,6 +169,15 @@ async def create_package(
     await sync_nested_relation(db, package, "boarding_points", PackageBoardingPoint, body.boarding_points)
     await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
     await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
+    
+    # Compute starting_price
+    package.starting_price = min(
+        (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
+        default=0
+    )
+    # Compute transport_info from active variants
+    transports = [v.transport_info for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and v.transport_info and v.transport_info.strip()]
+    package.transport_info = transports[0] if transports else None
     
     db.add(package)
     await db.commit()
@@ -291,8 +300,16 @@ async def update_package(
     if body.policies is not None:
         await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
         
+    # Recompute starting_price
+    package.starting_price = min(
+        (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
+        default=0
+    )
+    # Recompute transport_info
+    transports = [v.transport_info for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and v.transport_info and v.transport_info.strip()]
+    package.transport_info = transports[0] if transports else None
+        
     await db.commit()
-    await db.refresh(package)
     
     await log_action(
         db=db,
@@ -306,6 +323,20 @@ async def update_package(
         })
     )
     await db.commit()
+    
+    # Broadcast SSE for Admin Package Edit if status is INACTIVE
+    if package.status == "INACTIVE":
+        import time
+        from app.core.timezone import get_ist_now
+        from app.utils.sse import sse_manager
+        sse_payload = {
+            "version": int(time.time() * 1000),
+            "timestamp": get_ist_now().isoformat(),
+            "package_id": package.id,
+            "status": "INACTIVE"
+        }
+        await sse_manager.broadcast_event("package", str(package.id), "ENTITY_STATUS_UPDATE", sse_payload)
+        
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{old_slug}")
     clear_cache_prefix(f"packages:detail:{package.slug}")
@@ -342,6 +373,19 @@ async def delete_package(
         details={"title": package.title}
     )
     await db.commit()
+    
+    # Broadcast SSE for Admin Package Delete
+    import time
+    from app.core.timezone import get_ist_now
+    from app.utils.sse import sse_manager
+    sse_payload = {
+        "version": int(time.time() * 1000),
+        "timestamp": get_ist_now().isoformat(),
+        "package_id": package_id,
+        "status": "DELETED"
+    }
+    await sse_manager.broadcast_event("package", str(package_id), "ENTITY_STATUS_UPDATE", sse_payload)
+
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{package.slug}")
     from app.utils.cache import trigger_frontend_revalidation

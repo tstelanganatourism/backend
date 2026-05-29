@@ -116,6 +116,7 @@ class RoomResponse(RoomBase, TimestampSchema):
     id: int
     variants: List[RoomVariantResponse] = []
     starting_price: Optional[Decimal] = None
+    starting_weekend_price: Optional[Decimal] = None
 
 class RoomDetailResponse(RoomResponse):
     gallery: List[RoomGalleryImageResponse] = []

@@ -56,7 +56,7 @@ async def get_rooms(
     async def load_rooms() -> PaginatedResponse[RoomListDTO]:
         offset = (page - 1) * size
 
-        # Base Query (Only ACTIVE and PUBLISHED rooms)
+        # Base Query (Only PUBLISHED and ACTIVE rooms)
         base_query = select(Room).where(
             Room.status == PublishStatus.PUBLISHED,
             Room.is_active == True,
@@ -79,55 +79,50 @@ async def get_rooms(
             )
 
         # Count Query
-        count_query = select(func.count()).select_from(base_query.subquery())
-        total_result = await db.execute(count_query)
-        total_count = total_result.scalar_one()
+        count_query = base_query.with_only_columns(func.count()).order_by(None)
 
-        # Subquery to get minimum price per lodge
-        price_subquery = (
-            select(
-                RoomVariant.room_id,
-                func.min(RoomVariant.weekday_price).label("min_price")
-            )
-            .where(RoomVariant.is_active == True, RoomVariant.deleted_at == None)
-            .group_by(RoomVariant.room_id)
-            .subquery()
-        )
-
-        # Fetch Data
+        # Projection Query to avoid ORM Hydration overhead
         data_query = (
             base_query
-            .outerjoin(price_subquery, Room.id == price_subquery.c.room_id)
-            .options(selectinload(Room.variants.and_(RoomVariant.is_active == True, RoomVariant.deleted_at == None)))
+            .with_only_columns(
+                Room.id,
+                Room.slug,
+                Room.lodge_name,
+                Room.cover_image_url,
+                Room.is_featured,
+                Room.starting_price,
+                Room.starting_weekend_price,
+                Room.address,
+                Room.map_url,
+                Room.facilities,
+                Room.order_priority
+            )
         )
 
         # Sorting
         if sort == "price_low":
-            data_query = data_query.order_by(price_subquery.c.min_price.asc().nulls_last(), Room.id.desc())
+            data_query = data_query.order_by(Room.starting_price.asc().nulls_last(), Room.id.desc())
         elif sort == "price_high":
-            data_query = data_query.order_by(price_subquery.c.min_price.desc().nulls_last(), Room.id.desc())
+            data_query = data_query.order_by(Room.starting_price.desc().nulls_last(), Room.id.desc())
         else: # Default: priority
             data_query = data_query.order_by(Room.order_priority.asc(), Room.id.desc())
 
         data_query = data_query.offset(offset).limit(size)
         
-        result = await db.execute(data_query)
-        rooms = result.scalars().all()
+        total_count = (await db.execute(count_query)).scalar_one()
+        rooms = (await db.execute(data_query)).all()
 
         # Map to DTOs
         dto_list = []
         for r in rooms:
-            starting_price = min((v.weekday_price for v in r.variants), default=None)
-            starting_weekend_price = min((v.weekend_price for v in r.variants), default=None)
-            
             dto_list.append(RoomListDTO(
                 id=r.id,
                 slug=r.slug,
                 lodge_name=r.lodge_name,
                 cover_image_url=r.cover_image_url,
                 is_featured=r.is_featured,
-                starting_price=starting_price,
-                starting_weekend_price=starting_weekend_price,
+                starting_price=r.starting_price,
+                starting_weekend_price=r.starting_weekend_price,
                 address=r.address,
                 map_url=r.map_url,
                 facilities=r.facilities if r.facilities else []
@@ -169,17 +164,10 @@ async def get_room_detail(
                 Room.is_active == True,
                 Room.deleted_at.is_(None)
             )
-            .options(
-                selectinload(Room.variants.and_(RoomVariant.is_active == True, RoomVariant.deleted_at == None)),
-                selectinload(Room.gallery),
-                selectinload(Room.highlights),
-                selectinload(Room.faqs),
-                selectinload(Room.policies)
-            )
         )
         
         result = await db.execute(query)
-        r = result.scalar_one_or_none()
+        r = result.unique().scalar_one_or_none()
         
         if not r:
             raise HTTPException(
@@ -187,11 +175,36 @@ async def get_room_detail(
                 detail="Room not found or inactive"
             )
             
-        starting_price = min((v.weekday_price for v in r.variants), default=None)
+        import asyncio
+        from app.models.room import RoomVariant, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy
+
+        async def fetch_rel(model, active_filter=None):
+            q = select(model).where(model.room_id == r.id, model.deleted_at.is_(None))
+            if active_filter is not None:
+                q = q.where(active_filter)
+            return (await db.execute(q)).scalars().all()
+
+        results = await asyncio.gather(
+            fetch_rel(RoomVariant, and_(RoomVariant.is_active == True)),
+            fetch_rel(RoomGalleryImage),
+            fetch_rel(RoomHighlight),
+            fetch_rel(RoomFAQ),
+            fetch_rel(RoomPolicy)
+        )
+
+        r_variants = results[0]
+        r_gallery = results[1]
+        r_highlights = results[2]
+        r_faqs = results[3]
+        r_policies = results[4]
+
+        starting_price = min((v.weekday_price for v in r_variants), default=None)
         
         from app.services.r2_storage import r2_service
-        brochure_url = await r2_service.get_public_url(r.brochure_pdf_url or r.generated_brochure_url)
-        gen_brochure_url = await r2_service.get_public_url(r.generated_brochure_url)
+        brochure_url, gen_brochure_url = await asyncio.gather(
+            r2_service.get_public_url(r.brochure_pdf_url or r.generated_brochure_url),
+            r2_service.get_public_url(r.generated_brochure_url)
+        )
         
         return RoomDetailDTO(
             id=r.id,
@@ -223,12 +236,12 @@ async def get_room_detail(
                     weekday_price=v.weekday_price,
                     weekend_price=v.weekend_price,
                     capacity_per_room=v.capacity_per_room
-                ) for v in r.variants
+                ) for v in r_variants
             ],
-            gallery=r.gallery,
-            highlights=r.highlights,
-            faqs=r.faqs,
-            policies=r.policies
+            gallery=r_gallery,
+            highlights=r_highlights,
+            faqs=r_faqs,
+            policies=r_policies
         )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_room_detail)

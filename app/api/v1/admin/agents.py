@@ -59,10 +59,16 @@ async def list_agents(
         User.deleted_at.is_(None)
     )
 
-    query = select(User).where(
+    query = select(
+        User, 
+        func.count(Booking.id).label("total_bookings")
+    ).outerjoin(
+        Booking,
+        (Booking.agent_id == User.id) & Booking.deleted_at.is_(None)
+    ).where(
         User.role == UserRole.AGENT,
         User.deleted_at.is_(None),
-    )
+    ).group_by(User.id)
 
     # Search filter
     if search:
@@ -110,10 +116,10 @@ async def list_agents(
 
     query = query.limit(limit).offset(offset)
     result = await db.execute(query)
-    agents = result.scalars().all()
+    agents = result.all()
 
     return {
-        "items": [_to_response(a) for a in agents],
+        "items": [_to_response(row.User, row.total_bookings) for row in agents],
         "total": total_count,
         "page": (offset // limit) + 1 if limit > 0 else 1,
         "size": limit
@@ -372,7 +378,7 @@ async def _get_agent_or_404(db: AsyncSession, agent_id: int) -> User:
 
 async def _compute_agent_metrics(db: AsyncSession, agent_id: int) -> AgentBookingMetrics:
     """Compute real booking metrics for an agent via SQL aggregation."""
-    paid_statuses = (BookingStatus.CONFIRMED, BookingStatus.FULLY_PAID)
+    paid_statuses = (BookingStatus.FULLY_PAID,)
     result = await db.execute(
         select(
             func.count(Booking.id).label("total"),
@@ -403,7 +409,7 @@ async def _compute_agent_metrics(db: AsyncSession, agent_id: int) -> AgentBookin
     )
 
 
-def _to_response(agent: User) -> AgentResponse:
+def _to_response(agent: User, total_bookings: int = 0) -> AgentResponse:
     """Map a User ORM instance to AgentResponse."""
     return AgentResponse(
         id=agent.id,
@@ -421,6 +427,7 @@ def _to_response(agent: User) -> AgentResponse:
         address=agent.address,
         admin_notes=agent.admin_notes,
         last_login=agent.last_login,
+        total_bookings=total_bookings,
         created_at=agent.created_at,
         updated_at=agent.updated_at,
     )

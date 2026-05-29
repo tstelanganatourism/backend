@@ -6,8 +6,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     PROJECT_NAME: str = "Papikondalu Tourism Booking API"
-    CORS_ORIGINS: list[str] = ["http://localhost:3000"]
-    ALLOWED_HOSTS: list[str] = ["localhost", "127.0.0.1"]
+    CORS_ORIGINS: list[str] = ["https://tsboattourism.org", "https://www.tsboattourism.org"]
+    ALLOWED_HOSTS: list[str] = ["tsboattourism.org", "www.tsboattourism.org", "127.0.0.1", "localhost"]
     
     # Security
     SECRET_KEY: str
@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     
     # Brevo (Email Sending)
     BREVO_API_KEY: Optional[str] = None
-    BREVO_FROM_EMAIL: str = "no-reply@tstours.in"
+    BREVO_FROM_EMAIL: str = "bookings@tsboattourism.org"
     
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None

@@ -78,6 +78,7 @@ class PackageListDTO(AppBaseModel):
     is_featured: bool
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
+    transport_info: Optional[str] = None
     variants: List[PackageVariantPublicDTO] = Field(default_factory=list)
 
 class PackageItineraryDayDTO(AppBaseModel):

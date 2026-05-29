@@ -48,6 +48,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from app.middleware.observability import RequestIDMiddleware
+app.add_middleware(RequestIDMiddleware)
+
 # ─── Public Discovery Routes ──────────────────────────────────────────────────
 app.include_router(
     public_packages.router,
