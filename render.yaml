@@ -15,6 +15,6 @@ services:
       - key: REDIS_URL
         sync: false
       - key: ALLOWED_HOSTS
-        value: '["tsboattourism.org","www.tsboattourism.org"]'
+        value: '["tsboattourism.org","www.tsboattourism.org","*.onrender.com","localhost"]'
       - key: CORS_ORIGINS
         value: '["https://tsboattourism.org","https://www.tsboattourism.org"]'
