@@ -22,3 +22,4 @@ playwright==1.59.0
 arq==0.28.0
 sentry-sdk==2.0.0
 gunicorn==22.0.0
+bleach==6.3.0
