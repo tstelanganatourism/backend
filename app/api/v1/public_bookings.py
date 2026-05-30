@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import date, time, timedelta
@@ -13,7 +13,7 @@ from app.db.session import get_db
 from app.models.package import PackageVariantInventory, PackageVariant, Package
 from app.models.room import Room, RoomSlotInventory, RoomVariant
 from app.models.booking import Booking, BookingPassenger, BookingStayDate
-from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType
+from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType, PublishStatus
 from app.models.user import User
 from app.models.coupon import Coupon
 from app.middleware.auth import get_current_user_optional, require_agent, get_current_user
@@ -183,7 +183,7 @@ async def process_checkout(
                 PackageVariant.id == request.variant_id,
                 PackageVariant.is_active == True,
                 PackageVariant.deleted_at.is_(None),
-                Package.status == 'ACTIVE',
+                Package.status == PublishStatus.PUBLISHED,
                 Package.deleted_at.is_(None)
             )
             .limit(1)
@@ -595,11 +595,14 @@ async def get_agent_dashboard_summary(
 @router.get("/agent/bookings")
 async def get_agent_bookings(
     current_user: User = Depends(require_agent),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     """
     Fetch recent bookings for the logged-in agent, strictly sanitizing commission details.
     """
+
     query = (
         select(Booking, Package.title, PackageVariant.title)
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
@@ -610,6 +613,8 @@ async def get_agent_bookings(
             Booking.deleted_at.is_(None)
         )
         .order_by(Booking.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(query)
     rows = result.all()
@@ -632,6 +637,7 @@ async def get_agent_bookings(
             "gst_amount": float(b.gst_amount),
             "gateway_fee": float(b.gateway_fee),
             "total_amount": float(b.total_amount),
+            "paid_amount": float(b.paid_amount),
             "remaining_balance": float(b.remaining_balance),
             "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
             "created_at": b.created_at.isoformat() if b.created_at else None,
@@ -887,6 +893,7 @@ async def get_booking_details(
     )
     is_admin = current_user is not None and current_user.role == UserRole.ADMIN
     show_commission = is_agent_owner or is_admin
+    use_agent_payment_view = show_commission and b.agent_id is not None
 
     agent_paid = sum(Decimal(str(p.amount)) for p in raw_payments if p.status == PaymentStatus.CAPTURED)
     agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
@@ -906,12 +913,12 @@ async def get_booking_details(
         "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
         "remaining_balance": (
             float(max(Decimal("0.00"), agent_payable - agent_paid))
-            if show_commission
+            if use_agent_payment_view
             else float(b.remaining_balance)
         ),
         "paid_amount": (
             float(agent_paid)
-            if show_commission
+            if use_agent_payment_view
             else float(b.paid_amount)
         ),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),

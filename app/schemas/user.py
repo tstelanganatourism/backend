@@ -112,6 +112,9 @@ class UserMeResponse(AppBaseModel):
     account_status: AccountStatus
     phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
+    commission_percentage: Optional[float] = None
+    commission_type: Optional[str] = None
+    commission_fixed_amount: Optional[float] = None
 
 
 class ProfileUpdateRequest(AppBaseModel):

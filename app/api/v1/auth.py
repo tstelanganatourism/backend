@@ -140,6 +140,9 @@ def _build_token_response(user, response: Response, admin: bool = False) -> dict
             "account_status": user.account_status,
             "phone_number": user.phone_number,
             "avatar_url": user.avatar_url,
+            "commission_percentage": float(user.commission_percentage) if user.commission_percentage is not None else None,
+            "commission_type": user.commission_type,
+            "commission_fixed_amount": float(user.commission_fixed_amount) if user.commission_fixed_amount is not None else None,
         },
     }
 
@@ -768,6 +771,9 @@ async def refresh_access_token(
             "account_status": user.account_status,
             "phone_number": user.phone_number,
             "avatar_url": user.avatar_url,
+            "commission_percentage": float(user.commission_percentage) if user.commission_percentage is not None else None,
+            "commission_type": user.commission_type,
+            "commission_fixed_amount": float(user.commission_fixed_amount) if user.commission_fixed_amount is not None else None,
         },
     }
 
@@ -812,6 +818,9 @@ async def get_me(current_user=Depends(get_current_user)):
         account_status=current_user.account_status,
         phone_number=current_user.phone_number,
         avatar_url=current_user.avatar_url,
+        commission_percentage=float(current_user.commission_percentage) if current_user.commission_percentage is not None else None,
+        commission_type=current_user.commission_type,
+        commission_fixed_amount=float(current_user.commission_fixed_amount) if current_user.commission_fixed_amount is not None else None,
     )
 
 
@@ -841,6 +850,9 @@ async def update_me(
         account_status=current_user.account_status,
         phone_number=current_user.phone_number,
         avatar_url=current_user.avatar_url,
+        commission_percentage=float(current_user.commission_percentage) if current_user.commission_percentage is not None else None,
+        commission_type=current_user.commission_type,
+        commission_fixed_amount=float(current_user.commission_fixed_amount) if current_user.commission_fixed_amount is not None else None,
     )
 
 

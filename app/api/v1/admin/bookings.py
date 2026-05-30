@@ -206,7 +206,7 @@ async def list_admin_bookings(
             "travel_date": b.travel_date.isoformat(),
             "adult_count": b.adult_count,
             "child_count": b.child_count,
-            # Public pricing — never expose agent_commission or pricing_snapshot
+            # Admin pricing - expose agent_commission and agent_payable
             "subtotal_amount": float(b.subtotal_amount),
             "coupon_discount": float(b.coupon_discount),
             "coupon_applied": b.coupon_applied,
@@ -215,6 +215,8 @@ async def list_admin_bookings(
             "total_amount": float(b.total_amount),
             "paid_amount": float(b.paid_amount),
             "remaining_balance": float(b.remaining_balance),
+            "agent_commission": float(b.agent_commission) if b.agent_commission else None,
+            "agent_payable": float(b.total_amount - (b.agent_commission or 0)),
             "created_at": b.created_at.isoformat() if b.created_at else None,
             "package_title": title_info["package_title"],
             "variant_title": title_info["variant_title"],
@@ -284,7 +286,7 @@ async def get_bookings_summary(
             ).label("confirmed"),
             func.sum(
                 case(
-                    (Booking.status == "PENDING", literal(1)),
+                    (Booking.status == "PARTIAL_PAID", literal(1)),
                     else_=literal(0),
                 )
             ).label("pending"),
@@ -349,9 +351,11 @@ async def admin_create_booking(
     from datetime import date, timedelta, time
     from app.models.package import PackageVariantInventory
     from app.models.room import RoomSlotInventory
-    from app.models.enums import BookingStatus, BookingSource, GenderType
+    from app.models.enums import BookingStatus, BookingSource, GenderType, PaymentStatus
+    from app.models.payment import Payment
     from app.core.security import AadharCryptography, AadharHashing
     from app.core.timezone import get_ist_now
+    from app.utils.ledger import recompute_booking_ledger
     from app.utils.verhoeff import is_valid_aadhaar
 
     travel_date = date.fromisoformat(request.travel_date)
@@ -374,28 +378,39 @@ async def admin_create_booking(
         
         package_variant_id_val = variant.id
 
-        # Lock inventory directly (booked_count, not reserved_count)
+        # Admin bypass: fetch inventory if it exists — but never block on missing/closed/full
         inv_query = select(PackageVariantInventory).where(
             PackageVariantInventory.variant_id == request.variant_id,
             PackageVariantInventory.date == travel_date
         ).with_for_update()
         inv_res = await db.execute(inv_query)
         inv = inv_res.scalar_one_or_none()
-        if not inv:
-            raise HTTPException(status_code=400, detail=f"No inventory found for date {travel_date}")
-        if inv.is_closed:
-            raise HTTPException(status_code=400, detail=f"Date {travel_date} is closed for bookings")
-        available = inv.total_capacity - inv.booked_count - inv.reserved_count
-        if available < request.quantity:
-            raise HTTPException(status_code=400, detail=f"Insufficient seats. Available: {available}")
-        
-        # Calculate subtotal using precise Decimal representation and effective prices helper
+
+        if inv is None:
+            # Auto-create an inventory row on the fly so booked_count is tracked
+            inv = PackageVariantInventory(
+                variant_id=request.variant_id,
+                date=travel_date,
+                total_capacity=request.quantity,  # set to at least what admin is booking
+                booked_count=0,
+                reserved_count=0,
+                is_closed=False,
+            )
+            db.add(inv)
+            await db.flush()
+
+        # Admin always goes through — just increase total_capacity if we'd go over
+        if inv.booked_count + request.quantity > inv.total_capacity:
+            inv.total_capacity = inv.booked_count + inv.reserved_count + request.quantity
+
+        # Calculate subtotal using effective prices (use base variant prices if no override)
         eff_adult, eff_child = get_effective_package_prices(
-            variant.adult_price, variant.child_price, inv.price_override
+            variant.adult_price, variant.child_price, inv.price_override if hasattr(inv, 'price_override') else None
         )
         subtotal_amount = (Decimal(str(eff_adult)) * adult_count) + \
                           (Decimal(str(eff_child)) * child_count)
         
+        # Lock the seat in inventory
         inv.booked_count += request.quantity
 
     elif request.target_type == 'room':
@@ -426,7 +441,7 @@ async def admin_create_booking(
         slot_start_t = time.fromisoformat(request.slot_start) if request.slot_start else None
         slot_end_t = time.fromisoformat(request.slot_end) if request.slot_end else None
 
-        # Check & lock all dates
+        # Admin bypass: fetch each stay date's inventory — auto-create if missing, never block
         for sd in stay_dates:
             inv_query = select(RoomSlotInventory).where(
                 RoomSlotInventory.room_variant_id == request.room_variant_id,
@@ -436,13 +451,27 @@ async def admin_create_booking(
             ).with_for_update()
             inv_res = await db.execute(inv_query)
             room_inv = inv_res.scalar_one_or_none()
-            if not room_inv:
-                raise HTTPException(status_code=400, detail=f"No inventory for date {sd}")
-            if room_inv.is_closed:
-                raise HTTPException(status_code=400, detail=f"Date {sd} is closed")
-            available_rooms = room_inv.total_rooms - room_inv.booked_rooms - room_inv.reserved_rooms
-            if available_rooms < required_rooms:
-                raise HTTPException(status_code=400, detail=f"Insufficient rooms on {sd}. Available: {available_rooms}, Need: {required_rooms}")
+
+            if room_inv is None:
+                # Auto-create a slot inventory row on the fly
+                room_inv = RoomSlotInventory(
+                    room_variant_id=request.room_variant_id,
+                    date=sd,
+                    slot_start=slot_start_t,
+                    slot_end=slot_end_t,
+                    total_rooms=required_rooms,
+                    booked_rooms=0,
+                    reserved_rooms=0,
+                    is_closed=False,
+                )
+                db.add(room_inv)
+                await db.flush()
+
+            # Admin always goes through — expand total_rooms if needed to keep data consistent
+            if room_inv.booked_rooms + required_rooms > room_inv.total_rooms:
+                room_inv.total_rooms = room_inv.booked_rooms + room_inv.reserved_rooms + required_rooms
+
+            # Record this booking in the inventory
             room_inv.booked_rooms += required_rooms
 
         # Price calculation: use weekday/weekend per date
@@ -465,6 +494,11 @@ async def admin_create_booking(
     agent_id_val = request.agent_id
 
     paid_amount_val = Decimal(str(request.amount_paid)).quantize(Decimal("0.01")) if request.amount_paid is not None else total_amount
+    if paid_amount_val < Decimal("0.00"):
+        raise HTTPException(status_code=400, detail="Amount paid cannot be negative")
+    if paid_amount_val > total_amount + Decimal("0.01"):
+        raise HTTPException(status_code=400, detail=f"Amount paid cannot exceed total amount {total_amount}")
+    paid_amount_val = min(paid_amount_val, total_amount)
     remaining_balance_val = max(Decimal("0.00"), total_amount - paid_amount_val)
 
     pricing_snapshot = {
@@ -532,11 +566,33 @@ async def admin_create_booking(
         paid_amount=paid_amount_val,
         remaining_balance=remaining_balance_val,
         agent_commission=agent_commission,
-        status=BookingStatus.PARTIAL_PAID if remaining_balance_val > 0 else BookingStatus.FULLY_PAID,
+        status=(
+            BookingStatus.FULLY_PAID
+            if remaining_balance_val <= Decimal("0.01")
+            else BookingStatus.PARTIAL_PAID
+            if paid_amount_val > Decimal("0.00")
+            else BookingStatus.PENDING
+        ),
         pricing_snapshot=pricing_snapshot,
     )
     db.add(booking)
     await db.flush()
+
+    if paid_amount_val > Decimal("0.00"):
+        db.add(Payment(
+            booking_id=booking.id,
+            payment_reference_id=f"ADMIN_{booking.public_id}_{uuid.uuid4().hex[:8].upper()}",
+            razorpay_order_id=None,
+            razorpay_payment_id=None,
+            amount=paid_amount_val,
+            status=PaymentStatus.CAPTURED,
+            payment_method="ADMIN_MANUAL",
+            collected_by_type="ADMIN",
+            collected_by_user_id=current_admin.id,
+            collected_by_label=f"Admin: {current_admin.full_name}",
+        ))
+        await db.flush()
+        booking = await recompute_booking_ledger(booking.id, db)
 
     # Persist passengers
     crypto = AadharCryptography()
