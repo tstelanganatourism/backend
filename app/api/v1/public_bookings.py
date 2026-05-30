@@ -888,6 +888,9 @@ async def get_booking_details(
     is_admin = current_user is not None and current_user.role == UserRole.ADMIN
     show_commission = is_agent_owner or is_admin
 
+    agent_paid = sum(Decimal(str(p.amount)) for p in raw_payments if p.status == PaymentStatus.CAPTURED)
+    agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
+
     return {
         "id": b.id,
         "public_id": b.public_id,
@@ -902,11 +905,15 @@ async def get_booking_details(
         "gateway_fee": float(b.gateway_fee),
         "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
         "remaining_balance": (
-            float(max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")) - Decimal(str(b.paid_amount))))
+            float(max(Decimal("0.00"), agent_payable - agent_paid))
             if show_commission
             else float(b.remaining_balance)
         ),
-        "paid_amount": float(b.paid_amount),
+        "paid_amount": (
+            float(agent_paid)
+            if show_commission
+            else float(b.paid_amount)
+        ),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
         "created_at": b.created_at.isoformat() if b.created_at else None,
         "package_title": package_title,
@@ -1112,7 +1119,7 @@ async def process_balance_checkout(
         booking_id=booking.id,
         payment_reference_id=razorpay_order_id,  # idempotency key
         razorpay_order_id=razorpay_order_id,
-        amount=booking.remaining_balance,
+        amount=Decimal(str(payable_amount)),
         status=PaymentStatus.CREATED,
         payment_method="RAZORPAY",
         collected_by_type="RAZORPAY",
