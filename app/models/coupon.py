@@ -43,8 +43,12 @@ class Coupon(BaseModel):
         now = get_ist_now()
         if self.valid_from and self.valid_from > now:
             return False
-        if self.valid_until and self.valid_until < now:
-            return False
+        if self.valid_until:
+            val_until = self.valid_until
+            if val_until.hour == 0 and val_until.minute == 0 and val_until.second == 0:
+                val_until = val_until.replace(hour=23, minute=59, second=59, microsecond=999999)
+            if val_until < now:
+                return False
             
         # 3. Redemptions cap check
         if self.usage_limit is not None and self.usage_count >= self.usage_limit:

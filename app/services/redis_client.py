@@ -26,8 +26,8 @@ def get_redis() -> aioredis.Redis:
             settings.REDIS_URL,
             encoding="utf-8",
             decode_responses=True,
-            socket_connect_timeout=1.0,
-            socket_timeout=1.0,
+            socket_connect_timeout=3.0,
+            socket_timeout=3.0,
         )
     return _redis_client
 
@@ -39,8 +39,8 @@ def get_redis_raw() -> aioredis.Redis:
     if _redis_client_raw is None:
         _redis_client_raw = aioredis.from_url(
             settings.REDIS_URL,
-            socket_connect_timeout=1.0,
-            socket_timeout=1.0,
+            socket_connect_timeout=3.0,
+            socket_timeout=3.0,
         )
     return _redis_client_raw
 
@@ -92,23 +92,28 @@ async def blacklist_token(jti: str, expire_seconds: int, is_logout: bool = False
 
 async def is_token_blacklisted(jti: str) -> bool:
     """Return True if the given JTI has been blacklisted (i.e., token revoked)."""
-    client = get_redis()
-    key = f"blacklist:{jti}"
-    value = await client.get(key)
-    if not value:
-        return False
-    if value == "logout":
-        return True
-    
-    # Grace period logic: bypass blacklist for 30s during rotation race conditions
     try:
-        blacklist_time = float(value)
-        if time.time() - blacklist_time < 30.0:
+        client = get_redis()
+        key = f"blacklist:{jti}"
+        value = await client.get(key)
+        if not value:
             return False
-    except ValueError:
-        pass
+        if value == "logout":
+            return True
         
-    return True
+        # Grace period logic: bypass blacklist for 30s during rotation race conditions
+        try:
+            blacklist_time = float(value)
+            if time.time() - blacklist_time < 30.0:
+                return False
+        except ValueError:
+            pass
+            
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Redis error checking token blacklist (fail-open): {e}")
+        return False
 
 
 # ─── Package Availability Caching ────────────────────────────────────────────

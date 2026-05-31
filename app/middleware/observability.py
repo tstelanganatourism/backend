@@ -26,19 +26,19 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         # Bind the request ID to all loguru logs triggered during this async task context
         with logger.contextualize(request_id=request_id):
             if not is_asset:
-                logger.info(f"Incoming request: {request.method} {path} from {request.client.host if request.client else 'unknown'}")
+                logger.info("Incoming request: {} {} from {}", request.method, path, request.client.host if request.client else 'unknown')
 
             try:
                 response = await call_next(request)
                 duration = time.perf_counter() - start_time
                 
                 if not is_asset:
-                    logger.info(f"Completed request: {request.method} {path} - Status: {response.status_code} in {duration*1000:.2f}ms")
+                    logger.info("Completed request: {} {} - Status: {} in {:.2f}ms", request.method, path, response.status_code, duration*1000)
                 
                 # Propagate Request ID back to the client in response headers
                 response.headers["X-Request-ID"] = request_id
                 return response
             except Exception as e:
                 duration = time.perf_counter() - start_time
-                logger.error(f"Failed request: {request.method} {path} - Error: {str(e)} in {duration*1000:.2f}ms", exc_info=True)
+                logger.error("Failed request: {} {} - Error: {} in {:.2f}ms", request.method, path, str(e), duration*1000, exc_info=True)
                 raise e

@@ -343,6 +343,25 @@ async def update_package(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=[f"package-{package.id}"])
     
+    # Reload package with all relationships loaded to prevent MissingGreenlet errors during serialization
+    refresh_query = (
+        select(Package)
+        .where(Package.id == package.id)
+        .options(
+            selectinload(Package.variants),
+            selectinload(Package.gallery),
+            selectinload(Package.itinerary),
+            selectinload(Package.highlights),
+            selectinload(Package.inclusions),
+            selectinload(Package.exclusions),
+            selectinload(Package.boarding_points),
+            selectinload(Package.faqs),
+            selectinload(Package.policies)
+        )
+    )
+    refresh_result = await db.execute(refresh_query)
+    package = refresh_result.scalar_one()
+    
     return package
 
 @router.delete("/{package_id}", status_code=status.HTTP_204_NO_CONTENT)

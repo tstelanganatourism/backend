@@ -324,6 +324,21 @@ async def update_room(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
+    # Reload room with all relationships loaded to prevent MissingGreenlet errors during serialization
+    refresh_query = (
+        select(Room)
+        .where(Room.id == room.id)
+        .options(
+            selectinload(Room.variants),
+            selectinload(Room.gallery),
+            selectinload(Room.highlights),
+            selectinload(Room.faqs),
+            selectinload(Room.policies)
+        )
+    )
+    refresh_result = await db.execute(refresh_query)
+    room = refresh_result.scalar_one()
+    
     return room
 
 @router.delete("/{room_id}", status_code=status.HTTP_204_NO_CONTENT)

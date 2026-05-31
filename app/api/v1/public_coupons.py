@@ -96,9 +96,6 @@ async def get_active_coupons(
         query = select(Coupon).where(
             Coupon.is_active == True,
             Coupon.deleted_at.is_(None)
-        ).where(
-            (Coupon.valid_from.is_(None) | (Coupon.valid_from <= now)) &
-            (Coupon.valid_until.is_(None) | (Coupon.valid_until >= now))
         )
         
         result = await db.execute(query)
@@ -107,6 +104,15 @@ async def get_active_coupons(
         specific_coupons = []
         global_coupons = []
         for c in coupons:
+            # Date range checks
+            if c.valid_from and c.valid_from > now:
+                continue
+            val_until = c.valid_until
+            if val_until and val_until.hour == 0 and val_until.minute == 0 and val_until.second == 0:
+                val_until = val_until.replace(hour=23, minute=59, second=59, microsecond=999999)
+            if val_until and val_until < now:
+                continue
+
             is_global = not c.applicable_package_ids and not c.applicable_room_ids
             if is_global:
                 global_coupons.append(c)
