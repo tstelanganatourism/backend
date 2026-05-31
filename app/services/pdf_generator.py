@@ -200,19 +200,22 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 booking.invoice_generation_status = DocumentGenerationStatus.FAILED
                 await db.commit()
 
-        # 3. Generate Form PDF
+        # 3. Generate Form PDF (Only for package bookings, not room bookings)
         form_url = ""
-        try:
-            form_print_url = f"{frontend_url}/print/form/{booking.public_id}?secret={signature}"
-            form_pdf_bytes = await asyncio.to_thread(sync_generate_pdf, form_print_url)
-            version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            form_object_name = f"private/forms/generated/{booking.public_id}_{version}.pdf"
-            await r2_service.upload_file(form_pdf_bytes, form_object_name, content_type="application/pdf")
-            form_url = await r2_service.generate_presigned_url(form_object_name, expires_in=172800)
-            logger.info(f"Successfully generated form for booking {booking.public_id}")
-        except Exception as e:
-            logger.error(f"Failed to generate form for booking {booking.id}: {e}")
-            form_url = form_print_url  # fallback
+        is_room_booking = booking.room_variant_id is not None
+        if not is_room_booking:
+            try:
+                form_print_url = f"{frontend_url}/print/form/{booking.public_id}?secret={signature}"
+                form_pdf_bytes = await asyncio.to_thread(sync_generate_pdf, form_print_url)
+                version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                form_object_name = f"private/forms/generated/{booking.public_id}_{version}.pdf"
+                await r2_service.upload_file(form_pdf_bytes, form_object_name, content_type="application/pdf")
+                form_url = await r2_service.generate_presigned_url(form_object_name, expires_in=172800)
+                logger.info(f"Successfully generated form for booking {booking.public_id}")
+            except Exception as e:
+                logger.error(f"Failed to generate form for booking {booking.id}: {e}")
+                form_url = form_print_url  # fallback
+
 
         # 4. Determine Recipient Email
         recipient_email = None
@@ -256,6 +259,92 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         safe_office_address = escape(office_address)
         safe_office_maps_url = escape(office_maps_url, quote=True)
 
+        if is_room_booking:
+            preview_text = "Your TS Tours booking documents are ready. Download your ticket before the link expires."
+            next_steps_section = """
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
+                                        <tr>
+                                            <td style="padding:0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:8px;">Next steps</div>
+                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">1.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket.</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry printed ticket during your journey.</td>
+                                                    </tr>
+                                                </table>
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+            action_buttons_section = f"""
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                        <tr>
+                                            <td class="stack-column" width="100%" style="padding:0 0 12px 0;">
+                                                <a href="{safe_ticket_url}" target="_blank" style="display:block; background-color:#078a81; border:1px solid #078a81; border-radius:10px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:20px; font-weight:800; padding:14px 16px; text-align:center; text-decoration:none;">Download Ticket</a>
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+            mandatory_notice_section = """
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:4px 0 22px 0;">
+                                        <tr>
+                                            <td style="background-color:#fff7df; border:1px solid #f0d998; border-radius:12px; padding:14px 16px; color:#8a4b00; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
+                                                Mandatory: bring printed tickets for verification before boarding.
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+        else:
+            preview_text = "Your TS Tours booking documents are ready. Download your ticket and passenger form before the links expire."
+            next_steps_section = """
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
+                                        <tr>
+                                            <td style="padding:0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:8px;">Next steps</div>
+                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">1.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket.</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download, fill, and print the passenger form.</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">3.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry both printed documents during your journey.</td>
+                                                    </tr>
+                                                </table>
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+            action_buttons_section = f"""
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                        <tr>
+                                            <td class="stack-column" width="50%" style="padding:0 8px 12px 0;">
+                                                <a href="{safe_ticket_url}" target="_blank" style="display:block; background-color:#078a81; border:1px solid #078a81; border-radius:10px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:20px; font-weight:800; padding:14px 16px; text-align:center; text-decoration:none;">Download Ticket</a>
+                                            </td>
+                                            <td class="stack-column" width="50%" style="padding:0 0 12px 8px;">
+                                                <a href="{safe_form_url}" target="_blank" style="display:block; background-color:#ffffff; border:1px solid #075b60; border-radius:10px; color:#075b60; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:20px; font-weight:800; padding:14px 16px; text-align:center; text-decoration:none;">Download Form</a>
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+            mandatory_notice_section = """
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:4px 0 22px 0;">
+                                        <tr>
+                                            <td style="background-color:#fff7df; border:1px solid #f0d998; border-radius:12px; padding:14px 16px; color:#8a4b00; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
+                                                Mandatory: bring printed forms and tickets for verification before boarding.
+                                            </td>
+                                        </tr>
+                                    </table>
+            """.strip()
+
         base_html = """
         <!DOCTYPE html>
         <html>
@@ -281,7 +370,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         </head>
         <body style="margin:0; padding:0; background-color:#eef3f6;">
             <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
-                Your TS Tours booking documents are ready. Download your ticket and passenger form before the links expire.
+                {preview_text}
             </div>
             <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#eef3f6; margin:0; padding:0;">
                 <tr>
@@ -318,46 +407,11 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                         {financial_details}
                                     </table>
 
-                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
-                                        <tr>
-                                            <td style="padding:0;">
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:8px;">Next steps</div>
-                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
-                                                    <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">1.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket.</td>
-                                                    </tr>
-                                                    <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download, fill, and print the passenger form.</td>
-                                                    </tr>
-                                                    <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">3.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry both printed documents during your journey.</td>
-                                                    </tr>
-                                                </table>
-                                            </td>
-                                        </tr>
-                                    </table>
+                                    {next_steps_section}
 
-                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
-                                        <tr>
-                                            <td class="stack-column" width="50%" style="padding:0 8px 12px 0;">
-                                                <a href="{ticket_url}" target="_blank" style="display:block; background-color:#078a81; border:1px solid #078a81; border-radius:10px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:20px; font-weight:800; padding:14px 16px; text-align:center; text-decoration:none;">Download Ticket</a>
-                                            </td>
-                                            <td class="stack-column" width="50%" style="padding:0 0 12px 8px;">
-                                                <a href="{form_url}" target="_blank" style="display:block; background-color:#ffffff; border:1px solid #075b60; border-radius:10px; color:#075b60; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:20px; font-weight:800; padding:14px 16px; text-align:center; text-decoration:none;">Download Form</a>
-                                            </td>
-                                        </tr>
-                                    </table>
+                                    {action_buttons_section}
 
-                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:4px 0 22px 0;">
-                        <tr>
-                                            <td style="background-color:#fff7df; border:1px solid #f0d998; border-radius:12px; padding:14px 16px; color:#8a4b00; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
-                                                Mandatory: bring printed forms and tickets for verification before boarding.
-                            </td>
-                        </tr>
-                    </table>
+                                    {mandatory_notice_section}
                                 </td>
                             </tr>
                             <tr>
@@ -395,7 +449,10 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         if is_fully_paid:
             email_type = "FULL_PAYMENT"
             subject = "Booking Confirmed - TS Tours"
-            message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> is confirmed and fully paid. Your official ticket and passenger form are ready below."
+            if is_room_booking:
+                message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> is confirmed and fully paid. Your official ticket is ready below."
+            else:
+                message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> is confirmed and fully paid. Your official ticket and passenger form are ready below."
             financial_details = f"""
                         <tr>
                             <td style="padding:16px 20px; border-bottom:1px solid #dbe6ea;">
@@ -408,7 +465,10 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         else:
             email_type = "PARTIAL_PAYMENT"
             subject = "Booking Payment Received - TS Tours"
-            message_body = f"We received your payment for booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong>. Please clear the remaining balance before your journey and keep the documents below ready."
+            if is_room_booking:
+                message_body = f"We received your payment for booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong>. Please clear the remaining balance before your journey and keep the ticket below ready."
+            else:
+                message_body = f"We received your payment for booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong>. Please clear the remaining balance before your journey and keep the documents below ready."
             financial_details = f"""
                         {amount_paid_row}
                         <tr>
@@ -425,15 +485,18 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             message_body=message_body,
             booking_id=safe_booking_id,
             financial_details=financial_details,
-            ticket_url=safe_ticket_url,
-            form_url=safe_form_url,
             logo1_url=safe_logo1_url,
             logo2_url=safe_logo2_url,
             office_phone=office_phone,
             office_phone_tel=office_phone.replace(" ", ""),
             office_address=safe_office_address,
-            office_maps_url=safe_office_maps_url
+            office_maps_url=safe_office_maps_url,
+            preview_text=preview_text,
+            next_steps_section=next_steps_section,
+            action_buttons_section=action_buttons_section,
+            mandatory_notice_section=mandatory_notice_section
         )
+
 
         # Send via Brevo
         success, error_reason = await email_service.send_booking_email(
