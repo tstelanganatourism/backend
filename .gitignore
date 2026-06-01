@@ -44,3 +44,10 @@ fix_rooms_status.py
 scratch_*.py
 trigger_brochure.py
 update_package_4_duration.py
+
+# Tests
+tests/
+.pytest_cache/
+playwright.config.ts
+playwright-report/
+test-results/

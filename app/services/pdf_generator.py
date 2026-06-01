@@ -45,9 +45,10 @@ async def generate_pdf_from_url(url: str, output_path: str = None) -> bytes:
             await page.emulate_media(media="print")
 
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
+                # Greatly reduce networkidle wait to avoid 15s stalls on tracking pixels / Next.js polling
+                await page.wait_for_load_state("networkidle", timeout=2000)
             except Exception:
-                logger.warning("Timed out waiting for network idle on %s; continuing with PDF render.", url)
+                pass
 
             pdf_bytes = await page.pdf(
                 format="A4",

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import date, time, timedelta
+from datetime import date, time, timedelta, datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import uuid
@@ -1072,6 +1072,7 @@ async def process_balance_checkout(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
         )
+        .with_for_update()
         .limit(1)
     )
     result = await db.execute(query)
@@ -1100,6 +1101,29 @@ async def process_balance_checkout(
     captured_payments_count = sum(1 for p in booking.payments if p.status == PaymentStatus.CAPTURED)
     if captured_payments_count >= 2:
         raise HTTPException(status_code=400, detail="Maximum payment attempts reached for this booking")
+
+    pending_payments = [p for p in booking.payments if p.status == PaymentStatus.CREATED and p.razorpay_order_id]
+    pending_payments.sort(key=lambda p: p.created_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    if pending_payments:
+        latest_pending = pending_payments[0]
+        created_at = latest_pending.created_at
+        if created_at and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at and datetime.now(timezone.utc) - created_at <= timedelta(minutes=30):
+            return {
+                "status": "success",
+                "checkout_data": {
+                    "booking_public_id": booking.public_id,
+                    "razorpay_order_id": latest_pending.razorpay_order_id,
+                    "amount": int(round(float(latest_pending.amount) * 100)),
+                    "currency": "INR",
+                    "key_id": settings.RAZORPAY_KEY_ID
+                }
+            }
+
+        latest_pending.status = PaymentStatus.FAILED
+        latest_pending.error_code = "ORDER_ABANDONED"
+        latest_pending.error_description = "Previous balance checkout was abandoned before completion."
 
     # Generate a new Razorpay Order for remaining balance
     is_agent_payment = current_user is not None and current_user.role == UserRole.AGENT and booking.agent_id == current_user.id

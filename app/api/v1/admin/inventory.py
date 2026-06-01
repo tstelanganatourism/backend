@@ -476,12 +476,12 @@ async def generate_room_inventory(
     if not variant:
         raise HTTPException(status_code=404, detail="Room variant not found.")
 
-    if variant.total_rooms == 0 and body.override_total_rooms is None:
+    if variant.total_rooms == 0 and body.override_total_rooms is None and not body.slot_capacities:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Room variant '{variant.variant_name}' has total_rooms=0. "
-                "Set a total_rooms value on the variant first, or pass override_total_rooms."
+                "Set a total_rooms value on the variant first, or pass override_total_rooms/slot_capacities."
             )
         )
 
@@ -503,12 +503,15 @@ async def generate_room_inventory(
     if not room:
         raise HTTPException(status_code=404, detail="Parent room/lodge not found.")
 
-    effective_total_rooms = (
-        body.override_total_rooms if body.override_total_rooms is not None
-        else variant.total_rooms
-    )
-
     from datetime import time
+
+    def parse_time(t_str: str) -> time:
+        parts = [int(p) for p in t_str.split(':')]
+        if len(parts) == 2:
+            return time(parts[0], parts[1])
+        if len(parts) >= 3:
+            return time(parts[0], parts[1], parts[2])
+        raise ValueError()
 
     # Always add the primary slot if present
     slots_to_generate = []
@@ -520,20 +523,43 @@ async def generate_room_inventory(
         for slot in room.booking_slots:
             if isinstance(slot, dict) and "slot_start" in slot and "slot_end" in slot:
                 try:
-                    def parse_time(t_str: str) -> time:
-                        parts = [int(p) for p in t_str.split(':')]
-                        if len(parts) == 2:
-                            return time(parts[0], parts[1])
-                        elif len(parts) >= 3:
-                            return time(parts[0], parts[1], parts[2])
-                        else:
-                            raise ValueError()
                     start_t = parse_time(slot["slot_start"])
                     end_t = parse_time(slot["slot_end"])
                     if (start_t, end_t) not in slots_to_generate:
                         slots_to_generate.append((start_t, end_t))
                 except Exception:
                     pass
+
+    if not slots_to_generate:
+        raise HTTPException(
+            status_code=400,
+            detail="No booking slots are configured for this lodge.",
+        )
+
+    default_total_rooms = (
+        body.override_total_rooms if body.override_total_rooms is not None
+        else variant.total_rooms
+    )
+
+    slot_capacity_map = {}
+    if body.slot_capacities:
+        configured_slots = set(slots_to_generate)
+        for slot_capacity in body.slot_capacities:
+            try:
+                key = (parse_time(slot_capacity.slot_start), parse_time(slot_capacity.slot_end))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid slot time: {slot_capacity.slot_start}-{slot_capacity.slot_end}.",
+                )
+
+            if key not in configured_slots:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Slot {slot_capacity.slot_start}-{slot_capacity.slot_end} is not configured for this lodge.",
+                )
+
+            slot_capacity_map[key] = slot_capacity.total_rooms
 
     # Query existing (date, slot_start, slot_end) combinations for idempotency
     existing_result = await db.execute(
@@ -556,12 +582,13 @@ async def generate_room_inventory(
             if (current, s_start, s_end) in existing_slots:
                 skipped += 1
             else:
+                total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
                 db.add(RoomSlotInventory(
                     room_variant_id=body.room_variant_id,
                     date=current,
                     slot_start=s_start,
                     slot_end=s_end,
-                    total_rooms=effective_total_rooms,
+                    total_rooms=total_rooms,
                     booked_rooms=0,
                     reserved_rooms=0,
                     is_closed=False,
@@ -580,7 +607,15 @@ async def generate_room_inventory(
         details={
             "from_date": str(body.from_date),
             "to_date": str(body.to_date),
-            "effective_total_rooms": effective_total_rooms,
+            "default_total_rooms": default_total_rooms,
+            "slot_capacities": [
+                {
+                    "slot_start": str(slot_start),
+                    "slot_end": str(slot_end),
+                    "total_rooms": slot_capacity_map.get((slot_start, slot_end), default_total_rooms),
+                }
+                for slot_start, slot_end in slots_to_generate
+            ],
             "created": created,
             "skipped": skipped,
         },
@@ -600,6 +635,7 @@ async def generate_room_inventory(
         slug = slug_row[0]
         clear_cache_prefix(f"rooms:detail:{slug}")
         import asyncio
+        from app.services.redis_client import invalidate_cached_availability
         asyncio.create_task(invalidate_cached_availability(slug))
         from app.utils.cache import trigger_frontend_revalidation
         trigger_frontend_revalidation(tags=[f"room-{slug}"])
@@ -609,7 +645,7 @@ async def generate_room_inventory(
         skipped=skipped,
         message=(
             f"Generated {created} inventory rows for variant '{variant.variant_name}' "
-            f"({effective_total_rooms} rooms/day), skipped {skipped} existing."
+            f"across {len(slots_to_generate)} slot(s), skipped {skipped} existing."
         ),
     )
 

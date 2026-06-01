@@ -90,11 +90,18 @@ class PublicPackageAvailabilityResponse(AppBaseModel):
 
 # ─── Room Inventory Schemas ──────────────────────────────────────────────────
 
+class RoomSlotCapacityRequest(AppBaseModel):
+    slot_start: str
+    slot_end: str
+    total_rooms: int = Field(..., ge=0, le=10000)
+
+
 class RoomInventoryGenerateRequest(AppBaseModel):
     room_variant_id: int
     from_date: date
     to_date: date
     override_total_rooms: Optional[int] = Field(None, ge=0, le=10000)
+    slot_capacities: Optional[List[RoomSlotCapacityRequest]] = None
 
 
 class RoomInventoryUpdateRequest(AppBaseModel):

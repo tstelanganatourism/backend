@@ -7,6 +7,7 @@ import json
 from loguru import logger
 from sqlalchemy import select, text
 from pydantic import BaseModel
+from typing import Optional
 
 from app.db.session import get_db
 from app.models.booking import Booking, BookingDraft, BookingPassenger, BookingStayDate
@@ -24,6 +25,24 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
     razorpay_signature: str
+
+class PaymentFailureRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: Optional[str] = None
+    error_code: Optional[str] = None
+    error_description: Optional[str] = None
+    error_source: Optional[str] = None
+    error_step: Optional[str] = None
+    error_reason: Optional[str] = None
+
+def _failure_description(req: PaymentFailureRequest) -> str:
+    parts = [
+        req.error_description,
+        f"source={req.error_source}" if req.error_source else None,
+        f"step={req.error_step}" if req.error_step else None,
+        f"reason={req.error_reason}" if req.error_reason else None,
+    ]
+    return " | ".join(p for p in parts if p)[:1000]
 
 async def _finalize_draft(
     draft: BookingDraft,
@@ -325,7 +344,7 @@ async def verify_payment(
             bk_res = await db.execute(booking_stmt)
             booking = bk_res.scalar_one()
 
-            if payment.status == PaymentStatus.CREATED:
+            if payment.status != PaymentStatus.CAPTURED:
                 # Idempotency: check if this razorpay_payment_id was already captured
                 already_captured = await db.execute(
                     select(Payment).where(
@@ -381,6 +400,68 @@ async def verify_payment(
     return {"status": "success", "booking_id": public_id}
 
 
+@router.post("/record-failure")
+async def record_payment_failure(
+    failure: PaymentFailureRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Persist Razorpay failure details for retryable balance-payment attempts.
+    Initial booking failures are draft-based, so they are logged and released by
+    the existing draft cleanup worker unless a later success/webhook arrives.
+    """
+    from app.models.payment import Payment
+    from app.models.enums import PaymentStatus
+
+    payment_stmt = (
+        select(Payment)
+        .where(Payment.razorpay_order_id == failure.razorpay_order_id)
+        .with_for_update()
+    )
+    result = await db.execute(payment_stmt)
+    payment = result.scalar_one_or_none()
+
+    if not payment:
+        draft_res = await db.execute(
+            select(BookingDraft)
+            .where(BookingDraft.razorpay_order_id == failure.razorpay_order_id)
+            .with_for_update()
+        )
+        draft = draft_res.scalar_one_or_none()
+        if draft:
+            from app.workers.draft_cleanup import release_draft_inventory
+            sse_payloads = await release_draft_inventory(draft, db)
+            await db.delete(draft)
+            await db.commit()
+
+            from app.utils.sse import sse_manager
+            for p in sse_payloads or []:
+                await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+
+            logger.info(
+                f"Released draft {draft.draft_id} after Razorpay failure/dismissal "
+                f"for order {failure.razorpay_order_id}"
+            )
+            return {"status": "ok"}
+
+        logger.info(
+            f"Razorpay failure for draft/unknown order {failure.razorpay_order_id}: "
+            f"{failure.error_code or 'unknown'} {failure.error_description or ''}"
+        )
+        return {"status": "ok"}
+
+    if payment.status == PaymentStatus.CAPTURED:
+        logger.info(f"Ignoring failure for already captured order {failure.razorpay_order_id}")
+        return {"status": "ok"}
+
+    payment.status = PaymentStatus.FAILED
+    payment.razorpay_payment_id = failure.razorpay_payment_id
+    payment.error_code = failure.error_code
+    payment.error_description = _failure_description(failure)
+    await db.commit()
+    return {"status": "ok"}
+
+
 @router.post("/webhook/razorpay")
 async def razorpay_webhook(
     request: Request,
@@ -402,6 +483,27 @@ async def razorpay_webhook(
         data = json.loads(payload)
         event = data.get("event")
         
+        if event == "payment.failed":
+            payment_entity = data.get("payload", {}).get("payment", {}).get("entity", {})
+            order_id = payment_entity.get("order_id")
+            if order_id:
+                from app.models.payment import Payment
+                from app.models.enums import PaymentStatus
+
+                p_res = await db.execute(
+                    select(Payment)
+                    .where(Payment.razorpay_order_id == order_id)
+                    .with_for_update()
+                )
+                payment = p_res.scalar_one_or_none()
+                if payment and payment.status != PaymentStatus.CAPTURED:
+                    payment.status = PaymentStatus.FAILED
+                    payment.razorpay_payment_id = payment_entity.get("id")
+                    payment.error_code = payment_entity.get("error_code")
+                    payment.error_description = payment_entity.get("error_description")
+                    await db.commit()
+                    logger.info(f"Webhook marked Razorpay payment failed for order {order_id}")
+
         if event == "payment.captured" or event == "order.paid":
             payment_entity = data.get("payload", {}).get("payment", {}).get("entity", {})
             order_id = payment_entity.get("order_id")
@@ -454,27 +556,23 @@ async def razorpay_webhook(
                     p_res = await db.execute(payment_stmt)
                     payment = p_res.scalar_one_or_none()
 
-                    if payment and payment.status == PaymentStatus.CREATED:
-                        # Idempotency: ensure payment_id not already captured
-                        if payment_id and payment.razorpay_payment_id == payment_id:
-                            logger.info(f"Webhook: balance payment {payment_id} already captured, skipping")
-                        else:
-                            payment.status = PaymentStatus.CAPTURED
-                            payment.razorpay_payment_id = payment_id
+                    if payment and payment.status != PaymentStatus.CAPTURED:
+                        payment.status = PaymentStatus.CAPTURED
+                        payment.razorpay_payment_id = payment_id
 
-                            # Recompute balances from ledger
-                            from app.utils.ledger import recompute_booking_ledger
-                            booking = await recompute_booking_ledger(payment.booking_id, db)
+                        # Recompute balances from ledger
+                        from app.utils.ledger import recompute_booking_ledger
+                        booking = await recompute_booking_ledger(payment.booking_id, db)
 
-                            try:
-                                from app.worker import get_arq_pool
-                                arq_pool = await get_arq_pool()
-                                await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
-                            except Exception as arq_err:
-                                logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
+                        try:
+                            from app.worker import get_arq_pool
+                            arq_pool = await get_arq_pool()
+                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                        except Exception as arq_err:
+                            logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
 
-                            await db.commit()
-                            logger.info(f"Webhook finalized balance payment for order {order_id}")
+                        await db.commit()
+                        logger.info(f"Webhook finalized balance payment for order {order_id}")
                     
     except Exception as e:
         logger.error(f"Webhook processing failed: {str(e)}")
