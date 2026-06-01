@@ -90,7 +90,6 @@ TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q
 from datetime import datetime, timezone, timedelta
 
 def _set_refresh_cookie(response: Response, token: str, max_age_seconds: int) -> None:
-    expires_dt = datetime.now(timezone.utc) + timedelta(seconds=max_age_seconds)
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=token,
@@ -98,7 +97,6 @@ def _set_refresh_cookie(response: Response, token: str, max_age_seconds: int) ->
         secure=COOKIE_SECURE,
         samesite=COOKIE_SAMESITE,
         max_age=max_age_seconds,
-        expires=expires_dt,
         path="/",
     )
 

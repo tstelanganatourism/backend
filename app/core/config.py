@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30   # shorter for admin
-    ADMIN_REFRESH_TOKEN_EXPIRE_HOURS: int = 24    # 1 day for admin
+    ADMIN_REFRESH_TOKEN_EXPIRE_HOURS: int = 720    # 30 days for admin
     ADMIN_OTP_EXPIRE_SECONDS: int = 300           # 5-minute OTP window
     
     # Database
