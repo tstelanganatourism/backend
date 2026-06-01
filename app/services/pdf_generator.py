@@ -35,14 +35,19 @@ async def generate_pdf_from_url(url: str, output_path: str = None) -> bytes:
 
             # Navigate to the Next.js hidden print route
             logger.info(f"Navigating to {url} for PDF generation")
-            response = await page.goto(url, wait_until="load", timeout=30000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             if not response or not response.ok:
                 status = response.status if response else "no response"
                 raise Exception(f"Failed to load PDF page {url}: HTTP {status}")
 
-            # Give some time for maps/images to fully render
-            await asyncio.sleep(2)
+            await page.wait_for_selector(".page", timeout=15000)
+            await page.emulate_media(media="print")
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                logger.warning("Timed out waiting for network idle on %s; continuing with PDF render.", url)
 
             pdf_bytes = await page.pdf(
                 format="A4",
@@ -113,7 +118,7 @@ async def generate_package_brochure_task(ctx, package_id: int):
             logger.info(f"Successfully generated and uploaded brochure for package {package.slug}")
             
         except Exception as e:
-            logger.error(f"Failed to generate brochure for package {package_id}: {e}")
+            logger.exception(f"Failed to generate brochure for package {package_id}: {e}")
             package.brochure_generation_status = DocumentGenerationStatus.FAILED
             await db.commit()
             raise e # Raise to let ARQ handle retries if applicable

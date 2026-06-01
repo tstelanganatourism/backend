@@ -211,6 +211,7 @@ async def create_package(
     )
     await db.commit()
     clear_cache_prefix("packages:")
+    clear_cache_prefix("carousel:")
     
     return package
 
@@ -340,6 +341,7 @@ async def update_package(
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{old_slug}")
     clear_cache_prefix(f"packages:detail:{package.slug}")
+    clear_cache_prefix("carousel:")
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=[f"package-{package.id}"])
     

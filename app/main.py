@@ -63,6 +63,14 @@ app.include_router(
     tags=["Public Discovery - Rooms"],
 )
 
+# ─── Homepage Carousel Route ──────────────────────────────────────────────────
+from app.api.v1 import carousel as carousel_module
+app.include_router(
+    carousel_module.router,
+    prefix="/api/v1",
+    tags=["Public Discovery - Carousel"],
+)
+
 # ─── Auth Routes (Phase-3) ────────────────────────────────────────────────────
 app.include_router(
     auth.router,
