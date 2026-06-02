@@ -765,12 +765,13 @@ async def get_booking_details(
     """
     from app.models.room import Room, RoomVariant
     query = (
-        select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address)
+        select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address, Room.id)
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
         .outerjoin(Package, PackageVariant.package_id == Package.id)
         .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
         .outerjoin(Room, RoomVariant.room_id == Room.id)
         .options(selectinload(Booking.passengers))
+        .options(selectinload(Booking.stay_dates))
         .where(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
@@ -803,6 +804,20 @@ async def get_booking_details(
         room_checkout = row[6].strftime('%I:%M %p') if row[6] else None
 
     room_address = row[7] if row[7] else None
+    room_id = row[8]
+    
+    room_checkout_date = None
+    room_highlights = []
+    if b.room_variant_id:
+        if b.stay_dates:
+            dates = [sd.date for sd in b.stay_dates]
+            if dates:
+                room_checkout_date = (max(dates) + timedelta(days=1)).isoformat()
+        if room_id:
+            from app.models.room import RoomHighlight
+            hi_query = select(RoomHighlight).where(RoomHighlight.room_id == room_id).order_by(RoomHighlight.sort_order.asc())
+            hi_res = await db.execute(hi_query)
+            room_highlights = [{"title": hi.title, "icon": hi.icon} for hi in hi_res.scalars().all()]
     
     agent_id = None
     agent_name = None
@@ -934,7 +949,9 @@ async def get_booking_details(
         } if boarding_point else None,
         "room_checkin": room_checkin,
         "room_checkout": room_checkout,
+        "room_checkout_date": room_checkout_date,
         "room_address": room_address,
+        "room_highlights": room_highlights,
         "itinerary": itinerary,
         "passengers": [
             {

@@ -418,12 +418,13 @@ async def admin_create_booking(
             raise HTTPException(status_code=400, detail="room_variant_id is required for room booking")
         
         rv_result = await db.execute(
-            select(RoomVariant).where(RoomVariant.id == request.room_variant_id)
+            select(RoomVariant, Room).join(Room, Room.id == RoomVariant.room_id).where(RoomVariant.id == request.room_variant_id)
         )
-        rv = rv_result.scalar_one_or_none()
-        if not rv:
+        row = rv_result.one_or_none()
+        if not row:
             raise HTTPException(status_code=404, detail="Room variant not found")
         
+        rv, room_obj = row
         room_variant_id_val = rv.id
         
         # Calculate stay dates
@@ -438,8 +439,8 @@ async def admin_create_booking(
         from app.services.room_calculation import calculate_required_rooms
         required_rooms = calculate_required_rooms(request.quantity, rv.capacity_per_room)
         
-        slot_start_t = time.fromisoformat(request.slot_start) if request.slot_start else None
-        slot_end_t = time.fromisoformat(request.slot_end) if request.slot_end else None
+        slot_start_t = time.fromisoformat(request.slot_start) if request.slot_start else room_obj.slot_start
+        slot_end_t = time.fromisoformat(request.slot_end) if request.slot_end else room_obj.slot_end
 
         # Admin bypass: fetch each stay date's inventory — auto-create if missing, never block
         for sd in stay_dates:
@@ -465,7 +466,6 @@ async def admin_create_booking(
                     is_closed=False,
                 )
                 db.add(room_inv)
-                await db.flush()
 
             # Admin always goes through — expand total_rooms if needed to keep data consistent
             if room_inv.booked_rooms + required_rooms > room_inv.total_rooms:
@@ -473,6 +473,8 @@ async def admin_create_booking(
 
             # Record this booking in the inventory
             room_inv.booked_rooms += required_rooms
+            
+        await db.flush()
 
         # Price calculation: use weekday/weekend per date
         total_price = Decimal("0.00")
