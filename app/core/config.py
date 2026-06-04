@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     def normalize_environment(cls, value: str) -> str:
         return value.strip().lower()
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def convert_postgres_to_asyncpg(cls, value: str) -> str:
+        if value and value.startswith("postgres://"):
+            return value.replace("postgres://", "postgresql+asyncpg://", 1)
+        if value and value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
+
     @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", mode="before")
     @classmethod
     def parse_csv_list(cls, value: str | list[str]) -> list[str]:
