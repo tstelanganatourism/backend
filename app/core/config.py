@@ -64,10 +64,16 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def convert_postgres_to_asyncpg(cls, value: str) -> str:
-        if value and value.startswith("postgres://"):
-            return value.replace("postgres://", "postgresql+asyncpg://", 1)
-        if value and value.startswith("postgresql://"):
-            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        if not value:
+            return value
+        if value.startswith("postgres://"):
+            value = value.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif value.startswith("postgresql://") and not value.startswith("postgresql+asyncpg://"):
+            value = value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        
+        # asyncpg does not accept 'sslmode', it uses 'ssl'
+        if "sslmode=" in value:
+            value = value.replace("sslmode=", "ssl=")
         return value
 
     @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", mode="before")
