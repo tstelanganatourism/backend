@@ -71,9 +71,14 @@ class Settings(BaseSettings):
         elif value.startswith("postgresql://") and not value.startswith("postgresql+asyncpg://"):
             value = value.replace("postgresql://", "postgresql+asyncpg://", 1)
         
-        # asyncpg does not accept 'sslmode', it uses 'ssl'
+        # asyncpg does not accept 'sslmode' or 'channel_binding'
         if "sslmode=" in value:
             value = value.replace("sslmode=", "ssl=")
+        if "&channel_binding=require" in value:
+            value = value.replace("&channel_binding=require", "")
+        if "?channel_binding=require" in value:
+            value = value.replace("?channel_binding=require", "?")
+            
         return value
 
     @field_validator("CORS_ORIGINS", "ALLOWED_HOSTS", mode="before")

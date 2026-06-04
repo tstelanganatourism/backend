@@ -32,13 +32,6 @@ class WorkerSettings:
     max_tries = 2 # Fail fast if Playwright rendering timeouts or crashes
     job_timeout = 300  # 5 minutes timeout for generation
     
-    # CRITICAL FIX FOR UPSTASH FREE LIMITS:
-    # ARQ defaults to polling Redis every 0.5 seconds (172,000 requests/day).
-    # Upstash's free tier only allows 10,000 requests per day!
-    # By setting this to 15 seconds, ARQ only uses 5,760 requests/day, 
-    # keeping the database completely free forever.
-    poll_delay = 15.0
-    
 _pool = None
 
 # ARQ global pool to enqueue jobs from FastAPI
