@@ -740,8 +740,11 @@ async def refresh_access_token(
     old_exp = old_payload.get("exp", 0)
     old_jti = old_payload.get("jti", "")
     remaining = max(0, int(old_exp - get_ist_now().timestamp()))
-    if old_jti and remaining > 0:
-        await blacklist_token(old_jti, remaining)
+    # NOTE: Immediate blacklisting causes random logouts if the user has multiple tabs open
+    # and they both try to refresh the token at the exact same time. We will rely on 
+    # the token's natural expiration instead, or implement a 60-second grace period later if needed.
+    # if old_jti and remaining > 0:
+    #     await blacklist_token(old_jti, remaining)
 
     # Issue new access token and new refresh token (Proper Token Rotation)
     is_admin = user.role == UserRole.ADMIN
