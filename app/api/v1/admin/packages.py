@@ -13,7 +13,8 @@ from app.models.package import (
     PackageExclusion,
     PackageBoardingPoint,
     PackageFAQ,
-    PackagePolicy
+    PackagePolicy,
+    PackageTransportOption
 )
 from app.schemas.package import PackageCreate, PackageUpdate, PackageDetailResponse, PackageResponse, PackagePaginatedResponse
 from app.middleware.auth import require_admin
@@ -92,11 +93,32 @@ async def list_packages(
     total_result = await db.execute(count_query)
     total_count = total_result.scalar_one()
 
-    query = base_query.options(selectinload(Package.variants))
+    query = base_query.options(
+        selectinload(Package.variants),
+        selectinload(Package.transport_options)
+    )
     query = query.order_by(Package.order_priority.desc(), Package.created_at.desc()).limit(limit).offset(offset)
     
     result = await db.execute(query)
     items = result.scalars().all()
+    
+    package_ids = [item.id for item in items]
+    if package_ids:
+        from app.models.booking import Booking
+        from app.models.enums import BookingStatus
+        booking_counts = await db.execute(
+            select(PackageVariant.package_id, func.count(Booking.id))
+            .join(Booking, Booking.variant_id == PackageVariant.id)
+            .where(PackageVariant.package_id.in_(package_ids))
+            .where(Booking.status != BookingStatus.CANCELLED)
+            .group_by(PackageVariant.package_id)
+        )
+        counts_map = dict(booking_counts.all())
+        for item in items:
+            item.active_booking_count = counts_map.get(item.id, 0)
+    else:
+        for item in items:
+            item.active_booking_count = 0
     
     return {
         "items": items,
@@ -116,6 +138,7 @@ async def get_package(
         .where(Package.id == package_id, Package.deleted_at.is_(None))
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.highlights),
@@ -152,7 +175,7 @@ async def create_package(
         slug = f"{slug}-{int(func.now().select().scalar_one().timestamp())}"
         
     package_data = body.model_dump(exclude={
-        "variants", "gallery", "itinerary", "highlights", "inclusions", 
+        "variants", "transport_options", "gallery", "itinerary", "highlights", "inclusions", 
         "exclusions", "boarding_points", "faqs", "policies"
     })
     package_data["slug"] = slug
@@ -161,6 +184,7 @@ async def create_package(
     
     # Sync child relations before saving
     await sync_nested_relation(db, package, "variants", PackageVariant, body.variants)
+    await sync_nested_relation(db, package, "transport_options", PackageTransportOption, body.transport_options)
     await sync_nested_relation(db, package, "gallery", PackageGalleryImage, body.gallery)
     await sync_nested_relation(db, package, "itinerary", PackageItineraryDay, body.itinerary)
     await sync_nested_relation(db, package, "highlights", PackageHighlight, body.highlights)
@@ -175,9 +199,6 @@ async def create_package(
         (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
         default=0
     )
-    # Compute transport_info from active variants
-    transports = [v.transport_info for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and v.transport_info and v.transport_info.strip()]
-    package.transport_info = transports[0] if transports else None
     
     db.add(package)
     await db.commit()
@@ -188,6 +209,7 @@ async def create_package(
         .where(Package.id == package.id)
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.highlights),
@@ -228,6 +250,7 @@ async def update_package(
         .where(Package.id == package_id, Package.deleted_at.is_(None))
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.highlights),
@@ -248,7 +271,7 @@ async def update_package(
         )
         
     update_data = body.model_dump(exclude_unset=True, exclude={
-        "variants", "gallery", "itinerary", "highlights", "inclusions", 
+        "variants", "transport_options", "gallery", "itinerary", "highlights", "inclusions", 
         "exclusions", "boarding_points", "faqs", "policies"
     })
     
@@ -284,6 +307,8 @@ async def update_package(
     # Sync child relations if provided in update payload
     if body.variants is not None:
         await sync_nested_relation(db, package, "variants", PackageVariant, body.variants)
+    if getattr(body, "transport_options", None) is not None:
+        await sync_nested_relation(db, package, "transport_options", PackageTransportOption, body.transport_options)
     if body.gallery is not None:
         await sync_nested_relation(db, package, "gallery", PackageGalleryImage, body.gallery)
     if body.itinerary is not None:
@@ -306,9 +331,6 @@ async def update_package(
         (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
         default=0
     )
-    # Recompute transport_info
-    transports = [v.transport_info for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and v.transport_info and v.transport_info.strip()]
-    package.transport_info = transports[0] if transports else None
         
     await db.commit()
     
@@ -319,7 +341,7 @@ async def update_package(
         entity_type="Package",
         entity_id=str(package.id),
         details=body.model_dump(exclude_unset=True, exclude={
-            "variants", "gallery", "itinerary", "highlights", "inclusions", 
+            "variants", "transport_options", "gallery", "itinerary", "highlights", "inclusions", 
             "exclusions", "boarding_points", "faqs", "policies"
         })
     )
@@ -351,6 +373,7 @@ async def update_package(
         .where(Package.id == package.id)
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.highlights),
@@ -436,6 +459,7 @@ async def publish_package(
         .where(Package.id == package_id, Package.deleted_at.is_(None))
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.highlights),
@@ -566,6 +590,7 @@ async def get_brochure_validation(
         .where(Package.id == package_id, Package.deleted_at.is_(None))
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.inclusions),
@@ -627,6 +652,7 @@ async def regenerate_brochure(
         .where(Package.id == package_id, Package.deleted_at.is_(None))
         .options(
             selectinload(Package.variants),
+            selectinload(Package.transport_options),
             selectinload(Package.gallery),
             selectinload(Package.itinerary),
             selectinload(Package.inclusions),

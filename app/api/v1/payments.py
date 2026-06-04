@@ -211,7 +211,7 @@ async def _finalize_draft(
         travel_date=draft.travel_date,
         adult_count=draft.checkout_payload.get('adult_count') or draft.quantity,
         child_count=draft.checkout_payload.get('child_count') or 0,
-        has_refreshment_addon=draft.checkout_payload.get('has_refreshment_addon', False),
+        has_refreshment_addon=bool(snapshot.get('has_refreshment_addon', False)),
         subtotal_amount=Decimal(snapshot['subtotal_amount']),
         coupon_discount=Decimal(snapshot['coupon_discount']),
         coupon_applied=draft.coupon_applied,

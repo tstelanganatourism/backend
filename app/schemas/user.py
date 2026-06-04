@@ -115,6 +115,10 @@ class UserMeResponse(AppBaseModel):
     commission_percentage: Optional[float] = None
     commission_type: Optional[str] = None
     commission_fixed_amount: Optional[float] = None
+    company_name: Optional[str] = None
+    gst_number: Optional[str] = None
+    address: Optional[str] = None
+    admin_notes: Optional[str] = None
 
 
 class ProfileUpdateRequest(AppBaseModel):
@@ -122,6 +126,8 @@ class ProfileUpdateRequest(AppBaseModel):
     full_name: Optional[str] = None
     phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
+    gst_number: Optional[str] = None
+    address: Optional[str] = None
 
     @field_validator("full_name", mode="before")
     @classmethod

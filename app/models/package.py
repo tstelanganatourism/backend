@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Numeric, Integer, Boolean, ForeignKey, UniqueConstraint, Table, Enum as SQLEnum, Date, CheckConstraint, BigInteger, Index, text
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel, SortableMixin, SEOMixin
-from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus
+from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus, TransportOptionType
 
 # Association table for Package -> Tags
 package_tags = Table(
@@ -27,13 +27,17 @@ class Package(BaseModel, SEOMixin):
     region = Column(SQLEnum(RegionType), nullable=True)
     order_priority = Column(Integer, default=0)
     starting_price = Column(Numeric(12, 2), nullable=False, server_default="0.00", index=True)
-    transport_info = Column(String, nullable=True)
+    has_transport = Column(Boolean, default=False, server_default="false", nullable=False)
+    has_refreshments = Column(Boolean, default=False, server_default="false", nullable=False)
+    refreshment_adult_price = Column(Numeric(10, 2), nullable=True)
+    refreshment_child_price = Column(Numeric(10, 2), nullable=True)
     is_featured = Column(Boolean, default=False, server_default="false", nullable=False)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
     status = Column(SQLEnum(PublishStatus), default=PublishStatus.DRAFT, server_default="DRAFT", nullable=False, index=True)
 
     tags = relationship("Tag", secondary=package_tags)
     variants = relationship("PackageVariant", back_populates="package", cascade="all, delete-orphan")
+    transport_options = relationship("PackageTransportOption", back_populates="package", cascade="all, delete-orphan", order_by="PackageTransportOption.id")
     gallery = relationship("PackageGalleryImage", back_populates="package", cascade="all, delete-orphan", order_by="PackageGalleryImage.sort_order")
     itinerary = relationship("PackageItineraryDay", back_populates="package", cascade="all, delete-orphan", order_by="PackageItineraryDay.sort_order")
     highlights = relationship("PackageHighlight", back_populates="package", cascade="all, delete-orphan", order_by="PackageHighlight.sort_order")
@@ -130,7 +134,8 @@ class PackageVariant(BaseModel):
     title = Column(String, nullable=False)
     adult_price = Column(Numeric(10, 2), nullable=False)
     child_price = Column(Numeric(10, 2), nullable=False)
-    transport_info = Column(String, nullable=True)
+    weekend_adult_price = Column(Numeric(10, 2), nullable=True)
+    weekend_child_price = Column(Numeric(10, 2), nullable=True)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
 
     package = relationship("Package", back_populates="variants")
@@ -159,3 +164,24 @@ class PackageVariantInventory(BaseModel):
     )
 
     variant = relationship("PackageVariant", back_populates="inventory")
+
+class PackageTransportOption(BaseModel):
+    __tablename__ = "package_transport_options"
+
+    package_id = Column(ForeignKey("packages.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=False)
+    type = Column(SQLEnum(TransportOptionType), nullable=False)
+    capacity = Column(Integer, nullable=False, default=1, server_default="1")
+    
+    # Pricing for SHARED
+    adult_price = Column(Numeric(10, 2), nullable=True)
+    child_price = Column(Numeric(10, 2), nullable=True)
+    weekend_adult_price = Column(Numeric(10, 2), nullable=True)
+    weekend_child_price = Column(Numeric(10, 2), nullable=True)
+    
+    # Pricing for SEPARATE_VEHICLE
+    fixed_price = Column(Numeric(10, 2), nullable=True)
+    weekend_fixed_price = Column(Numeric(10, 2), nullable=True)
+
+    package = relationship("Package", back_populates="transport_options")
+

@@ -121,6 +121,24 @@ async def list_rooms(
     result = await db.execute(query)
     items = result.scalars().all()
     
+    room_ids = [item.id for item in items]
+    if room_ids:
+        from app.models.booking import Booking
+        from app.models.enums import BookingStatus
+        booking_counts = await db.execute(
+            select(RoomVariant.room_id, func.count(Booking.id))
+            .join(Booking, Booking.room_variant_id == RoomVariant.id)
+            .where(RoomVariant.room_id.in_(room_ids))
+            .where(Booking.status != BookingStatus.CANCELLED)
+            .group_by(RoomVariant.room_id)
+        )
+        counts_map = dict(booking_counts.all())
+        for item in items:
+            item.active_booking_count = counts_map.get(item.id, 0)
+    else:
+        for item in items:
+            item.active_booking_count = 0
+    
     return {
         "items": items,
         "total": total_count,

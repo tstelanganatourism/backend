@@ -55,6 +55,10 @@ class RegionType(str, enum.Enum):
     AP = 'AP'
     TS = 'TS'
 
+class TransportOptionType(str, enum.Enum):
+    SHARED = 'SHARED'
+    SEPARATE_VEHICLE = 'SEPARATE_VEHICLE'
+
 class CancellationStatus(str, enum.Enum):
     PENDING = 'PENDING'
     APPROVED = 'APPROVED'

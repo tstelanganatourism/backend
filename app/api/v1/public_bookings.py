@@ -10,7 +10,7 @@ from loguru import logger
 import asyncio
 
 from app.db.session import get_db
-from app.models.package import PackageVariantInventory, PackageVariant, Package
+from app.models.package import PackageVariantInventory, PackageVariant, Package, PackageBoardingPoint, PackageTransportOption
 from app.models.room import Room, RoomSlotInventory, RoomVariant
 from app.models.booking import Booking, BookingPassenger, BookingStayDate
 from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType, PublishStatus
@@ -46,6 +46,11 @@ class PassengerInput(BaseModel):
     relationship: Optional[str] = None  # e.g. 'self', 'spouse', 'child'
     is_primary: Optional[bool] = False
 
+class TransportSelection(BaseModel):
+    """A single transport option with the quantity of vehicles/passes selected."""
+    option_id: int
+    quantity: int = Field(..., ge=1)
+
 class CheckoutRequest(BaseModel):
     # Differentiate between package or room
     target_type: str  # 'package' or 'room'
@@ -56,6 +61,11 @@ class CheckoutRequest(BaseModel):
 
     # Package specific
     variant_id: Optional[int] = None
+    # Deprecated: use transport_selections instead (kept for backward compat)
+    transport_option_id: Optional[int] = None
+    # New: supports multiple vehicle types with quantities
+    transport_selections: Optional[List[TransportSelection]] = None
+    include_refreshments: Optional[bool] = False
 
     # Room specific
     room_id: Optional[int] = None
@@ -146,6 +156,8 @@ async def process_checkout(
     _room_stay_dates = []  # Populated for room bookings with multi-day stays
     
     # Start inventory validation scope under SELECT FOR UPDATE
+    commissionable_base = Decimal("0.00")
+
     if request.target_type == 'package':
         if not request.variant_id:
             raise HTTPException(status_code=400, detail="variant_id is required for package")
@@ -178,6 +190,7 @@ async def process_checkout(
         # 2. Get base variant details and verify parent package is active/not deleted
         variant_query = (
             select(PackageVariant)
+            .options(selectinload(PackageVariant.package))
             .join(Package, Package.id == PackageVariant.package_id)
             .where(
                 PackageVariant.id == request.variant_id,
@@ -193,11 +206,114 @@ async def process_checkout(
         if not variant:
             raise HTTPException(status_code=400, detail="Package variant not found")
             
-        # Calculate subtotal using precise Decimal representation
+        parent_package = variant.package
+            
+        # Determine base pricing based on weekend
+        is_weekend = request.travel_date.weekday() in (5, 6)
+        
+        base_adult_price = variant.adult_price
+        base_child_price = variant.child_price
+        
+        if is_weekend:
+            if variant.weekend_adult_price is not None:
+                base_adult_price = variant.weekend_adult_price
+            if variant.weekend_child_price is not None:
+                base_child_price = variant.weekend_child_price
+
+        # Calculate base subtotal using precise Decimal representation
         eff_adult, eff_child = get_effective_package_prices(
-            variant.adult_price, variant.child_price, inventory.price_override
+            base_adult_price, base_child_price, inventory.price_override
         )
-        subtotal_amount = Decimal(str(adult_count)) * eff_adult + Decimal(str(child_count)) * eff_child
+        base_subtotal = Decimal(str(adult_count)) * eff_adult + Decimal(str(child_count)) * eff_child
+        
+        transport_subtotal = Decimal("0.00")
+        transport_snapshot_items = []
+
+        # Resolve transport_selections (new) or fall back to legacy transport_option_id
+        effective_selections = request.transport_selections or []
+        if not effective_selections and request.transport_option_id:
+            effective_selections = [TransportSelection(option_id=request.transport_option_id, quantity=1)]
+
+        if parent_package.has_transport and effective_selections:
+            # Load all selected transport options in one query
+            selected_opt_ids = [s.option_id for s in effective_selections]
+            t_opts_res = await db.execute(
+                select(PackageTransportOption).where(
+                    PackageTransportOption.id.in_(selected_opt_ids),
+                    PackageTransportOption.package_id == parent_package.id
+                )
+            )
+            t_opts_map = {t.id: t for t in t_opts_res.scalars().all()}
+
+            for sel in effective_selections:
+                t_opt = t_opts_map.get(sel.option_id)
+                if not t_opt:
+                    raise HTTPException(status_code=400, detail=f"Invalid transport option id: {sel.option_id}")
+
+                if t_opt.type == 'SHARED':
+                    # For SHARED: price per passenger, sel.quantity is ignored (always 1 selection)
+                    t_adult = t_opt.adult_price or Decimal("0.00")
+                    t_child = t_opt.child_price or Decimal("0.00")
+                    if is_weekend:
+                        if t_opt.weekend_adult_price is not None:
+                            t_adult = t_opt.weekend_adult_price
+                        if t_opt.weekend_child_price is not None:
+                            t_child = t_opt.weekend_child_price
+                    item_cost = Decimal(str(adult_count)) * t_adult + Decimal(str(child_count)) * t_child
+                    transport_subtotal += item_cost
+                    transport_snapshot_items.append({
+                        "option_id": t_opt.id,
+                        "title": t_opt.title,
+                        "type": "SHARED",
+                        "capacity": int(t_opt.capacity or 0),
+                        "quantity": 1,
+                        "adult_price": float(t_adult),
+                        "child_price": float(t_child),
+                        "item_total": float(item_cost)
+                    })
+
+                elif t_opt.type == 'SEPARATE_VEHICLE':
+                    # For SEPARATE_VEHICLE: price per vehicle, sel.quantity = number of vehicles
+                    t_fixed = t_opt.fixed_price or Decimal("0.00")
+                    if is_weekend and t_opt.weekend_fixed_price is not None:
+                        t_fixed = t_opt.weekend_fixed_price
+                    item_cost = Decimal(str(sel.quantity)) * t_fixed
+                    transport_subtotal += item_cost
+                    transport_snapshot_items.append({
+                        "option_id": t_opt.id,
+                        "title": t_opt.title,
+                        "type": "SEPARATE_VEHICLE",
+                        "capacity": int(t_opt.capacity or 0),
+                        "quantity": sel.quantity,
+                        "fixed_price": float(t_fixed),
+                        "item_total": float(item_cost)
+                    })
+
+            # Validate capacity: total vehicle capacity must cover all passengers
+            total_pax = adult_count + child_count
+            separate_capacity = sum(
+                s.quantity * (t_opts_map[s.option_id].capacity or 1)
+                for s in effective_selections
+                if s.option_id in t_opts_map and t_opts_map[s.option_id].type == 'SEPARATE_VEHICLE'
+            )
+            has_separate = any(
+                s.option_id in t_opts_map and t_opts_map[s.option_id].type == 'SEPARATE_VEHICLE'
+                for s in effective_selections
+            )
+            if has_separate and separate_capacity < total_pax:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected vehicles can only seat {separate_capacity} passengers, but you have {total_pax}. Please add more vehicles."
+                )
+
+        refreshment_subtotal = Decimal("0.00")
+        if parent_package.has_refreshments and request.include_refreshments:
+            r_adult = parent_package.refreshment_adult_price or Decimal("0.00")
+            r_child = parent_package.refreshment_child_price or Decimal("0.00")
+            refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
+            
+        subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
+        commissionable_base = base_subtotal
         
         # Reserve inventory (increment reserved_count instead of booked_count)
         inventory.reserved_count += request.quantity
@@ -316,6 +432,7 @@ async def process_checkout(
             else:
                 day_price = variant.weekday_price
             subtotal_amount += Decimal(str(required_rooms)) * day_price
+        commissionable_base = subtotal_amount
 
         # Store stay dates for persistence
         _room_stay_dates = stay_dates
@@ -383,11 +500,11 @@ async def process_checkout(
         
         if commission_type == 'FIXED_AMOUNT':
             fixed_amount = Decimal(str(current_user.commission_fixed_amount or 0))
-            agent_discount = min(fixed_amount, total_amount).quantize(Decimal("0.01"))
+            agent_discount = min(fixed_amount, commissionable_base, total_amount).quantize(Decimal("0.01"))
         else:
             # PERCENTAGE type
             agent_discount = (
-                discounted_subtotal
+                commissionable_base
                 * commission_percentage
                 / Decimal("100")
             ).quantize(Decimal("0.01"))
@@ -399,14 +516,21 @@ async def process_checkout(
     # Construct historical pricing snapshot with Decimal-safe string values
     pricing_snapshot = {
         "subtotal_amount": str(subtotal_amount),
+        "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
+        "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
         "gateway_fee": str(gateway_fee),
         "tourist_total": str(total_amount),
+        "commissionable_base": str(commissionable_base),
         "agent_discount": str(agent_discount),
         "agent_payable": str(agent_payable),
     }
+    # Store transport selections breakdown in snapshot for invoice/ticket rendering
+    if request.target_type == 'package' and transport_snapshot_items:
+        pricing_snapshot["transport_selections"] = transport_snapshot_items
+
     if is_agent:
         pricing_snapshot["agent_metadata"] = {
             "agent_id": current_user.id,
@@ -604,10 +728,23 @@ async def get_agent_bookings(
     """
 
     query = (
-        select(Booking, Package.title, PackageVariant.title)
+        select(
+            Booking, 
+            Package.title, 
+            PackageVariant.title,
+            Room.lodge_name,
+            RoomVariant.variant_name,
+            Room.slot_start,
+            Room.slot_end,
+            PackageBoardingPoint.departure_time
+        )
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
         .outerjoin(Package, PackageVariant.package_id == Package.id)
+        .outerjoin(PackageBoardingPoint, (PackageBoardingPoint.package_id == Package.id) & (PackageBoardingPoint.sort_order == 0))
+        .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
+        .outerjoin(Room, RoomVariant.room_id == Room.id)
         .options(selectinload(Booking.passengers))
+        .options(selectinload(Booking.stay_dates))
         .where(
             Booking.agent_id == current_user.id,
             Booking.deleted_at.is_(None)
@@ -620,12 +757,42 @@ async def get_agent_bookings(
     rows = result.all()
     
     sanitized_items = []
+    from datetime import datetime, timedelta
     for row in rows:
         b = row[0]
-        package_title = row[1] or "Custom Lodging / Stays"
-        variant_title = row[2] or "Lodge Room Booking"
+        package_title = row[1] if b.variant_id else row[3]
+        variant_title = row[2] if b.variant_id else row[4]
         
+        target_type = "ROOM" if b.room_variant_id else "PACKAGE"
+        room_checkin = None
+        room_checkout = None
+        room_checkout_date = None
+        package_departure_time = None
+        
+        if target_type == "ROOM":
+            if b.stay_dates:
+                dates = [sd.date for sd in b.stay_dates]
+                if dates:
+                    room_checkout_date = (max(dates) + timedelta(days=1)).isoformat()
+            
+            if b.pricing_snapshot and b.pricing_snapshot.get('slot_start'):
+                try:
+                    room_checkin = datetime.strptime(b.pricing_snapshot.get('slot_start'), "%H:%M:%S").strftime('%I:%M %p')
+                    room_checkout = datetime.strptime(b.pricing_snapshot.get('slot_end'), "%H:%M:%S").strftime('%I:%M %p')
+                except:
+                    pass
+            if not room_checkin:
+                room_checkin = row[5].strftime('%I:%M %p') if row[5] else None
+                room_checkout = row[6].strftime('%I:%M %p') if row[6] else None
+        else:
+            package_departure_time = row[7].strftime('%I:%M %p') if row[7] else None
+
         sanitized_items.append({
+            "target_type": target_type,
+            "room_checkin": room_checkin,
+            "room_checkout": room_checkout,
+            "room_checkout_date": room_checkout_date,
+            "package_departure_time": package_departure_time,
             "id": b.id,
             "public_id": b.public_id,
             "travel_date": b.travel_date.isoformat(),
@@ -639,12 +806,14 @@ async def get_agent_bookings(
             "total_amount": float(b.total_amount),
             "paid_amount": float(b.paid_amount),
             "remaining_balance": float(b.remaining_balance),
+            "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
             "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
             "created_at": b.created_at.isoformat() if b.created_at else None,
             "package_title": package_title,
             "variant_title": variant_title,
             "passenger_names": [p.full_name for p in b.passengers],
             "agent_commission": float(b.agent_commission or 0),
+            "pricing_snapshot": b.pricing_snapshot,
         })
         
     return sanitized_items
@@ -696,10 +865,23 @@ async def get_tourist_bookings(
     Fetch recent bookings for the logged-in tourist.
     """
     query = (
-        select(Booking, Package.title, PackageVariant.title)
+        select(
+            Booking, 
+            Package.title, 
+            PackageVariant.title,
+            Room.lodge_name,
+            RoomVariant.variant_name,
+            Room.slot_start,
+            Room.slot_end,
+            PackageBoardingPoint.departure_time
+        )
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
         .outerjoin(Package, PackageVariant.package_id == Package.id)
+        .outerjoin(PackageBoardingPoint, (PackageBoardingPoint.package_id == Package.id) & (PackageBoardingPoint.sort_order == 0))
+        .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
+        .outerjoin(Room, RoomVariant.room_id == Room.id)
         .options(selectinload(Booking.passengers))
+        .options(selectinload(Booking.stay_dates))
         .where(
             Booking.user_id == current_user.id,
             Booking.deleted_at.is_(None),
@@ -711,23 +893,62 @@ async def get_tourist_bookings(
     rows = result.all()
     
     sanitized_items = []
+    from datetime import datetime, timedelta
     for row in rows:
         b = row[0]
-        package_title = row[1] or "Custom Lodging / Stays"
-        variant_title = row[2] or "Lodge Room Booking"
+        package_title = row[1] if b.variant_id else row[3]
+        variant_title = row[2] if b.variant_id else row[4]
         
+        target_type = "ROOM" if b.room_variant_id else "PACKAGE"
+        room_checkin = None
+        room_checkout = None
+        room_checkout_date = None
+        package_departure_time = None
+        
+        if target_type == "ROOM":
+            if b.stay_dates:
+                dates = [sd.date for sd in b.stay_dates]
+                if dates:
+                    room_checkout_date = (max(dates) + timedelta(days=1)).isoformat()
+            
+            if b.pricing_snapshot and b.pricing_snapshot.get('slot_start'):
+                try:
+                    room_checkin = datetime.strptime(b.pricing_snapshot.get('slot_start'), "%H:%M:%S").strftime('%I:%M %p')
+                    room_checkout = datetime.strptime(b.pricing_snapshot.get('slot_end'), "%H:%M:%S").strftime('%I:%M %p')
+                except:
+                    pass
+            if not room_checkin:
+                room_checkin = row[5].strftime('%I:%M %p') if row[5] else None
+                room_checkout = row[6].strftime('%I:%M %p') if row[6] else None
+        else:
+            package_departure_time = row[7].strftime('%I:%M %p') if row[7] else None
+
         sanitized_items.append({
+            "target_type": target_type,
+            "room_checkin": room_checkin,
+            "room_checkout": room_checkout,
+            "room_checkout_date": room_checkout_date,
+            "package_departure_time": package_departure_time,
             "id": b.id,
             "public_id": b.public_id,
             "travel_date": b.travel_date.isoformat(),
             "adult_count": b.adult_count,
             "child_count": b.child_count,
             "total_amount": float(b.total_amount),
+            "subtotal_amount": float(b.subtotal_amount),
+            "coupon_discount": float(b.coupon_discount),
+            "coupon_applied": b.coupon_applied,
+            "gst_amount": float(b.gst_amount),
+            "gateway_fee": float(b.gateway_fee),
+            "paid_amount": float(b.paid_amount),
+            "remaining_balance": float(b.remaining_balance),
+            "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
             "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
             "created_at": b.created_at.isoformat() if b.created_at else None,
             "package_title": package_title,
             "variant_title": variant_title,
             "passenger_names": [p.full_name for p in b.passengers],
+            "pricing_snapshot": b.pricing_snapshot,
         })
         
     return sanitized_items
@@ -765,13 +986,14 @@ async def get_booking_details(
     """
     from app.models.room import Room, RoomVariant
     query = (
-        select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address, Room.id)
+        select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address, Room.id, Package.type)
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
         .outerjoin(Package, PackageVariant.package_id == Package.id)
         .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
         .outerjoin(Room, RoomVariant.room_id == Room.id)
         .options(selectinload(Booking.passengers))
         .options(selectinload(Booking.stay_dates))
+        .options(selectinload(Booking.cancellation_requests))
         .where(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
@@ -786,6 +1008,7 @@ async def get_booking_details(
     b = row[0]
     package_title = row[1] if b.variant_id else row[3]
     variant_title = row[2] if b.variant_id else row[4]
+    package_type = row[9] if b.variant_id else None
     
     room_checkin = None
     room_checkout = None
@@ -835,6 +1058,18 @@ async def get_booking_details(
     else:
         agent_gst = None
         agent_company = None
+
+    booked_by_name = None
+    booked_by_email = None
+    booked_by_role = None
+    if b.user_id:
+        user_query = select(User).where(User.id == b.user_id).limit(1)
+        u_result = await db.execute(user_query)
+        booked_user = u_result.scalar_one_or_none()
+        if booked_user:
+            booked_by_name = booked_user.full_name
+            booked_by_email = booked_user.email
+            booked_by_role = booked_user.role.value if hasattr(booked_user.role, 'value') else str(booked_user.role)
 
     boarding_point = None
     itinerary = []
@@ -913,7 +1148,7 @@ async def get_booking_details(
     agent_paid = sum(Decimal(str(p.amount)) for p in raw_payments if p.status == PaymentStatus.CAPTURED)
     agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
 
-    return {
+    result_dict = {
         "id": b.id,
         "public_id": b.public_id,
         "target_type": "ROOM" if b.room_variant_id else "PACKAGE",
@@ -921,6 +1156,7 @@ async def get_booking_details(
         "adult_count": b.adult_count,
         "child_count": b.child_count,
         "subtotal_amount": float(b.subtotal_amount),
+        "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
         "coupon_discount": float(b.coupon_discount),
         "coupon_applied": b.coupon_applied,
         "gst_amount": float(b.gst_amount),
@@ -940,6 +1176,7 @@ async def get_booking_details(
         "created_at": b.created_at.isoformat() if b.created_at else None,
         "package_title": package_title,
         "variant_title": variant_title,
+        "package_type": package_type.value if hasattr(package_type, 'value') else str(package_type) if package_type else None,
         "boarding_point": {
             "title": boarding_point.title,
             "address": boarding_point.address,
@@ -973,6 +1210,9 @@ async def get_booking_details(
         "agent_phone": agent_phone,
         "agent_gst": agent_gst,
         "agent_company": agent_company,
+        "booked_by_name": booked_by_name,
+        "booked_by_email": booked_by_email,
+        "booked_by_role": booked_by_role,
         "has_pending_cancellation": has_pending_cancellation,
         "ticket_pdf_url": b.ticket_pdf_url,
         "invoice_pdf_url": b.invoice_pdf_url,
@@ -987,7 +1227,22 @@ async def get_booking_details(
         ),
         # Immutable payment history — always returned
         "payment_ledger": payment_ledger,
+        "pricing_snapshot": b.pricing_snapshot,
     }
+    
+    # Include cancellation details if present
+    if b.cancellation_requests:
+        latest_cancel = sorted(b.cancellation_requests, key=lambda c: c.requested_at, reverse=True)[0]
+        result_dict["cancellation_details"] = {
+            "status": latest_cancel.status.value if hasattr(latest_cancel.status, "value") else str(latest_cancel.status),
+            "reason": latest_cancel.reason,
+            "cancellation_fee": float(latest_cancel.cancellation_fee) if latest_cancel.cancellation_fee is not None else None,
+            "refund_amount": float(latest_cancel.refund_amount) if latest_cancel.refund_amount is not None else None,
+            "requested_at": latest_cancel.requested_at.isoformat() if latest_cancel.requested_at else None,
+            "processed_at": latest_cancel.processed_at.isoformat() if latest_cancel.processed_at else None,
+        }
+        
+    return result_dict
 
 class CancellationRequestInput(BaseModel):
     reason: str = Field(..., min_length=5, max_length=1000)

@@ -10,7 +10,7 @@ from app.db.session import get_db
 from app.models.package import Package, PackageVariant, PackageVariantInventory, package_tags
 from app.models.tag import Tag
 from app.models.enums import PackageType, RegionType, PublishStatus
-from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO
+from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO, TransportOptionPublicDTO
 from app.schemas.inventory import PublicDateAvailability, PublicPackageAvailabilityResponse
 from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
 from app.utils.pricing import get_effective_package_prices
@@ -103,7 +103,6 @@ async def get_packages(
                 Package.generated_brochure_url,
                 Package.is_featured,
                 Package.starting_price,
-                Package.transport_info,
                 func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
             )
             .group_by(Package.id)
@@ -139,7 +138,7 @@ async def get_packages(
                     title=v.title,
                     adult_price=v.adult_price,
                     child_price=v.child_price,
-                    transport_info=v.transport_info
+                    transport_info=None
                 ))
 
         # Map to DTOs
@@ -166,7 +165,7 @@ async def get_packages(
                 is_featured=pkg.is_featured,
                 tags=pkg.tags_list or [],
                 starting_price=pkg.starting_price,
-                transport_info=pkg.transport_info,
+                transport_info=None,
                 variants=variants_by_pkg.get(pkg.id, [])
             )
 
@@ -218,9 +217,9 @@ async def get_package_detail(
             )
 
         import asyncio
-        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy
+        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption
 
-        # Fetch all relationships concurrently to eliminate 11 sequential roundtrips
+        # Fetch all relationships concurrently to eliminate sequential roundtrips
         async def fetch_rel(model, active_filter=None):
             q = select(model).where(model.package_id == pkg.id)
             if active_filter is not None:
@@ -236,7 +235,8 @@ async def get_package_detail(
             fetch_rel(PackageExclusion),
             fetch_rel(PackageBoardingPoint),
             fetch_rel(PackageFAQ),
-            fetch_rel(PackagePolicy)
+            fetch_rel(PackagePolicy),
+            fetch_rel(PackageTransportOption),
         )
 
         pkg_variants = results[0]
@@ -252,6 +252,7 @@ async def get_package_detail(
         pkg_boarding_points = results[6]
         pkg_faqs = results[7]
         pkg_policies = results[8]
+        pkg_transport_options = results[9]
             
         starting_price = min((v.adult_price for v in pkg_variants), default=None)
         
@@ -275,6 +276,25 @@ async def get_package_detail(
             is_featured=pkg.is_featured,
             tags=[tag.name for tag in pkg_tags if tag.is_active],
             starting_price=starting_price,
+            # Transport & Refreshments
+            has_transport=pkg.has_transport or False,
+            transport_options=[
+                TransportOptionPublicDTO(
+                    id=t.id,
+                    type=t.type,
+                    title=t.title,
+                    capacity=t.capacity,
+                    adult_price=t.adult_price,
+                    child_price=t.child_price,
+                    weekend_adult_price=t.weekend_adult_price,
+                    weekend_child_price=t.weekend_child_price,
+                    fixed_price=t.fixed_price,
+                    weekend_fixed_price=t.weekend_fixed_price,
+                ) for t in pkg_transport_options
+            ],
+            has_refreshments=pkg.has_refreshments or False,
+            refreshment_adult_price=pkg.refreshment_adult_price,
+            refreshment_child_price=pkg.refreshment_child_price,
             meta_title=pkg.meta_title,
             meta_description=pkg.meta_description,
             og_image_url=pkg.og_image_url,
@@ -285,7 +305,7 @@ async def get_package_detail(
                     title=v.title,
                     adult_price=v.adult_price,
                     child_price=v.child_price,
-                    transport_info=v.transport_info
+                    transport_info=None
                 ) for v in pkg_variants
             ],
             gallery=[

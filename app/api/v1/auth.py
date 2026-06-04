@@ -141,6 +141,10 @@ def _build_token_response(user, response: Response, admin: bool = False) -> dict
             "commission_percentage": float(user.commission_percentage) if user.commission_percentage is not None else None,
             "commission_type": user.commission_type,
             "commission_fixed_amount": float(user.commission_fixed_amount) if user.commission_fixed_amount is not None else None,
+            "company_name": user.company_name,
+            "gst_number": user.gst_number,
+            "address": user.address,
+            "admin_notes": user.admin_notes,
         },
     }
 
@@ -772,6 +776,10 @@ async def refresh_access_token(
             "commission_percentage": float(user.commission_percentage) if user.commission_percentage is not None else None,
             "commission_type": user.commission_type,
             "commission_fixed_amount": float(user.commission_fixed_amount) if user.commission_fixed_amount is not None else None,
+            "company_name": user.company_name,
+            "gst_number": user.gst_number,
+            "address": user.address,
+            "admin_notes": user.admin_notes,
         },
     }
 
@@ -819,6 +827,10 @@ async def get_me(current_user=Depends(get_current_user)):
         commission_percentage=float(current_user.commission_percentage) if current_user.commission_percentage is not None else None,
         commission_type=current_user.commission_type,
         commission_fixed_amount=float(current_user.commission_fixed_amount) if current_user.commission_fixed_amount is not None else None,
+        company_name=current_user.company_name,
+        gst_number=current_user.gst_number,
+        address=current_user.address,
+        admin_notes=current_user.admin_notes,
     )
 
 
@@ -836,6 +848,10 @@ async def update_me(
         current_user.phone_number = body.phone_number
     if body.avatar_url is not None:
         current_user.avatar_url = body.avatar_url
+    if body.gst_number is not None:
+        current_user.gst_number = bleach.clean(body.gst_number, tags=[], strip=True).strip() if body.gst_number else None
+    if body.address is not None:
+        current_user.address = bleach.clean(body.address, tags=[], strip=True).strip() if body.address else None
 
     await db.commit()
     await db.refresh(current_user)
@@ -851,6 +867,10 @@ async def update_me(
         commission_percentage=float(current_user.commission_percentage) if current_user.commission_percentage is not None else None,
         commission_type=current_user.commission_type,
         commission_fixed_amount=float(current_user.commission_fixed_amount) if current_user.commission_fixed_amount is not None else None,
+        company_name=current_user.company_name,
+        gst_number=current_user.gst_number,
+        address=current_user.address,
+        admin_notes=current_user.admin_notes,
     )
 
 

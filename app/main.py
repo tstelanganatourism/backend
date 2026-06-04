@@ -125,6 +125,10 @@ from app.services.redis_client import get_redis
 # --- Rate Limiting Middleware (Phase-4) --------------------------------------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    if client_ip in ("127.0.0.1", "localhost", "::1"):
+        return await call_next(request)
+
     path = request.url.path
     
     # Exempt routes (health, API documentation, and static assets)
@@ -164,7 +168,6 @@ async def rate_limit_middleware(request: Request, call_next):
         limit = 30
         category = "checkout"
 
-    client_ip = request.client.host if request.client else "unknown"
     key = f"ratelimit:{client_ip}:{category}"
 
     try:

@@ -66,6 +66,10 @@ async def list_admin_bookings(
             base_query = base_query.where(Booking.room_variant_id.isnot(None))
         elif target_filter.upper() == "PACKAGE":
             base_query = base_query.where(Booking.variant_id.isnot(None))
+        elif target_filter.upper() in ("BOAT RIDE", "TOUR"):
+            base_query = base_query.join(PackageVariant, Booking.variant_id == PackageVariant.id).join(Package, PackageVariant.package_id == Package.id).where(Package.type == "TOUR")
+        elif target_filter.upper() in ("SIGHTSEEING", "TRIP"):
+            base_query = base_query.join(PackageVariant, Booking.variant_id == PackageVariant.id).join(Package, PackageVariant.package_id == Package.id).where(Package.type == "TRIP")
 
     if variant_id is not None:
         base_query = base_query.where(Booking.variant_id == variant_id)
@@ -143,6 +147,7 @@ async def list_admin_bookings(
     paginated_query = (
         base_query
         .options(selectinload(Booking.passengers))
+        .options(selectinload(Booking.stay_dates))
         .order_by(Booking.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -167,43 +172,85 @@ async def list_admin_bookings(
 
     variant_map: dict = {}
     if variant_ids:
+        from app.models.package import PackageBoardingPoint
         pv_res = await db.execute(
-            select(PackageVariant, Package.title)
+            select(PackageVariant, Package.title, PackageBoardingPoint.departure_time, Package.type)
             .join(Package, Package.id == PackageVariant.package_id)
+            .outerjoin(PackageBoardingPoint, (PackageBoardingPoint.package_id == Package.id) & (PackageBoardingPoint.sort_order == 0))
             .where(PackageVariant.id.in_(variant_ids))
         )
-        for pv, pkg_title in pv_res.all():
-            variant_map[pv.id] = {"package_title": pkg_title, "variant_title": pv.title}
+        for pv, pkg_title, dep_time, pkg_type in pv_res.all():
+            variant_map[pv.id] = {
+                "package_title": pkg_title, 
+                "variant_title": pv.title,
+                "package_type": pkg_type.value if hasattr(pkg_type, 'value') else str(pkg_type),
+                "departure_time": dep_time.strftime('%I:%M %p') if dep_time else None
+            }
 
     room_variant_map: dict = {}
     if room_variant_ids:
         rv_res = await db.execute(
-            select(RoomVariant, Room.lodge_name)
+            select(RoomVariant, Room.lodge_name, Room.slot_start, Room.slot_end)
             .join(Room, Room.id == RoomVariant.room_id)
             .where(RoomVariant.id.in_(room_variant_ids))
         )
-        for rv, room_name in rv_res.all():
-            room_variant_map[rv.id] = {"package_title": room_name, "variant_title": rv.variant_name}
+        for rv, room_name, start_time, end_time in rv_res.all():
+            room_variant_map[rv.id] = {
+                "package_title": room_name, 
+                "variant_title": rv.variant_name,
+                "slot_start": start_time.strftime('%I:%M %p') if start_time else None,
+                "slot_end": end_time.strftime('%I:%M %p') if end_time else None
+            }
 
+    from datetime import datetime, timedelta
     items = []
     for b in bookings:
         customer = user_map.get(b.user_id) if b.user_id else None
         agent = user_map.get(b.agent_id) if b.agent_id else None
+        target_type = "ROOM" if b.room_variant_id else "PACKAGE"
+
+        room_checkin = None
+        room_checkout = None
+        room_checkout_date = None
+        package_departure_time = None
+
+        package_type = None
 
         if b.variant_id and b.variant_id in variant_map:
             title_info = variant_map[b.variant_id]
+            package_departure_time = title_info.get("departure_time")
+            package_type = title_info.get("package_type")
         elif b.room_variant_id and b.room_variant_id in room_variant_map:
             title_info = room_variant_map[b.room_variant_id]
+            if b.stay_dates:
+                dates = [sd.date for sd in b.stay_dates]
+                if dates:
+                    room_checkout_date = (max(dates) + timedelta(days=1)).isoformat()
+            
+            if b.pricing_snapshot and b.pricing_snapshot.get('slot_start'):
+                try:
+                    room_checkin = datetime.strptime(b.pricing_snapshot.get('slot_start'), "%H:%M:%S").strftime('%I:%M %p')
+                    room_checkout = datetime.strptime(b.pricing_snapshot.get('slot_end'), "%H:%M:%S").strftime('%I:%M %p')
+                except:
+                    pass
+            if not room_checkin:
+                room_checkin = title_info.get("slot_start")
+                room_checkout = title_info.get("slot_end")
         else:
             title_info = {"package_title": "—", "variant_title": "—"}
 
         items.append({
             "id": b.id,
             "public_id": b.public_id,
-            "target_type": "ROOM" if b.room_variant_id else "PACKAGE",
+            "target_type": target_type,
             "source": b.source.value if hasattr(b.source, "value") else str(b.source),
             "status": b.status.value if hasattr(b.status, "value") else str(b.status),
             "travel_date": b.travel_date.isoformat(),
+            "room_checkin": room_checkin,
+            "room_checkout": room_checkout,
+            "room_checkout_date": room_checkout_date,
+            "package_departure_time": package_departure_time,
+            "package_type": package_type,
             "adult_count": b.adult_count,
             "child_count": b.child_count,
             # Admin pricing - expose agent_commission and agent_payable
@@ -215,6 +262,7 @@ async def list_admin_bookings(
             "total_amount": float(b.total_amount),
             "paid_amount": float(b.paid_amount),
             "remaining_balance": float(b.remaining_balance),
+            "has_refreshment_addon": b.has_refreshment_addon,
             "agent_commission": float(b.agent_commission) if b.agent_commission else None,
             "agent_payable": float(b.total_amount - (b.agent_commission or 0)),
             "created_at": b.created_at.isoformat() if b.created_at else None,
@@ -234,6 +282,7 @@ async def list_admin_bookings(
                 next((p.full_name for p in b.passengers if p.is_primary), None)
                 or (b.passengers[0].full_name if b.passengers else None)
             ),
+            "pricing_snapshot": b.pricing_snapshot,
         })
 
     return {
@@ -330,6 +379,10 @@ class AdminCreateBookingRequest(BaseModel):
     user_id: Optional[int] = None  # optional: assign to a registered user
     agent_id: Optional[int] = None  # optional: assign under an agent
     passengers: List[AdminPassengerInput] = []
+    # Transport
+    transport_selections: Optional[List] = None  # List[{option_id, quantity}]
+    # Refreshments
+    include_refreshments: Optional[bool] = False
     # Room-specific
     departure_date: Optional[str] = None
     slot_start: Optional[str] = None
@@ -409,6 +462,49 @@ async def admin_create_booking(
         )
         subtotal_amount = (Decimal(str(eff_adult)) * adult_count) + \
                           (Decimal(str(eff_child)) * child_count)
+        
+        # Transport pricing for admin direct booking
+        transport_snapshot_items = []
+        if request.transport_selections:
+            from app.models.package import PackageTransportOption as PTO
+            pkg_res_for_transport = await db.execute(
+                select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
+            )
+            parent_pkg = pkg_res_for_transport.scalar_one_or_none()
+            is_weekend_admin = travel_date.weekday() in (5, 6)
+            if parent_pkg and parent_pkg.has_transport:
+                selected_ids = [s['option_id'] for s in request.transport_selections if isinstance(s, dict)]
+                t_res = await db.execute(select(PTO).where(PTO.id.in_(selected_ids), PTO.package_id == parent_pkg.id))
+                t_map = {t.id: t for t in t_res.scalars().all()}
+                for sel in request.transport_selections:
+                    sel_id = sel['option_id'] if isinstance(sel, dict) else sel.option_id
+                    sel_qty = sel['quantity'] if isinstance(sel, dict) else sel.quantity
+                    t_opt = t_map.get(sel_id)
+                    if not t_opt:
+                        continue
+                    if t_opt.type == 'SHARED':
+                        t_adult = (t_opt.weekend_adult_price if is_weekend_admin and t_opt.weekend_adult_price else t_opt.adult_price) or Decimal("0.00")
+                        t_child = (t_opt.weekend_child_price if is_weekend_admin and t_opt.weekend_child_price else t_opt.child_price) or Decimal("0.00")
+                        item_cost = Decimal(str(adult_count)) * Decimal(str(t_adult)) + Decimal(str(child_count)) * Decimal(str(t_child))
+                        subtotal_amount += item_cost
+                        transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SHARED", "capacity": int(t_opt.capacity or 0), "quantity": 1, "adult_price": float(t_adult), "child_price": float(t_child), "item_total": float(item_cost)})
+                    elif t_opt.type == 'SEPARATE_VEHICLE':
+                        t_fixed = (t_opt.weekend_fixed_price if is_weekend_admin and t_opt.weekend_fixed_price else t_opt.fixed_price) or Decimal("0.00")
+                        item_cost = Decimal(str(sel_qty)) * Decimal(str(t_fixed))
+                        subtotal_amount += item_cost
+                        transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SEPARATE_VEHICLE", "capacity": int(t_opt.capacity or 0), "quantity": sel_qty, "fixed_price": float(t_fixed), "item_total": float(item_cost)})
+
+        # Refreshments for admin direct booking
+        if request.include_refreshments:
+            pkg_res_for_ref = await db.execute(
+                select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
+            )
+            parent_pkg_ref = pkg_res_for_ref.scalar_one_or_none()
+            if parent_pkg_ref and parent_pkg_ref.has_refreshments:
+                r_adult = parent_pkg_ref.refreshment_adult_price or Decimal("0.00")
+                r_child = parent_pkg_ref.refreshment_child_price or Decimal("0.00")
+                ref_cost = Decimal(str(adult_count)) * Decimal(str(r_adult)) + Decimal(str(child_count)) * Decimal(str(r_child))
+                subtotal_amount += ref_cost
         
         # Lock the seat in inventory
         inv.booked_count += request.quantity
@@ -505,6 +601,8 @@ async def admin_create_booking(
 
     pricing_snapshot = {
         "subtotal_amount": str(subtotal_amount),
+        "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
+        "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
         "coupon_discount": "0.00",
         "coupon_applied": None,
         "gst_amount": str(gst_amount),
@@ -516,6 +614,8 @@ async def admin_create_booking(
         "created_by_admin_id": current_admin.id,
         "admin_name": current_admin.full_name,
     }
+    if transport_snapshot_items:
+        pricing_snapshot["transport_selections"] = transport_snapshot_items
 
     if request.target_type == 'room':
         if request.slot_start:
@@ -576,6 +676,7 @@ async def admin_create_booking(
             else BookingStatus.PENDING
         ),
         pricing_snapshot=pricing_snapshot,
+        has_refreshment_addon=bool(getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False)),
     )
     db.add(booking)
     await db.flush()
@@ -705,6 +806,28 @@ async def admin_generate_invoice(
             detail=f"Failed to enqueue post-booking documents task: {str(e)}"
         )
 
+@router.post("/{id}/mark-refunded")
+async def mark_booking_refunded(
+    id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """
+    Marks a cancelled booking as REFUNDED.
+    """
+    from app.models.enums import BookingStatus
+    booking = await db.get(Booking, id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    if booking.status != BookingStatus.CANCELLED:
+        raise HTTPException(status_code=400, detail="Only cancelled bookings can be marked as refunded.")
+        
+    booking.status = BookingStatus.REFUNDED
+    await db.commit()
+    
+    return {"status": "success", "message": f"Booking {booking.public_id} marked as refunded."}
+
 @router.patch("/{id}/cancel")
 async def admin_cancel_booking(
     id: int,
@@ -764,8 +887,13 @@ async def admin_cancel_booking(
     if booking.status == BookingStatus.CANCELLED:
         raise HTTPException(status_code=400, detail="Booking is already cancelled.")
 
-    # Calculate 35% cancellation fee based on total_amount
-    cancellation_fee = (booking.total_amount * Decimal("0.35")).quantize(Decimal("0.01"))
+    # Calculate cancellation fee based on target type
+    # For rooms, no cancellations allowed (100% charge)
+    if booking.room_variant_id:
+        cancellation_fee = booking.total_amount
+    else:
+        cancellation_fee = (booking.total_amount * Decimal("0.35")).quantize(Decimal("0.01"))
+        
     # refund_amount = paid_amount - cancellation_fee (refund remains manual)
     paid_amount = Decimal(str(booking.paid_amount or 0.00))
     refund_amount = max(Decimal("0.00"), paid_amount - cancellation_fee).quantize(Decimal("0.01"))
@@ -939,6 +1067,7 @@ async def list_cancellation_requests(
             "paid_amount": float(booking.paid_amount),
             "reason": r.reason,
             "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+            "booking_status": booking.status.value if hasattr(booking.status, "value") else str(booking.status),
             "requested_at": r.requested_at.isoformat(),
             "processed_at": r.processed_at.isoformat() if r.processed_at else None,
             "cancellation_fee": float(r.cancellation_fee) if r.cancellation_fee is not None else None,
@@ -1085,4 +1214,238 @@ async def _do_record_cash_payment(
         "paid_amount": float(booking.paid_amount),
         "remaining_balance": float(booking.remaining_balance),
         "payment_reference_id": payment_reference_id,
+    }
+
+
+# ─── Transport Planning Endpoint ──────────────────────────────────────────────
+
+@router.get("/transport-planning")
+async def get_transport_planning(
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns a grouped view of transport requirements by travel date and package.
+    For each date, shows:
+    - Which packages have bookings
+    - Aggregate of separate vehicle needs (e.g. 2x Sedan, 1x SUV)
+    - Total shared transport pax count + capacity from transport option
+    - Per-booking detail with customer name and their chosen vehicles
+    """
+    from datetime import datetime, date, timedelta
+
+    # Parse date range — default to today..today+30
+    today = date.today()
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else today
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else today + timedelta(days=30)
+    except ValueError:
+        start_dt = today
+        end_dt = today + timedelta(days=30)
+
+    # Fetch all non-cancelled, non-room bookings with transport in date range
+    q = (
+        select(Booking)
+        .options(selectinload(Booking.passengers))
+        .where(
+            Booking.deleted_at.is_(None),
+            Booking.variant_id.isnot(None),  # package bookings only
+            Booking.status.notin_(["CANCELLED", "REFUNDED"]),
+            Booking.travel_date >= start_dt,
+            Booking.travel_date <= end_dt,
+        )
+        .order_by(Booking.travel_date.asc(), Booking.created_at.asc())
+    )
+    result = await db.execute(q)
+    bookings = result.scalars().all()
+
+    # Batch-load packages and users
+    variant_ids = {b.variant_id for b in bookings}
+    user_ids = {b.user_id for b in bookings if b.user_id}
+
+    variant_to_package: dict = {}
+    if variant_ids:
+        from app.models.package import PackageTransportOption
+        pv_res = await db.execute(
+            select(PackageVariant, Package)
+            .join(Package, Package.id == PackageVariant.package_id)
+            .where(PackageVariant.id.in_(variant_ids))
+        )
+        for pv, pkg in pv_res.all():
+            variant_to_package[pv.id] = {"package": pkg, "variant": pv}
+
+        # Load shared transport capacities per package
+        transport_opt_res = await db.execute(
+            select(PackageTransportOption)
+            .where(PackageTransportOption.package_id.in_({v["package"].id for v in variant_to_package.values()}))
+        )
+        package_transport_opts: dict = {}
+        for opt in transport_opt_res.scalars().all():
+            package_transport_opts.setdefault(opt.package_id, []).append(opt)
+
+    user_map: dict = {}
+    if user_ids:
+        u_res = await db.execute(select(User).where(User.id.in_(user_ids)))
+        for u in u_res.scalars().all():
+            user_map[u.id] = u
+
+    # ── Group by date then package ──────────────────────────────────────────
+    from collections import defaultdict
+
+    date_groups_raw: dict = defaultdict(lambda: defaultdict(list))  # date -> package_id -> list[booking]
+
+    for b in bookings:
+        info = variant_to_package.get(b.variant_id)
+        if not info:
+            continue
+        pkg = info["package"]
+        date_groups_raw[b.travel_date][pkg.id].append((b, info))
+
+    date_groups = []
+    for travel_date in sorted(date_groups_raw.keys()):
+        pkg_groups = date_groups_raw[travel_date]
+        date_total_bookings = 0
+        date_total_pax = 0
+        date_with_transport = 0
+        date_without_transport = 0
+        package_group_list = []
+
+        for pkg_id, booking_infos in pkg_groups.items():
+            pkg = booking_infos[0][1]["package"]
+            transport_opts = package_transport_opts.get(pkg_id, [])
+
+            # Build capacity lookup: title -> capacity (for shared options)
+            shared_capacity_by_title: dict = {}
+            for opt in transport_opts:
+                if opt.type.value == "SHARED":
+                    shared_capacity_by_title[opt.title] = int(opt.capacity)
+
+            # Aggregate
+            separate_vehicles: dict = defaultdict(int)  # title -> total_quantity
+            separate_vehicle_details: dict = {}  # title -> {capacity, fixed_price}
+            shared_pax = 0
+            shared_option_title = None
+            shared_capacity = None
+            booking_detail_list = []
+            pkg_with_transport = 0
+            pkg_without_transport = 0
+            pkg_with_refreshments = 0
+
+            for b, info in booking_infos:
+                customer = user_map.get(b.user_id)
+                customer_name = customer.full_name if customer else (
+                    next((p.full_name for p in b.passengers if p.is_primary), None)
+                    or (b.passengers[0].full_name if b.passengers else "Guest")
+                )
+                pax = b.adult_count + b.child_count
+                date_total_bookings += 1
+                date_total_pax += pax
+
+                if getattr(b, 'has_refreshment_addon', False):
+                    pkg_with_refreshments += pax
+
+                transport_sels = (b.pricing_snapshot or {}).get("transport_selections", [])
+                has_transport = len(transport_sels) > 0
+
+                if has_transport:
+                    pkg_with_transport += 1
+                    date_with_transport += 1
+                else:
+                    pkg_without_transport += 1
+                    date_without_transport += 1
+
+                booking_transport_summary = []
+                for ts in transport_sels:
+                    t_type = ts.get("type", "")
+                    t_title = ts.get("title", "")
+                    t_qty = int(ts.get("quantity", 1))
+                    t_cap = int(ts.get("capacity", 0))
+                    if t_type == "SEPARATE_VEHICLE":
+                        separate_vehicles[t_title] += t_qty
+                        if t_title not in separate_vehicle_details:
+                            separate_vehicle_details[t_title] = {"capacity": t_cap, "fixed_price": ts.get("fixed_price")}
+                        booking_transport_summary.append({
+                            "type": "SEPARATE_VEHICLE",
+                            "title": t_title,
+                            "quantity": t_qty,
+                            "capacity": t_cap,
+                        })
+                    elif t_type == "SHARED":
+                        pax_for_shared = pax  # all pax of this booking share
+                        shared_pax += pax_for_shared
+                        shared_option_title = t_title
+                        shared_capacity = shared_capacity_by_title.get(t_title)
+                        booking_transport_summary.append({
+                            "type": "SHARED",
+                            "title": t_title,
+                            "pax": pax_for_shared,
+                            "capacity": shared_capacity,
+                        })
+
+                booking_detail_list.append({
+                    "public_id": b.public_id,
+                    "booking_id": b.id,
+                    "customer_name": customer_name,
+                    "customer_email": customer.email if customer else None,
+                    "adult_count": b.adult_count,
+                    "child_count": b.child_count,
+                    "total_pax": pax,
+                    "has_transport": has_transport,
+                    "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
+                    "transport_selections": booking_transport_summary,
+                    "status": b.status.value if hasattr(b.status, "value") else str(b.status),
+                })
+
+            # Build separate vehicles summary list
+            separate_vehicles_summary = [
+                {
+                    "title": title,
+                    "total_quantity": qty,
+                    "capacity_per_vehicle": separate_vehicle_details[title]["capacity"],
+                    "total_capacity": qty * separate_vehicle_details[title]["capacity"],
+                }
+                for title, qty in sorted(separate_vehicles.items())
+            ]
+
+            # Shared vehicle calc
+            shared_vehicles_needed = None
+            if shared_pax > 0 and shared_capacity:
+                import math
+                shared_vehicles_needed = math.ceil(shared_pax / shared_capacity)
+
+            package_group_list.append({
+                "package_id": pkg.id,
+                "package_title": pkg.title,
+                "package_type": pkg.type.value if hasattr(pkg.type, "value") else str(pkg.type),
+                "bookings_count": len(booking_infos),
+                "pax_count": sum(b.adult_count + b.child_count for b, _ in booking_infos),
+                "with_transport_count": pkg_with_transport,
+                "without_transport_count": pkg_without_transport,
+                "refreshment_pax_count": pkg_with_refreshments,
+                # Separate vehicles
+                "separate_vehicles_summary": separate_vehicles_summary,
+                "total_separate_vehicles": sum(s["total_quantity"] for s in separate_vehicles_summary),
+                # Shared transport
+                "shared_pax_count": shared_pax,
+                "shared_option_title": shared_option_title,
+                "shared_vehicle_capacity": shared_capacity,
+                "shared_vehicles_needed": shared_vehicles_needed,
+                # Per-booking detail
+                "bookings": booking_detail_list,
+            })
+
+        date_groups.append({
+            "travel_date": travel_date.isoformat(),
+            "total_bookings": date_total_bookings,
+            "total_pax": date_total_pax,
+            "with_transport_count": date_with_transport,
+            "without_transport_count": date_without_transport,
+            "package_groups": package_group_list,
+        })
+
+    return {
+        "start_date": start_dt.isoformat(),
+        "end_date": end_dt.isoformat(),
+        "date_groups": date_groups,
     }

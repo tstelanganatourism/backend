@@ -105,10 +105,27 @@ class PackageBoardingPointDTO(AppBaseModel):
     return_drop_info: Optional[str] = None
     sort_order: int
 
+class TransportOptionPublicDTO(AppBaseModel):
+    id: int
+    type: str  # 'SHARED' | 'SEPARATE_VEHICLE'
+    title: str
+    capacity: Optional[int] = None
+    adult_price: Optional[Decimal] = None
+    child_price: Optional[Decimal] = None
+    weekend_adult_price: Optional[Decimal] = None
+    weekend_child_price: Optional[Decimal] = None
+    fixed_price: Optional[Decimal] = None
+    weekend_fixed_price: Optional[Decimal] = None
+
 class PackageDetailDTO(PackageListDTO, SEOSchema):
     description: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
+    has_transport: bool = False
+    transport_options: List[TransportOptionPublicDTO] = Field(default_factory=list)
+    has_refreshments: bool = False
+    refreshment_adult_price: Optional[Decimal] = None
+    refreshment_child_price: Optional[Decimal] = None
     variants: List[PackageVariantPublicDTO] = Field(default_factory=list)
     gallery: List[GalleryImageDTO] = Field(default_factory=list)
     itinerary: List[PackageItineraryDayDTO] = Field(default_factory=list)
