@@ -21,4 +21,5 @@ arq==0.28.0
 sentry-sdk==2.0.0
 gunicorn==22.0.0
 bleach==6.3.0
-playwright
+playwright==1.60.0
+tzdata==2026.2
