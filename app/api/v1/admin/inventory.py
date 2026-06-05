@@ -158,6 +158,36 @@ async def generate_package_inventory(
     clear_cache_prefix(f"inventory:packages:{body.variant_id}")
     await _clear_package_cache_for_variant(db, body.variant_id)
 
+    # Broadcast SSE for newly created inventory dates
+    if created > 0:
+        import time
+        from app.core.timezone import get_ist_now
+        from app.utils.sse import sse_manager
+        from app.api.v1.public_packages import get_effective_package_prices
+        
+        variant_res = await db.execute(select(PackageVariant).where(PackageVariant.id == body.variant_id))
+        variant = variant_res.scalar_one_or_none()
+        if variant:
+            eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, None)
+            current_date = body.from_date
+            while current_date <= body.to_date:
+                if current_date not in existing_dates:
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "package_id": variant.package_id,
+                        "travel_date": str(current_date),
+                        "available": body.total_capacity,
+                        "reserved": 0,
+                        "booked": 0,
+                        "is_closed": False,
+                        "effective_adult_price": float(eff_adult),
+                        "effective_child_price": float(eff_child),
+                        "variant_id": body.variant_id
+                    }
+                    await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
+                current_date += timedelta(days=1)
+
     return PackageInventoryGenerateResponse(
         created=created,
         skipped=skipped,
@@ -616,19 +646,47 @@ async def generate_room_inventory(
     clear_cache_prefix(f"inventory:rooms:{body.room_variant_id}")
     clear_cache_prefix("rooms:")
     room_result = await db.execute(
-        select(Room.slug).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+        select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
             RoomVariant.id == body.room_variant_id
         )
     )
     slug_row = room_result.first()
     if slug_row:
         slug = slug_row[0]
+        room_id = slug_row[1]
         clear_cache_prefix(f"rooms:detail:{slug}")
         import asyncio
         from app.services.redis_client import invalidate_cached_availability
         asyncio.create_task(invalidate_cached_availability(slug))
         from app.utils.cache import trigger_frontend_revalidation
         trigger_frontend_revalidation(tags=[f"room-{slug}"])
+
+        # Broadcast SSE for newly created room inventory slots
+        if created > 0:
+            import time
+            from app.core.timezone import get_ist_now
+            from app.utils.sse import sse_manager
+            
+            current_date = body.from_date
+            while current_date <= body.to_date:
+                for s_start, s_end in slots_to_generate:
+                    if (current_date, s_start, s_end) not in existing_slots:
+                        total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
+                        sse_payload = {
+                            "version": int(time.time() * 1000),
+                            "timestamp": get_ist_now().isoformat(),
+                            "room_id": room_id,
+                            "travel_date": str(current_date),
+                            "available": total_rooms,
+                            "reserved": 0,
+                            "booked": 0,
+                            "is_closed": False,
+                            "variant_id": body.room_variant_id,
+                            "slot_start": str(s_start),
+                            "slot_end": str(s_end)
+                        }
+                        await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
+                current_date += timedelta(days=1)
 
     return RoomInventoryGenerateResponse(
         created=created,
