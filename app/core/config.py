@@ -44,8 +44,14 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: Optional[str] = None
     
     # Brevo (Email Sending)
-    BREVO_API_KEY: Optional[str] = None
+    BREVO_API_KEY: Optional[str] = None  # Legacy fallback
+    BREVO_API_KEY_USER: Optional[str] = None
+    BREVO_API_KEY_ADMIN: Optional[str] = None
+    BREVO_API_KEY_BACKUP: Optional[str] = None
     BREVO_FROM_EMAIL: str = "bookings@tsboattourism.org"
+    BREVO_FROM_EMAIL_USER: Optional[str] = None
+    BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
+    BREVO_FROM_EMAIL_BACKUP: Optional[str] = None
     
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None

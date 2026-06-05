@@ -129,7 +129,7 @@ async def list_rooms(
             select(RoomVariant.room_id, func.count(Booking.id))
             .join(Booking, Booking.room_variant_id == RoomVariant.id)
             .where(RoomVariant.room_id.in_(room_ids))
-            .where(Booking.status != BookingStatus.CANCELLED)
+            .where(Booking.status.not_in([BookingStatus.CANCELLED, BookingStatus.REFUNDED]))
             .group_by(RoomVariant.room_id)
         )
         counts_map = dict(booking_counts.all())
@@ -433,7 +433,7 @@ async def get_future_bookings(
         .where(
             Booking.room_variant_id.in_(variant_ids),
             Booking.travel_date >= date.today(),
-            Booking.status != BookingStatus.CANCELLED
+            Booking.status.not_in([BookingStatus.CANCELLED, BookingStatus.REFUNDED])
         )
         .order_by(Booking.travel_date.asc())
     )

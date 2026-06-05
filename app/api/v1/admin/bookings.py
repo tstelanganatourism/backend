@@ -505,6 +505,7 @@ async def admin_create_booking(
                 r_child = parent_pkg_ref.refreshment_child_price or Decimal("0.00")
                 ref_cost = Decimal(str(adult_count)) * Decimal(str(r_adult)) + Decimal(str(child_count)) * Decimal(str(r_child))
                 subtotal_amount += ref_cost
+                refreshment_subtotal = ref_cost
         
         # Lock the seat in inventory
         inv.booked_count += request.quantity
@@ -1012,9 +1013,11 @@ async def admin_cancel_booking(
     if booking.variant_id:
         clear_cache_prefix("packages:list:")
         clear_cache_prefix("packages:detail:")
+        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
     elif booking.room_variant_id:
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
+        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
 
     if sse_payload:
         from app.utils.sse import sse_manager

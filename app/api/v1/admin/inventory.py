@@ -101,11 +101,6 @@ async def generate_package_inventory(
         raise HTTPException(status_code=404, detail="Package variant not found.")
 
     # Date range validation
-    if body.from_date < today:
-        raise HTTPException(
-            status_code=400,
-            detail=f"from_date must be today or a future date (today: {today})."
-        )
     if body.to_date < body.from_date:
         raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
     if (body.to_date - body.from_date).days > 365:
@@ -485,11 +480,6 @@ async def generate_room_inventory(
             )
         )
 
-    if body.from_date < today:
-        raise HTTPException(
-            status_code=400,
-            detail=f"from_date must be today or a future date (today: {today})."
-        )
     if body.to_date < body.from_date:
         raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
     if (body.to_date - body.from_date).days > 365:

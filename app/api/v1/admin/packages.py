@@ -110,7 +110,7 @@ async def list_packages(
             select(PackageVariant.package_id, func.count(Booking.id))
             .join(Booking, Booking.variant_id == PackageVariant.id)
             .where(PackageVariant.package_id.in_(package_ids))
-            .where(Booking.status != BookingStatus.CANCELLED)
+            .where(Booking.status.not_in([BookingStatus.CANCELLED, BookingStatus.REFUNDED]))
             .group_by(PackageVariant.package_id)
         )
         counts_map = dict(booking_counts.all())
@@ -636,7 +636,7 @@ async def get_brochure_validation(
         "status": package.brochure_generation_status,
         "generated_brochure_url": package.generated_brochure_url,
         "brochure_pdf_url": package.brochure_pdf_url,
-        "active_brochure_url": package.generated_brochure_url or package.brochure_pdf_url
+        "active_brochure_url": package.brochure_pdf_url or package.generated_brochure_url
     }
 
 @router.post("/{package_id}/regenerate-brochure", status_code=status.HTTP_202_ACCEPTED)
@@ -750,7 +750,7 @@ async def get_future_bookings(
         .where(
             Booking.variant_id.in_(variant_ids),
             Booking.travel_date >= date.today(),
-            Booking.status != BookingStatus.CANCELLED
+            Booking.status.not_in([BookingStatus.CANCELLED, BookingStatus.REFUNDED])
         )
         .order_by(Booking.travel_date.asc())
     )

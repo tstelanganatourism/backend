@@ -28,6 +28,8 @@ def get_redis() -> aioredis.Redis:
             decode_responses=True,
             socket_connect_timeout=3.0,
             socket_timeout=3.0,
+            max_connections=10,
+            health_check_interval=10,
         )
     return _redis_client
 
@@ -41,6 +43,8 @@ def get_redis_raw() -> aioredis.Redis:
             settings.REDIS_URL,
             socket_connect_timeout=3.0,
             socket_timeout=3.0,
+            max_connections=10,
+            health_check_interval=10,
         )
     return _redis_client_raw
 

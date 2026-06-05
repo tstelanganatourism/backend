@@ -6,6 +6,8 @@ from typing import Optional
 from datetime import datetime, timezone
 from playwright.async_api import async_playwright
 
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.services.r2_storage import r2_service
 from app.db.session import AsyncSessionLocal
@@ -19,22 +21,20 @@ logger = logging.getLogger(__name__)
 AP_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358705/b66b077a-69fa-4625-8b49-9a168efde88f.png"
 TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png"
 
-async def generate_pdf_from_url(url: str, output_path: str = None) -> bytes:
+async def generate_pdf_from_url(url: str) -> bytes:
     """
     Spins up headless Chromium, navigates to the URL, and generates a PDF.
-    Returns the PDF bytes.
+    Used ONLY for package brochures (admin-triggered, one-time operations).
+    Booking tickets/invoices/forms use client-side printing instead.
 
     CRITICAL: browser.close() is always called in the finally block to prevent
-    Chromium zombie processes from leaking on the ARQ worker VM when navigation
-    fails, times out, or rendering raises an exception.
+    Chromium zombie processes from leaking if navigation fails or times out.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         try:
             page = await browser.new_page()
-
-            # Navigate to the Next.js hidden print route
-            logger.info(f"Navigating to {url} for PDF generation")
+            logger.info(f"Navigating to {url} for brochure PDF generation")
             response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             if not response or not response.ok:
@@ -45,41 +45,48 @@ async def generate_pdf_from_url(url: str, output_path: str = None) -> bytes:
             await page.emulate_media(media="print")
 
             try:
-                # Greatly reduce networkidle wait to avoid 15s stalls on tracking pixels / Next.js polling
-                await page.wait_for_load_state("networkidle", timeout=2000)
-            except Exception:
-                pass
+                await page.evaluate("""
+                    async () => {
+                        const images = Array.from(document.images);
+                        await Promise.all(images.map(img => {
+                            if (img.complete) return Promise.resolve();
+                            return new Promise((resolve) => {
+                                img.addEventListener('load', resolve);
+                                img.addEventListener('error', resolve);
+                            });
+                        }));
+                    }
+                """)
+                await page.wait_for_timeout(500)
+            except Exception as e:
+                logger.warning(f"Timeout or error waiting for images on {url}: {e}")
 
             pdf_bytes = await page.pdf(
                 format="A4",
                 print_background=True,
                 margin={"top": "0", "right": "0", "bottom": "0", "left": "0"}
             )
-
             return pdf_bytes
         finally:
-            # Always close the browser — even if navigation, timeout, or rendering fails.
-            # Without this, every failed PDF job leaks a headless Chromium process on the VM.
             await browser.close()
 
 
 def sync_generate_pdf(url: str) -> bytes:
     """
-    Synchronous wrapper to run generate_pdf_from_url in a separate thread
-    with its own ProactorEventLoop on Windows.
+    Synchronous wrapper to run generate_pdf_from_url in a dedicated thread.
+    Used ONLY for package brochure generation.
     """
-    # Create a new event loop for this thread
     if sys.platform == 'win32':
-        # Force proactor loop for subprocess support on Windows
         loop = asyncio.ProactorEventLoop()
     else:
         loop = asyncio.new_event_loop()
-        
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(generate_pdf_from_url(url))
     finally:
         loop.close()
+
+
 
 async def generate_package_brochure_task(ctx, package_id: int):
     """
@@ -126,101 +133,55 @@ async def generate_package_brochure_task(ctx, package_id: int):
 
 async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None):
     """
-    Background task to generate a booking ticket PDF and upload to R2.
+    Background task to send booking confirmation email.
+    PDF generation is client-side — the email contains links to the beautiful
+    frontend print pages (/print/ticket, /print/invoice, /print/form) which
+    open the customer's browser print dialog directly. This eliminates
+    all Playwright RAM usage while keeping the full ticket design.
     """
     from app.models.booking import Booking, EmailLog
     from app.models.enums import BookingStatus, DocumentGenerationStatus
     from app.utils.pricing import get_booking_hash
     from app.models.user import User
     from app.services.email_service import email_service
-    
-    async with AsyncSessionLocal() as db:
-        booking = await db.get(Booking, booking_id)
-        if not booking:
-            logger.error(f"Booking {booking_id} not found for ticket PDF generation.")
-            return
-            
-        try:
-            booking.ticket_generation_status = DocumentGenerationStatus.GENERATING
-            await db.commit()
-            
-            signature = get_booking_hash(booking.public_id, settings.SECRET_KEY)
-            frontend_url = settings.FRONTEND_URL.rstrip('/')
-            print_url = f"{frontend_url}/print/ticket/{booking.public_id}?secret={signature}"
-            ticket_url = print_url
-            
-            pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
-            
-            version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            object_name = f"private/tickets/generated/{booking.public_id}_{version}.pdf"
-            await r2_service.upload_file(pdf_bytes, object_name, content_type="application/pdf")
-            
-            if booking.ticket_pdf_url and booking.ticket_pdf_url != object_name:
-                try:
-                    await r2_service.delete_file(booking.ticket_pdf_url)
-                except Exception as del_err:
-                    pass
-                
-            booking.ticket_pdf_url = object_name
-            booking.ticket_generation_status = DocumentGenerationStatus.AVAILABLE
-            await db.commit()
-            logger.info(f"Successfully generated ticket for booking {booking.public_id}")
-            
-            # Generate Signed URL (48 hours)
-            ticket_url = await r2_service.generate_presigned_url(object_name, expires_in=172800)
-        except Exception as e:
-            logger.error(f"Failed to generate ticket for booking {booking_id}: {e}")
-            booking.ticket_generation_status = DocumentGenerationStatus.FAILED
-            await db.commit()
+    from app.services.admin_notification import send_admin_booking_notification
 
-        # 2. Generate Invoice PDF (Only if fully paid)
+    async with AsyncSessionLocal() as db:
+        stmt = select(Booking).options(selectinload(Booking.passengers)).where(Booking.id == booking_id)
+        result = await db.execute(stmt)
+        booking = result.scalars().first()
+        if not booking:
+            logger.error(f"Booking {booking_id} not found for email dispatch.")
+            return
+
+        # Build the signed print URLs — these point to the beautiful React ticket pages.
+        # The customer clicks the link, their browser loads the full ticket design,
+        # and they press the built-in "Print / Save PDF" button to download it.
+        signature = get_booking_hash(booking.public_id, settings.SECRET_KEY)
+        frontend_url = settings.FRONTEND_URL.rstrip('/')
+        ticket_url = f"{frontend_url}/print/ticket/{booking.public_id}?secret={signature}"
+
+        # Resolve payment state
         if is_fully_paid is None:
             is_fully_paid = booking.remaining_balance <= 0 or booking.status == BookingStatus.FULLY_PAID
-        if is_fully_paid:
-            try:
-                booking.invoice_generation_status = DocumentGenerationStatus.GENERATING
-                await db.commit()
-                
-                print_url = f"{frontend_url}/print/invoice/{booking.public_id}?secret={signature}"
-                pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
-                
-                version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                object_name = f"private/invoices/generated/{booking.public_id}_{version}.pdf"
-                await r2_service.upload_file(pdf_bytes, object_name, content_type="application/pdf")
-                
-                if booking.invoice_pdf_url and booking.invoice_pdf_url != object_name:
-                    try:
-                        await r2_service.delete_file(booking.invoice_pdf_url)
-                    except Exception as del_err:
-                        pass
-                    
-                booking.invoice_pdf_url = object_name
-                booking.invoice_generation_status = DocumentGenerationStatus.AVAILABLE
-                await db.commit()
-                logger.info(f"Successfully generated invoice for booking {booking.public_id}")
-                
-                # Generate Signed URL (48 hours)
-                invoice_url = await r2_service.generate_presigned_url(object_name, expires_in=172800)
-            except Exception as e:
-                logger.error(f"Failed to generate invoice for booking {booking_id}: {e}")
-                booking.invoice_generation_status = DocumentGenerationStatus.FAILED
-                await db.commit()
 
-        # 3. Generate Form PDF (Only for package bookings, not room bookings)
-        form_url = ""
+        # Mark ticket/invoice statuses as AVAILABLE immediately — the print pages are
+        # always live because they are server-rendered React pages, not R2 files.
+        try:
+            booking.ticket_generation_status = DocumentGenerationStatus.AVAILABLE
+            if is_fully_paid:
+                booking.invoice_generation_status = DocumentGenerationStatus.AVAILABLE
+            await db.commit()
+            logger.info(f"Marked document statuses as AVAILABLE for booking {booking.public_id}")
+        except Exception as e:
+            logger.error(f"Failed to mark document statuses for booking {booking_id}: {e}")
+
+        # Build invoice URL (only relevant if fully paid)
+        invoice_url = f"{frontend_url}/print/invoice/{booking.public_id}?secret={signature}" if is_fully_paid else ""
+
+        # Build form URL (only for package bookings, not room bookings)
         is_room_booking = booking.room_variant_id is not None
-        if not is_room_booking:
-            try:
-                form_print_url = f"{frontend_url}/print/form/{booking.public_id}?secret={signature}"
-                form_pdf_bytes = await asyncio.to_thread(sync_generate_pdf, form_print_url)
-                version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                form_object_name = f"private/forms/generated/{booking.public_id}_{version}.pdf"
-                await r2_service.upload_file(form_pdf_bytes, form_object_name, content_type="application/pdf")
-                form_url = await r2_service.generate_presigned_url(form_object_name, expires_in=172800)
-                logger.info(f"Successfully generated form for booking {booking.public_id}")
-            except Exception as e:
-                logger.error(f"Failed to generate form for booking {booking.id}: {e}")
-                form_url = form_print_url  # fallback
+        form_url = f"{frontend_url}/print/form/{booking.public_id}?secret={signature}" if not is_room_booking else ""
 
 
         # 4. Determine Recipient Email
@@ -504,13 +465,18 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         )
 
 
-        # Send via Brevo
         success, error_reason = await email_service.send_booking_email(
             recipient_email=recipient_email,
             recipient_name=recipient_name,
             subject=subject,
             html_content=html_content
         )
+        
+        # Send admin notification
+        try:
+            await send_admin_booking_notification(booking)
+        except Exception as e:
+            logger.error(f"Failed to dispatch admin notification: {e}")
 
         log_entry = EmailLog(
             booking_id=booking.id,

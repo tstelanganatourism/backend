@@ -138,6 +138,8 @@ async def get_packages(
                     title=v.title,
                     adult_price=v.adult_price,
                     child_price=v.child_price,
+                    weekend_adult_price=v.weekend_adult_price,
+                    weekend_child_price=v.weekend_child_price,
                     transport_info=None
                 ))
 
@@ -146,7 +148,7 @@ async def get_packages(
         import asyncio
 
         async def build_dto(pkg):
-            active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
+            active_brochure_key = pkg.brochure_pdf_url or pkg.generated_brochure_url
             brochure_url, gen_brochure_url = await asyncio.gather(
                 r2_service.get_public_url(active_brochure_key),
                 r2_service.get_public_url(pkg.generated_brochure_url)
@@ -257,7 +259,7 @@ async def get_package_detail(
         starting_price = min((v.adult_price for v in pkg_variants), default=None)
         
         from app.services.r2_storage import r2_service
-        active_brochure_key = pkg.generated_brochure_url or pkg.brochure_pdf_url
+        active_brochure_key = pkg.brochure_pdf_url or pkg.generated_brochure_url
         brochure_url = await r2_service.get_public_url(active_brochure_key)
         gen_brochure_url = await r2_service.get_public_url(pkg.generated_brochure_url)
         
@@ -305,6 +307,8 @@ async def get_package_detail(
                     title=v.title,
                     adult_price=v.adult_price,
                     child_price=v.child_price,
+                    weekend_adult_price=v.weekend_adult_price,
+                    weekend_child_price=v.weekend_child_price,
                     transport_info=None
                 ) for v in pkg_variants
             ],
@@ -439,8 +443,9 @@ async def get_package_availability(
         for variant in active_variants:
             inv = inv_map.get((variant.id, current))
 
-            base_adult = variant.adult_price
-            base_child = variant.child_price
+            is_weekend = current.weekday() in (5, 6)
+            base_adult = variant.weekend_adult_price if is_weekend and variant.weekend_adult_price is not None else variant.adult_price
+            base_child = variant.weekend_child_price if is_weekend and variant.weekend_child_price is not None else variant.child_price
 
             if inv is None:
                 eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, None)

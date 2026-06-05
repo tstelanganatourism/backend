@@ -28,9 +28,9 @@ class WorkerSettings:
     redis_settings = REDIS_SETTINGS
     on_startup = startup
     on_shutdown = shutdown
-    max_jobs = 2  # Keep concurrency low since Playwright is CPU-heavy
-    max_tries = 2 # Fail fast if Playwright rendering timeouts or crashes
-    job_timeout = 300  # 5 minutes timeout for generation
+    max_jobs = 10  # Safe: jobs now only send emails (no Playwright/RAM spike)
+    max_tries = 3  # Retry up to 3 times if email sending fails
+    job_timeout = 60   # 60 seconds is more than enough to send an email
     
 _pool = None
 

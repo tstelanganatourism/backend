@@ -62,6 +62,8 @@ class PackageVariantPublicDTO(AppBaseModel):
     title: str
     adult_price: Decimal
     child_price: Decimal
+    weekend_adult_price: Optional[Decimal] = None
+    weekend_child_price: Optional[Decimal] = None
     transport_info: Optional[str] = None
 
 class PackageListDTO(AppBaseModel):
