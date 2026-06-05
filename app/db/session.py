@@ -3,14 +3,26 @@ from app.core.config import settings
 
 from sqlalchemy.pool import NullPool
 
+import sys
+
+# Determine if we are running as a background worker (arq command)
+is_worker = any("arq" in arg or "worker" in arg for arg in sys.argv)
+
+if is_worker:
+    pool_size = 2
+    max_overflow = 0
+else:
+    pool_size = 4
+    max_overflow = 2
+
 # Create async engine
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.SQL_ECHO,
-    pool_size=10,
-    max_overflow=5,
-    pool_timeout=30,
-    pool_recycle=1800,
+    pool_size=pool_size,
+    max_overflow=max_overflow,
+    pool_timeout=15,
+    pool_recycle=900,
     pool_pre_ping=True,
     connect_args={
         "prepared_statement_cache_size": 0,
