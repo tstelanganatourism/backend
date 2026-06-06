@@ -215,7 +215,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
 
         # Build premium, email-client-safe HTML content.
         office_phone = "+91 95420 69573"
-        office_address = "Telangana Boat Tourism Central Booking Office, D.No. 4-1-78/1, Kalyana Mandapam Road, Opp SBI ATM, Bhadrachalam, Bhadradri Kothagudem (Dist), Telangana - 507111."
+        office_address = "Telangana Boat Tourism, near SBI ATM, SREE SEETHA RAMA TEMPLE PARKING, DR-NO-4-1-78/1, kalyana mandapam road, opp. sbi atm, Bhadrachalam, Telangana 507111"
         office_maps_url = "https://maps.app.goo.gl/6YDfViEq3RLuvNN36?g_st=awb"
         safe_recipient_name = escape(recipient_name or "Guest")
         safe_booking_id = escape(booking.public_id)

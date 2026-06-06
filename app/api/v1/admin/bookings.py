@@ -18,7 +18,6 @@ from app.utils.pricing import get_effective_package_prices
 router = APIRouter(
     prefix="/bookings",
     tags=["Admin - Bookings"],
-    dependencies=[Depends(require_admin)],
 )
 
 
@@ -138,14 +137,9 @@ async def list_admin_bookings(
             )
         )
 
-    # Count total
-    count_query = base_query.with_only_columns(func.count(Booking.id)).order_by(None)
-    total_result = await db.execute(count_query)
-    total = total_result.scalar_one() or 0
-
-    # Paginate and add loaders
+    # Paginate and add loaders with window function for total count
     paginated_query = (
-        base_query
+        base_query.add_columns(func.count(Booking.id).over().label('total_count'))
         .options(selectinload(Booking.passengers))
         .options(selectinload(Booking.stay_dates))
         .order_by(Booking.created_at.desc())
@@ -153,7 +147,14 @@ async def list_admin_bookings(
         .offset(offset)
     )
     result = await db.execute(paginated_query)
-    bookings = result.scalars().all()
+    rows = result.all()
+    
+    if rows:
+        total = rows[0].total_count
+        bookings = [row[0] for row in rows] # row[0] is the Booking entity
+    else:
+        total = 0
+        bookings = []
 
     # Collect agent + user IDs for batch lookup
     agent_ids = {b.agent_id for b in bookings if b.agent_id}

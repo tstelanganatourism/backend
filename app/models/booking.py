@@ -58,6 +58,9 @@ class Booking(BaseModel):
     payments = relationship("Payment", back_populates="booking", cascade="all, delete-orphan")
     cancellation_requests = relationship("CancellationRequest", back_populates="booking", cascade="all, delete-orphan")
     agent = relationship("User", foreign_keys=[agent_id], back_populates="agent_bookings")
+    customer = relationship("User", foreign_keys=[user_id])
+    package_variant = relationship("PackageVariant", foreign_keys=[variant_id])
+    room_variant = relationship("RoomVariant", foreign_keys=[room_variant_id])
 
 class BookingStayDate(BaseModel):
     __tablename__ = "booking_stay_dates"

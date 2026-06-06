@@ -9,11 +9,11 @@ import sys
 is_worker = any("arq" in arg or "worker" in arg for arg in sys.argv)
 
 if is_worker:
-    pool_size = 2
-    max_overflow = 0
+    pool_size = 5
+    max_overflow = 5
 else:
-    pool_size = 4
-    max_overflow = 2
+    pool_size = 20
+    max_overflow = 20
 
 # Create async engine
 engine = create_async_engine(
@@ -21,7 +21,7 @@ engine = create_async_engine(
     echo=settings.SQL_ECHO,
     pool_size=pool_size,
     max_overflow=max_overflow,
-    pool_timeout=15,
+    pool_timeout=30,
     pool_recycle=900,
     pool_pre_ping=True,
     connect_args={
