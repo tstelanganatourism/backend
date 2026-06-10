@@ -1,7 +1,11 @@
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 
-IST = ZoneInfo("Asia/Kolkata")
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    # Fallback for Windows if tzdata is not installed
+    IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
 def get_ist_now() -> datetime:
     """Returns the current aware datetime in IST."""

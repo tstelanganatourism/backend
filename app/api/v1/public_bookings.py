@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import date, time, timedelta, datetime, timezone
@@ -88,22 +88,26 @@ class CheckoutRequest(BaseModel):
     
     # Trust Lock Expected Pricing (to prevent mismatch)
     expected_amount: Optional[float] = None
+    quick_booking: Optional[bool] = False
+    customer_email: Optional[str] = None
 
 @router.post("/checkout")
-async def process_checkout(
+async def checkout(
     request: CheckoutRequest,
+    fastapi_req: Request,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Checkout API (Draft-First Architecture). 
     Validates inventory (locks via reserved_count), applies pricing logic,
-    generates a Razorpay Order, and creates a temporary BookingDraft.
+    generates a PhonePe payment session, and creates a temporary BookingDraft.
     """
-    from app.services.razorpay_client import razorpay_service
+    from app.services.phonepe_client import phonepe_service
     from app.models.booking import BookingDraft
     from app.core.timezone import get_ist_now
     from app.utils.verhoeff import is_valid_aadhaar
+    from app.core.config import settings
     
     # Derive adult and child count safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
@@ -120,34 +124,54 @@ async def process_checkout(
         for i, p in enumerate(request.passengers):
             is_child = i >= adult_count
             
-            # Age constraints
-            if request.target_type == 'package':
-                if is_child:
-                    if not (4 <= p.age <= 10):
-                        raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
+            if request.quick_booking:
+                # Quick booking is only allowed for agent and admin
+                is_agent_or_admin = current_user is not None and current_user.role in (UserRole.AGENT, UserRole.ADMIN)
+                if not is_agent_or_admin:
+                    raise HTTPException(status_code=403, detail="Quick booking is only allowed for admins and agents")
+                
+                # Check lead passenger constraints and bypass the rest
+                if i == 0:
+                    if p.age < 18:
+                        raise HTTPException(status_code=400, detail="Primary passenger must be an adult (18+) for quick booking")
+                    if not p.phone:
+                        raise HTTPException(status_code=400, detail="Phone number is required for the primary passenger")
+                    if not p.aadhaar or not p.aadhaar.strip():
+                        raise HTTPException(status_code=400, detail="Aadhaar is required for the primary passenger")
+                    if not is_valid_aadhaar(p.aadhaar.strip()):
+                        raise HTTPException(status_code=400, detail="Invalid Aadhaar format for the primary passenger")
                 else:
-                    if p.age < 11:
-                        raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
+                    # Skip Aadhaar and other constraints for non-primary passengers in quick booking
+                    continue
+            else:
+                # Age constraints
+                if request.target_type == 'package':
+                    if is_child:
+                        if not (4 <= p.age <= 10):
+                            raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
+                    else:
+                        if p.age < 11:
+                            raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
+                        if i == 0 and not p.phone:
+                            raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
+                else:
+                    # Room bookings treat all guests generically, but still need phone for primary
                     if i == 0 and not p.phone:
-                        raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
-            else:
-                # Room bookings treat all guests generically, but still need phone for primary
-                if i == 0 and not p.phone:
-                    raise HTTPException(status_code=400, detail=f"Phone number is required for the primary passenger")
-            
-            # Aadhaar validation contract: optional for children <= 10, mandatory for anyone >= 11
-            is_child_age = p.age <= 10
-            if not is_child_age:
-                # 11+ MUST provide a valid Aadhaar
-                if not p.aadhaar or not p.aadhaar.strip():
-                    raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
-                if not is_valid_aadhaar(p.aadhaar.strip()):
-                    raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
-            else:
-                # Children (<= 10): validate only if provided
-                if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
-                    raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
-    
+                        raise HTTPException(status_code=400, detail=f"Phone number is required for the primary passenger")
+                
+                # Aadhaar validation contract: optional for children <= 10, mandatory for anyone >= 11
+                is_child_age = p.age <= 10
+                if not request.quick_booking:
+                    if not is_child_age:
+                        # 11+ MUST provide a valid Aadhaar
+                        if not p.aadhaar or not p.aadhaar.strip():
+                            raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
+                        if not is_valid_aadhaar(p.aadhaar.strip()):
+                            raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+                    else:
+                        # Children (<= 10): validate only if provided
+                        if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
+                            raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
     has_refreshment_addon = request.has_refreshment_addon or False
     
     subtotal_amount = Decimal("0.00")
@@ -159,6 +183,15 @@ async def process_checkout(
     commissionable_base = Decimal("0.00")
 
     if request.target_type == 'package':
+        from app.core.timezone import get_ist_now
+        now_ist = get_ist_now()
+        today = now_ist.date()
+        is_after_6am = now_ist.hour >= 6
+        is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+        
+        if not is_admin and (request.travel_date < today or (request.travel_date == today and is_after_6am)):
+            raise HTTPException(status_code=400, detail="Bookings for today are closed after 6:00 AM IST")
+
         if not request.variant_id:
             raise HTTPException(status_code=400, detail="variant_id is required for package")
             
@@ -207,7 +240,16 @@ async def process_checkout(
             raise HTTPException(status_code=400, detail="Package variant not found")
             
         parent_package = variant.package
-            
+
+        # Minimum passengers check
+        min_pax = getattr(parent_package, 'min_passengers', 1) or 1
+        total_passengers = adult_count + child_count
+        if total_passengers < min_pax:
+            raise HTTPException(
+                status_code=400,
+                detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
+            )
+
         # Determine base pricing based on weekend
         is_weekend = request.travel_date.weekday() in (5, 6)
         
@@ -373,6 +415,15 @@ async def process_checkout(
         if departure < arrival:
             raise HTTPException(status_code=400, detail="departure_date cannot be before travel_date")
 
+        from app.core.timezone import get_ist_now
+        now_ist = get_ist_now()
+        today = now_ist.date()
+        is_after_6am = now_ist.hour >= 6
+        is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+        
+        if not is_admin and (arrival < today or (arrival == today and is_after_6am)):
+            raise HTTPException(status_code=400, detail="Bookings for today are closed after 6:00 AM IST")
+
         stay_dates = []
         if departure == arrival:
             stay_dates.append(arrival)
@@ -526,6 +577,7 @@ async def process_checkout(
         "commissionable_base": str(commissionable_base),
         "agent_discount": str(agent_discount),
         "agent_payable": str(agent_payable),
+        "booking_mode": "QUICK" if request.quick_booking else "FULL",
     }
     # Store transport selections breakdown in snapshot for invoice/ticket rendering
     if request.target_type == 'package' and transport_snapshot_items:
@@ -564,19 +616,29 @@ async def process_checkout(
         pass # Frontend sends expected_amount but we just process checkout with realtime calculated price.
 
     draft_id = "DRF-" + str(uuid.uuid4())[:8].upper()
-    receipt_id = f"rcpt_{draft_id}"
+    merchant_txn_id = f"TXN_{draft_id}_{str(uuid.uuid4())[:4].upper()}"
     
-    razorpay_order = await asyncio.to_thread(
-        razorpay_service.create_order,
+    host = fastapi_req.headers.get('host')
+    protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
+    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}"
+
+    user_phone = None
+    if request.passengers:
+        user_phone = next((p.phone for p in request.passengers if p.phone), None)
+
+    phonepe_order = await phonepe_service.create_payment_url(
         amount=float(payable_amount),
-        receipt=receipt_id,
-        notes={"draft_id": draft_id}
+        transaction_id=merchant_txn_id,
+        user_id=str(current_user.id) if current_user else "guest",
+        redirect_url=redirect_url,
+        callback_url=callback_url,
+        phone_number=user_phone
     )
-    razorpay_order_id = razorpay_order.get("id")
-        
+    
     # --- Database Draft Persistence ---
     now = get_ist_now()
-    expires_at = now + timedelta(minutes=10)
+    expires_at = now + timedelta(minutes=5)
     
     # Serialize complete payload to JSON
     # Safe dump of the entire request
@@ -584,7 +646,7 @@ async def process_checkout(
     
     draft = BookingDraft(
         draft_id=draft_id,
-        razorpay_order_id=razorpay_order_id,
+        razorpay_order_id=merchant_txn_id, # map PhonePe transaction_id to razorpay_order_id to preserve DB schema
         user_id=current_user.id if current_user else None,
         agent_id=agent_id,
         checkout_payload=payload_dump,
@@ -641,18 +703,17 @@ async def process_checkout(
         target_id = p.get("package_id") if target_channel == "package" else p.get("room_id")
         await sse_manager.broadcast_event(target_channel, str(target_id), "INVENTORY_UPDATE", p)
 
-    logger.info(f"BookingDraft {draft_id} created | order={razorpay_order_id} | expires={expires_at.isoformat()}")
+    logger.info(f"BookingDraft {draft_id} created | order={merchant_txn_id} | expires={expires_at.isoformat()}")
 
-    from app.core.config import settings
     return {
         "status": "success",
         "message": "Draft created and inventory reserved.",
         "checkout_data": {
             "draft_id": draft.draft_id,
             "razorpay_order_id": draft.razorpay_order_id,
-            "amount": razorpay_order.get("amount"), # in paise
+            "redirect_url": phonepe_order.get("redirect_url"),
+            "amount": phonepe_order.get("amount"), # in paise
             "currency": "INR",
-            "key_id": settings.RAZORPAY_KEY_ID,
             "expires_at": draft.expires_at.isoformat()
         }
     }
@@ -1123,7 +1184,12 @@ async def get_booking_details(
     for p in raw_payments:
         collected_by_label = p.collected_by_label
         if not collected_by_label:
-            collected_by_label = "Razorpay" if p.collected_by_type == "RAZORPAY" else "Admin (Cash)"
+            if p.collected_by_type == "RAZORPAY":
+                collected_by_label = "Razorpay"
+            elif p.collected_by_type == "PHONEPE":
+                collected_by_label = "PhonePe"
+            else:
+                collected_by_label = "Admin (Cash)"
         payment_ledger.append({
             "id": p.id,
             "amount": float(p.amount),
@@ -1151,6 +1217,7 @@ async def get_booking_details(
     result_dict = {
         "id": b.id,
         "public_id": b.public_id,
+        "customer_email": b.customer_email,
         "target_type": "ROOM" if b.room_variant_id else "PACKAGE",
         "travel_date": b.travel_date.isoformat(),
         "adult_count": b.adult_count,
@@ -1324,14 +1391,15 @@ async def request_booking_cancellation(
 @router.post("/{public_id}/balance-checkout")
 async def process_balance_checkout(
     public_id: str,
+    fastapi_req: Request,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Tourist balance checkout.
-    Generates a Razorpay Order for the remaining balance.
+    Generates a PhonePe payment session for the remaining balance.
     """
-    from app.services.razorpay_client import razorpay_service
+    from app.services.phonepe_client import phonepe_service
     from app.models.payment import Payment
     from app.models.enums import PaymentStatus
     from app.core.config import settings
@@ -1339,7 +1407,10 @@ async def process_balance_checkout(
     # Fetch booking
     query = (
         select(Booking)
-        .options(selectinload(Booking.payments))
+        .options(
+            selectinload(Booking.payments),
+            selectinload(Booking.passengers)
+        )
         .where(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
@@ -1374,30 +1445,14 @@ async def process_balance_checkout(
     if captured_payments_count >= 2:
         raise HTTPException(status_code=400, detail="Maximum payment attempts reached for this booking")
 
-    pending_payments = [p for p in booking.payments if p.status == PaymentStatus.CREATED and p.razorpay_order_id]
-    pending_payments.sort(key=lambda p: p.created_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    if pending_payments:
-        latest_pending = pending_payments[0]
-        created_at = latest_pending.created_at
-        if created_at and created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        if created_at and datetime.now(timezone.utc) - created_at <= timedelta(minutes=30):
-            return {
-                "status": "success",
-                "checkout_data": {
-                    "booking_public_id": booking.public_id,
-                    "razorpay_order_id": latest_pending.razorpay_order_id,
-                    "amount": int(round(float(latest_pending.amount) * 100)),
-                    "currency": "INR",
-                    "key_id": settings.RAZORPAY_KEY_ID
-                }
-            }
+    # Cancel any previous CREATED payment records to ensure a fresh session
+    for p in booking.payments:
+        if p.status == PaymentStatus.CREATED:
+            p.status = PaymentStatus.FAILED
+            p.error_code = "ORDER_SUPERSEDED"
+            p.error_description = "Superseded by a new balance payment checkout session."
 
-        latest_pending.status = PaymentStatus.FAILED
-        latest_pending.error_code = "ORDER_ABANDONED"
-        latest_pending.error_description = "Previous balance checkout was abandoned before completion."
-
-    # Generate a new Razorpay Order for remaining balance
+    # Generate a new PhonePe payment session for remaining balance
     is_agent_payment = current_user is not None and current_user.role == UserRole.AGENT and booking.agent_id == current_user.id
     
     if is_agent_payment:
@@ -1407,25 +1462,35 @@ async def process_balance_checkout(
     else:
         payable_amount = float(booking.remaining_balance)
         
-    order_receipt = f"bal_{booking.public_id}_{uuid.uuid4().hex[:6].upper()}"
+    merchant_txn_id = f"BAL-{booking.public_id}-{uuid.uuid4().hex[:6].upper()}"
+    
+    host = fastapi_req.headers.get('host')
+    protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
+    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}"
 
-    razorpay_order = await asyncio.to_thread(
-        razorpay_service.create_order,
+    user_phone = None
+    if booking.passengers:
+        user_phone = next((p.phone_number for p in booking.passengers if p.phone_number), None)
+
+    phonepe_order = await phonepe_service.create_payment_url(
         amount=payable_amount,
-        receipt=order_receipt,
-        notes={"booking_id": booking.id, "type": "balance"}
+        transaction_id=merchant_txn_id,
+        user_id=str(current_user.id),
+        redirect_url=redirect_url,
+        callback_url=callback_url,
+        phone_number=user_phone
     )
-    razorpay_order_id = razorpay_order.get("id")
 
     # Create CREATED payment ledger row to track this attempt
     payment = Payment(
         booking_id=booking.id,
-        payment_reference_id=razorpay_order_id,  # idempotency key
-        razorpay_order_id=razorpay_order_id,
+        payment_reference_id=merchant_txn_id,  # idempotency key
+        razorpay_order_id=merchant_txn_id,
         amount=Decimal(str(payable_amount)),
         status=PaymentStatus.CREATED,
-        payment_method="RAZORPAY",
-        collected_by_type="RAZORPAY",
+        payment_method="PHONEPE",
+        collected_by_type="PHONEPE",
     )
     db.add(payment)
     await db.commit()
@@ -1434,9 +1499,9 @@ async def process_balance_checkout(
         "status": "success",
         "checkout_data": {
             "booking_public_id": booking.public_id,
-            "razorpay_order_id": razorpay_order_id,
-            "amount": razorpay_order.get("amount"), # in paise
+            "razorpay_order_id": merchant_txn_id,
+            "redirect_url": phonepe_order.get("redirect_url"),
+            "amount": phonepe_order.get("amount"), # in paise
             "currency": "INR",
-            "key_id": settings.RAZORPAY_KEY_ID
         }
     }

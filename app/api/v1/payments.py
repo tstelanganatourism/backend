@@ -16,6 +16,7 @@ from app.models.room import RoomSlotInventory
 from app.models.coupon import Coupon
 from app.models.enums import BookingStatus, BookingSource, GenderType
 from app.services.razorpay_client import razorpay_service
+from app.services.phonepe_client import phonepe_service
 from app.core.security import AadharCryptography, AadharHashing
 from app.core.timezone import get_ist_now
 
@@ -49,7 +50,8 @@ async def _finalize_draft(
     payment_id: str,
     db: AsyncSession,
     background_tasks: BackgroundTasks | None = None,
-    sse_payloads: list = None
+    sse_payloads: list = None,
+    payment_source: str = "PHONEPE"
 ) -> str:
     """
     Idempotent function to convert BookingDraft to Booking.
@@ -206,6 +208,7 @@ async def _finalize_draft(
         user_id=draft.user_id,
         agent_id=draft.agent_id,
         source=BookingSource.AGENT if draft.agent_id else BookingSource.PUBLIC,
+        customer_email=draft.checkout_payload.get('customer_email'),
         variant_id=draft.variant_id,
         room_variant_id=draft.room_variant_id,
         travel_date=draft.travel_date,
@@ -266,8 +269,8 @@ async def _finalize_draft(
         razorpay_payment_id=payment_id,
         amount=draft.amount_payable,
         status=PaymentStatus.CAPTURED,
-        payment_method="RAZORPAY",
-        collected_by_type="RAZORPAY",
+        payment_method=payment_source,
+        collected_by_type=payment_source,
     )
     db.add(payment_record)
 
@@ -381,7 +384,7 @@ async def verify_payment(
         raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
 
     sse_payloads = []
-    public_id = await _finalize_draft(draft, request.razorpay_payment_id, db, background_tasks, sse_payloads)
+    public_id = await _finalize_draft(draft, request.razorpay_payment_id, db, background_tasks, sse_payloads, payment_source="RAZORPAY")
     await db.commit()
     
     # Immediately invalidate L1+L2 cache so inventory/availability is live for next visitor
@@ -518,7 +521,7 @@ async def razorpay_webhook(
                 if draft:
                     sse_payloads = []
                     target_type = draft.target_type
-                    public_id = await _finalize_draft(draft, payment_id, db, sse_payloads=sse_payloads)
+                    public_id = await _finalize_draft(draft, payment_id, db, sse_payloads=sse_payloads, payment_source="RAZORPAY")
                     await db.commit()
                     
                     # Invalidate L1+L2 cache immediately
@@ -579,4 +582,277 @@ async def razorpay_webhook(
         await db.rollback()
         return {"status": "error"}
         
+    except Exception as e:
+        logger.error(f"Webhook processing failed: {str(e)}")
+        await db.rollback()
+        return {"status": "error"}
+        
+    return {"status": "ok"}
+
+
+@router.get("/verify-status")
+async def verify_status(
+    transaction_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Frontend queries this endpoint to verify payment status of a PhonePe transaction.
+    If success, booking is finalized.
+    """
+    check_res = await phonepe_service.get_transaction_status(transaction_id)
+    status_str = check_res.get("status")
+    payment_id = check_res.get("gateway_payment_id")
+
+    if status_str == "PENDING":
+        return {"status": "pending", "message": "Transaction is pending verification."}
+    elif status_str == "FAILED":
+        # Check if draft exists to clean it up (releasing inventory)
+        draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == transaction_id).with_for_update()
+        res = await db.execute(draft_query)
+        draft = res.scalar_one_or_none()
+        if draft:
+            from app.workers.draft_cleanup import release_draft_inventory
+            sse_payloads = await release_draft_inventory(draft, db)
+            await db.delete(draft)
+            await db.commit()
+            
+            from app.utils.sse import sse_manager
+            for p in sse_payloads or []:
+                await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+        return {"status": "failed", "message": "Transaction failed."}
+
+    # Lock draft to prevent webhook race condition
+    draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == transaction_id).with_for_update()
+    res = await db.execute(draft_query)
+    draft = res.scalar_one_or_none()
+
+    if not draft:
+        # Check if booking already finalized by webhook
+        existing = await db.execute(
+            select(Booking).where(Booking.pricing_snapshot['razorpay_order_id'].astext == transaction_id)
+        )
+        booking = existing.scalar_one_or_none()
+        if booking:
+            return {"status": "success", "booking_id": booking.public_id}
+            
+        # Check if this is a balance payment
+        from app.models.payment import Payment
+        from app.models.enums import PaymentStatus
+        
+        payment_stmt = select(Payment).where(
+            Payment.razorpay_order_id == transaction_id
+        ).with_for_update()
+        p_res = await db.execute(payment_stmt)
+        payment = p_res.scalar_one_or_none()
+        
+        if payment:
+            booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
+            bk_res = await db.execute(booking_stmt)
+            booking = bk_res.scalar_one()
+
+            if payment.status != PaymentStatus.CAPTURED:
+                # Idempotency check
+                already_captured = await db.execute(
+                    select(Payment).where(
+                        Payment.razorpay_payment_id == payment_id,
+                        Payment.status == PaymentStatus.CAPTURED
+                    )
+                )
+                if already_captured.scalar_one_or_none():
+                    return {"status": "success", "booking_id": booking.public_id}
+
+                payment.status = PaymentStatus.CAPTURED
+                payment.razorpay_payment_id = payment_id
+
+                from app.utils.ledger import recompute_booking_ledger
+                booking = await recompute_booking_ledger(booking.id, db)
+
+            async def _enqueue_bal_task(b_id: int, is_fully_paid: bool):
+                try:
+                    from app.worker import get_arq_pool
+                    arq_pool = await get_arq_pool()
+                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
+                except Exception as arq_err:
+                    logger.warning(f"Failed to enqueue post-booking documents task for balance payment: {arq_err}")
+
+            if payment.status == PaymentStatus.CAPTURED:
+                background_tasks.add_task(_enqueue_bal_task, booking.id, booking.status == BookingStatus.FULLY_PAID)
+
+            await db.commit()
+            return {"status": "success", "booking_id": booking.public_id}
+            
+        raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
+
+    sse_payloads = []
+    public_id = await _finalize_draft(draft, payment_id, db, background_tasks, sse_payloads, payment_source="PHONEPE")
+    await db.commit()
+    
+    # Invalidate cache
+    from app.utils.cache import clear_cache_prefix
+    if draft.target_type == 'package':
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+    elif draft.target_type == 'room':
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+    
+    from app.utils.sse import sse_manager
+    for p in sse_payloads:
+        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+    
+    return {"status": "success", "booking_id": public_id}
+
+
+@router.post("/webhook/phonepe")
+async def phonepe_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    PhonePe S2S Webhook callback.
+    Finalizes the booking draft or balance payment asynchronously.
+    """
+    import base64
+    body_bytes = await request.body()
+    signature = request.headers.get("x-verify")
+
+    try:
+        data = json.loads(body_bytes)
+        response_base64 = data.get("response")
+    except Exception:
+        logger.error("PhonePe Webhook failed to parse raw request JSON.")
+        raise HTTPException(status_code=400, detail="Invalid request JSON")
+
+    if not response_base64:
+        raise HTTPException(status_code=400, detail="Missing response payload")
+
+    # Verify signature
+    is_valid = phonepe_service.verify_webhook_signature(response_base64, signature)
+    if not is_valid:
+        logger.warning("PhonePe Webhook signature verification failed.")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Decode payload
+    try:
+        decoded_bytes = base64.b64decode(response_base64)
+        payload = json.loads(decoded_bytes)
+    except Exception as e:
+        logger.error(f"PhonePe Webhook failed to decode/parse base64: {e}")
+        raise HTTPException(status_code=400, detail="Invalid base64 payload")
+
+    success = payload.get("success")
+    code = payload.get("code")
+    payload_data = payload.get("data", {})
+    
+    merchant_txn_id = payload_data.get("merchantTransactionId")
+    gateway_payment_id = payload_data.get("transactionId")
+    payment_instrument = payload_data.get("paymentInstrument", {}).get("type")
+
+    if not merchant_txn_id:
+        logger.warning("PhonePe Webhook payload missing merchantTransactionId")
+        return {"status": "ok"}
+
+    try:
+        if success and code == "PAYMENT_SUCCESS":
+            # Lock draft
+            draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == merchant_txn_id).with_for_update()
+            res = await db.execute(draft_query)
+            draft = res.scalar_one_or_none()
+
+            if draft:
+                sse_payloads = []
+                target_type = draft.target_type
+                public_id = await _finalize_draft(draft, gateway_payment_id, db, sse_payloads=sse_payloads, payment_source="PHONEPE")
+                await db.commit()
+                
+                # Invalidate cache
+                from app.utils.cache import clear_cache_prefix
+                if target_type == 'package':
+                    clear_cache_prefix("packages:list:")
+                    clear_cache_prefix("packages:detail:")
+                elif target_type == 'room':
+                    clear_cache_prefix("rooms:list:")
+                    clear_cache_prefix("rooms:detail:")
+                
+                from app.utils.sse import sse_manager
+                for p in sse_payloads:
+                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                
+                finalized_booking = await db.execute(
+                    select(Booking).where(Booking.public_id == public_id).limit(1)
+                )
+                booking = finalized_booking.scalar_one_or_none()
+                if booking:
+                    try:
+                        from app.worker import get_arq_pool
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                    except Exception as arq_err:
+                        logger.warning(f"Failed to enqueue document tasks from PhonePe webhook: {arq_err}")
+                logger.info(f"PhonePe Webhook finalized booking for transaction {merchant_txn_id}")
+            else:
+                # Check balance payment
+                from app.models.payment import Payment
+                from app.models.enums import PaymentStatus
+
+                payment_stmt = select(Payment).where(
+                    Payment.razorpay_order_id == merchant_txn_id
+                ).with_for_update()
+                p_res = await db.execute(payment_stmt)
+                payment = p_res.scalar_one_or_none()
+
+                if payment and payment.status != PaymentStatus.CAPTURED:
+                    payment.status = PaymentStatus.CAPTURED
+                    payment.razorpay_payment_id = gateway_payment_id
+                    if payment_instrument:
+                        payment.payment_method = payment_instrument
+
+                    from app.utils.ledger import recompute_booking_ledger
+                    booking = await recompute_booking_ledger(payment.booking_id, db)
+
+                    try:
+                        from app.worker import get_arq_pool
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                    except Exception as arq_err:
+                        logger.warning(f"Failed to enqueue documents task from PhonePe webhook: {arq_err}")
+
+                    await db.commit()
+                    logger.info(f"PhonePe Webhook finalized balance payment for transaction {merchant_txn_id}")
+        else:
+            # Payment failed/error webhook
+            draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == merchant_txn_id).with_for_update()
+            res = await db.execute(draft_query)
+            draft = res.scalar_one_or_none()
+            if draft:
+                from app.workers.draft_cleanup import release_draft_inventory
+                sse_payloads = await release_draft_inventory(draft, db)
+                await db.delete(draft)
+                await db.commit()
+                
+                from app.utils.sse import sse_manager
+                for p in sse_payloads or []:
+                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                logger.info(f"PhonePe Webhook released draft {draft.draft_id} after payment failure")
+            else:
+                from app.models.payment import Payment
+                from app.models.enums import PaymentStatus
+
+                payment_stmt = select(Payment).where(
+                    Payment.razorpay_order_id == merchant_txn_id
+                ).with_for_update()
+                p_res = await db.execute(payment_stmt)
+                payment = p_res.scalar_one_or_none()
+                if payment and payment.status != PaymentStatus.CAPTURED:
+                    payment.status = PaymentStatus.FAILED
+                    payment.error_code = code
+                    payment.error_description = payload.get("message")
+                    await db.commit()
+                    logger.info(f"PhonePe Webhook marked balance payment failed for transaction {merchant_txn_id}")
+    except Exception as e:
+        logger.error(f"PhonePe Webhook processing failed: {str(e)}")
+        await db.rollback()
+        return {"status": "error"}
+
     return {"status": "ok"}

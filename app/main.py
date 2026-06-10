@@ -241,36 +241,11 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to pre-warm R2 Storage client during startup: {e}")
 
-    # Start the Draft Cleanup background worker
-    from app.workers.draft_cleanup import draft_cleanup_loop
-    task = asyncio.create_task(draft_cleanup_loop())
-    # Store on app state so shutdown can cancel it
-    app.state.draft_cleanup_task = task
-    logger.info("[DraftCleanup] Background worker task created.")
-
-    # Start the Daily Cutoff background worker
-    from app.workers.daily_cutoff import daily_cutoff_loop
-    cutoff_task = asyncio.create_task(daily_cutoff_loop())
-    app.state.daily_cutoff_task = cutoff_task
-    logger.info("[DailyCutoff] Background worker task created.")
-
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    task = getattr(app.state, "draft_cleanup_task", None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        logger.info("[DraftCleanup] Background worker task cancelled on shutdown.")
-        
-    cutoff_task = getattr(app.state, "daily_cutoff_task", None)
-    if cutoff_task and not cutoff_task.done():
-        cutoff_task.cancel()
-        try:
-            await cutoff_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("[DailyCutoff] Background worker task cancelled on shutdown.")
+    # Crucial: Dispose of SQLAlchemy connection pool to prevent connection leaks on reload
+    from app.db.session import engine
+    await engine.dispose()
+    logger.info("Database connection pool disposed gracefully.")
+# reload trigger

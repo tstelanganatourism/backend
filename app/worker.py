@@ -1,9 +1,10 @@
 import asyncio
 import logging
-from arq import create_pool
+from arq import create_pool, cron
 from arq.connections import RedisSettings
 from app.core.config import settings
 from app.services.pdf_generator import generate_package_brochure_task, process_post_booking_documents_task
+from app.workers.daily_cutoff import perform_daily_cutoff
 
 logger = logging.getLogger(__name__)
 
@@ -21,16 +22,21 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     logger.info("Worker shutting down...")
-    pass
+    from app.db.session import engine
+    await engine.dispose()
+    logger.info("Database connection pool disposed gracefully.")
 
 class WorkerSettings:
     functions = [generate_package_brochure_task, process_post_booking_documents_task]
+    cron_jobs = [
+        cron(perform_daily_cutoff, second=0, run_at_startup=True),
+    ]
     redis_settings = REDIS_SETTINGS
     on_startup = startup
     on_shutdown = shutdown
-    max_jobs = 10  # Safe: jobs now only send emails (no Playwright/RAM spike)
+    max_jobs = 3   # Must not exceed the ARQ worker's DB pool ceiling (pool_size=2, max_overflow=1)
     max_tries = 3  # Retry up to 3 times if email sending fails
-    job_timeout = 60   # 60 seconds is more than enough to send an email
+    job_timeout = 90   # 90 seconds to handle slow Brevo or DB responses
     
 _pool = None
 

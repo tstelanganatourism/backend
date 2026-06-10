@@ -159,7 +159,7 @@ async def get_room_detail(
         query = (
             select(Room)
             .where(
-                Room.slug == slug,
+                func.lower(Room.slug) == slug.lower(),
                 Room.status == PublishStatus.PUBLISHED,
                 Room.is_active == True,
                 Room.deleted_at.is_(None)
@@ -264,9 +264,11 @@ async def get_room_availability(
     - Dates with available_rooms=0 → SOLD_OUT.
     - Dates with no inventory row → NO_INVENTORY (disabled in calendar).
     """
-    from app.core.timezone import ist_date_today
+    from app.core.timezone import get_ist_now
     set_public_cache_headers(response)
-    today = ist_date_today()
+    now_ist = get_ist_now()
+    today = now_ist.date()
+    is_after_6am = now_ist.hour >= 6
 
     # Validate month format
     try:
@@ -283,7 +285,7 @@ async def get_room_availability(
     result = await db.execute(
         select(Room)
         .where(
-            Room.slug == slug,
+            func.lower(Room.slug) == slug.lower(),
             Room.status == PublishStatus.PUBLISHED,
             Room.is_active == True,
             Room.deleted_at.is_(None),
@@ -326,7 +328,7 @@ async def get_room_availability(
     # Walk every date in the month, for every variant
     current = from_date
     while current <= to_date:
-        if current < today:
+        if current < today or (current == today and is_after_6am):
             current += timedelta(days=1)
             continue
 

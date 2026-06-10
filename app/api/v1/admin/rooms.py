@@ -181,7 +181,7 @@ async def create_room(
     current_admin: User = Depends(require_admin)
 ):
     """Create a new room/lodge with all nested relations in one transaction."""
-    slug = body.slug or slugify(body.lodge_name)
+    slug = slugify(body.slug) if body.slug else slugify(body.lodge_name)
     
     existing = await db.execute(select(Room).where(Room.slug == slug))
     if existing.scalar_one_or_none():
@@ -277,13 +277,15 @@ async def update_room(
         "variants", "gallery", "highlights", "faqs", "policies"
     })
     
-    if "slug" in update_data and update_data["slug"] != room.slug:
-        existing = await db.execute(select(Room).where(Room.slug == update_data["slug"]))
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Slug already in use"
-            )
+    if "slug" in update_data and update_data["slug"]:
+        update_data["slug"] = slugify(update_data["slug"])
+        if update_data["slug"] != room.slug:
+            existing = await db.execute(select(Room).where(Room.slug == update_data["slug"]))
+            if existing.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Slug already in use"
+                )
             
     old_slug = room.slug
 

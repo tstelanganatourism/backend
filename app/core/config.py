@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: Optional[str] = None
     RAZORPAY_KEY_SECRET: Optional[str] = None
     
+    # PhonePe
+    PHONEPE_MERCHANT_ID: Optional[str] = None
+    PHONEPE_SALT_KEY: Optional[str] = None
+    PHONEPE_SALT_INDEX: int = 1
+    PHONEPE_ENV: str = "UAT"
+
+    
     # Brevo (Email Sending)
     BREVO_API_KEY: Optional[str] = None  # Legacy fallback
     BREVO_API_KEY_USER: Optional[str] = None
@@ -104,3 +111,4 @@ class Settings(BaseSettings):
         return self
 
 settings = Settings()
+# Force reload for sandbox settings update

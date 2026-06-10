@@ -379,6 +379,7 @@ class AdminCreateBookingRequest(BaseModel):
     child_count: Optional[int] = None
     user_id: Optional[int] = None  # optional: assign to a registered user
     agent_id: Optional[int] = None  # optional: assign under an agent
+    customer_email: Optional[str] = None # Tourist email (for admin direct / agent bookings)
     passengers: List[AdminPassengerInput] = []
     # Transport
     transport_selections: Optional[List] = None  # List[{option_id, quantity}]
@@ -390,6 +391,8 @@ class AdminCreateBookingRequest(BaseModel):
     slot_end: Optional[str] = None
     # Payment
     amount_paid: Optional[float] = None
+    # Booking mode: QUICK = only lead passenger details, rest auto-filled
+    quick_booking: Optional[bool] = False
 
 @router.post("/create")
 async def admin_create_booking(
@@ -424,12 +427,21 @@ async def admin_create_booking(
             raise HTTPException(status_code=400, detail="variant_id is required for package booking")
         
         variant_result = await db.execute(
-            select(PackageVariant).where(PackageVariant.id == request.variant_id)
+            select(PackageVariant).options(selectinload(PackageVariant.package)).where(PackageVariant.id == request.variant_id)
         )
         variant = variant_result.scalar_one_or_none()
         if not variant:
             raise HTTPException(status_code=404, detail="Package variant not found")
         
+        # Minimum passengers check for admins/agents as well
+        min_pax = getattr(variant.package, 'min_passengers', 1) or 1
+        total_passengers = adult_count + child_count
+        if total_passengers < min_pax:
+            raise HTTPException(
+                status_code=400,
+                detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
+            )
+
         package_variant_id_val = variant.id
 
         # Admin bypass: fetch inventory if it exists — but never block on missing/closed/full
@@ -615,6 +627,7 @@ async def admin_create_booking(
         "payment_method": "ADMIN_MANUAL",
         "created_by_admin_id": current_admin.id,
         "admin_name": current_admin.full_name,
+        "booking_mode": "QUICK" if request.quick_booking else "FULL",
     }
     if transport_snapshot_items:
         pricing_snapshot["transport_selections"] = transport_snapshot_items
@@ -656,6 +669,7 @@ async def admin_create_booking(
         user_id=request.user_id,
         agent_id=agent_id_val,
         source=BookingSource.ADMIN_DIRECT,
+        customer_email=request.customer_email,
         variant_id=package_variant_id_val,
         room_variant_id=room_variant_id_val,
         travel_date=travel_date,
@@ -742,6 +756,17 @@ async def admin_create_booking(
     elif request.target_type == 'room':
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
+
+    # Trigger ticket/invoice generation and notifications asynchronously
+    try:
+        from app.worker import get_arq_pool
+        from loguru import logger
+        arq_pool = await get_arq_pool()
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True)
+        logger.info(f"Queued post-booking documents task for admin direct booking {booking.public_id}")
+    except Exception as e:
+        from loguru import logger
+        logger.error(f"Failed to queue post-booking documents task for admin booking: {e}")
 
     return {
         "status": "success",

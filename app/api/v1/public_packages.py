@@ -103,6 +103,7 @@ async def get_packages(
                 Package.generated_brochure_url,
                 Package.is_featured,
                 Package.starting_price,
+                Package.min_passengers,
                 func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
             )
             .group_by(Package.id)
@@ -165,6 +166,7 @@ async def get_packages(
                 generated_brochure_url=gen_brochure_url,
                 cover_image_url=pkg.cover_image_url,
                 is_featured=pkg.is_featured,
+                min_passengers=pkg.min_passengers or 1,
                 tags=pkg.tags_list or [],
                 starting_price=pkg.starting_price,
                 transport_info=None,
@@ -204,7 +206,7 @@ async def get_package_detail(
         query = (
             select(Package)
             .where(
-                Package.slug == slug,
+                func.lower(Package.slug) == slug.lower(),
                 Package.status == PublishStatus.PUBLISHED,
                 Package.deleted_at.is_(None)
             )
@@ -278,6 +280,7 @@ async def get_package_detail(
             is_featured=pkg.is_featured,
             tags=[tag.name for tag in pkg_tags if tag.is_active],
             starting_price=starting_price,
+            min_passengers=pkg.min_passengers or 1,
             # Transport & Refreshments
             has_transport=pkg.has_transport or False,
             transport_options=[
@@ -368,7 +371,11 @@ async def get_package_availability(
     - Dates with no inventory row are returned with status='NO_INVENTORY'.
     """
     set_no_store_headers(response)
-    today = ist_date_today()
+    set_no_store_headers(response)
+    from app.core.timezone import get_ist_now
+    now_ist = get_ist_now()
+    today = now_ist.date()
+    is_after_6am = now_ist.hour >= 6
 
     # Check Redis cache first
     from app.services.redis_client import get_cached_availability
@@ -391,7 +398,7 @@ async def get_package_availability(
     pkg_result = await db.execute(
         select(Package)
         .where(
-            Package.slug == slug,
+            func.lower(Package.slug) == slug.lower(),
             Package.status == PublishStatus.PUBLISHED,
             Package.deleted_at.is_(None),
         )
@@ -435,8 +442,8 @@ async def get_package_availability(
     # Walk every date in the month, for every variant
     current = from_date
     while current <= to_date:
-        # Skip past dates
-        if current < today:
+        # Skip past dates or today if after 6 AM IST
+        if current < today or (current == today and is_after_6am):
             current += timedelta(days=1)
             continue
 

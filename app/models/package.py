@@ -34,6 +34,7 @@ class Package(BaseModel, SEOMixin):
     is_featured = Column(Boolean, default=False, server_default="false", nullable=False)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
     status = Column(SQLEnum(PublishStatus), default=PublishStatus.DRAFT, server_default="DRAFT", nullable=False, index=True)
+    min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
 
     tags = relationship("Tag", secondary=package_tags)
     variants = relationship("PackageVariant", back_populates="package", cascade="all, delete-orphan")

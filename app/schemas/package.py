@@ -202,6 +202,7 @@ class PackageBase(AppBaseModel):
     is_featured: bool = False
     is_active: bool = True
     status: PublishStatus = PublishStatus.DRAFT
+    min_passengers: int = Field(1, ge=1)
 
 class PackageResponse(PackageBase, TimestampSchema):
     id: int
@@ -252,6 +253,7 @@ class PackageUpdate(AppBaseModel):
     is_featured: Optional[bool] = None
     is_active: Optional[bool] = None
     status: Optional[PublishStatus] = None
+    min_passengers: Optional[int] = Field(None, ge=1)
     
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None

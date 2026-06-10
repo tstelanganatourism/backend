@@ -11,6 +11,7 @@ class Booking(BaseModel):
     user_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     agent_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     source = Column(SQLEnum(BookingSource), default=BookingSource.PUBLIC, server_default="PUBLIC", nullable=False)
+    customer_email = Column(String, nullable=True)  # Tourist email for direct/agent bookings
 
     # Strict Mutually Exclusive Foreign Keys
     room_variant_id = Column(ForeignKey("room_variants.id", ondelete="RESTRICT"), nullable=True, index=True)

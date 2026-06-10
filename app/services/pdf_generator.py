@@ -184,24 +184,37 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         form_url = f"{frontend_url}/print/form/{booking.public_id}?secret={signature}" if not is_room_booking else ""
 
 
-        # 4. Determine Recipient Email
-        recipient_email = None
-        recipient_name = "Guest"
-        if booking.user_id:
+        # 4. Determine Recipient Emails
+        recipients = []
+        
+        # Tourist Email (Highest Priority)
+        if booking.customer_email:
+            primary_passenger_name = next((p.full_name for p in booking.passengers if p.is_primary), "Guest")
+            recipients.append((booking.customer_email, primary_passenger_name))
+            
+        # Logged-in User Email (If no tourist email provided)
+        elif booking.user_id:
             user = await db.get(User, booking.user_id)
             if user and user.email:
-                recipient_email = user.email
-                recipient_name = user.full_name
+                recipients.append((user.email, user.full_name))
 
-        if not recipient_email and booking.agent_id:
+        # Agent Email (If booked via agent, always send them a copy)
+        if booking.agent_id:
             agent = await db.get(User, booking.agent_id)
             if agent and agent.email:
-                recipient_email = agent.email
-                recipient_name = agent.full_name
+                if not any(r[0] == agent.email for r in recipients):
+                    recipients.append((agent.email, agent.full_name))
 
         # 5. Prepare and Send Email
-        if not recipient_email:
-            # Skip email logic
+        if not recipients:
+            # Send admin notification even if customer has no email (walk-in/guest/admin direct)
+            try:
+                from app.services.admin_notification import send_admin_booking_notification
+                await send_admin_booking_notification(booking, db=db)
+            except Exception as e:
+                logger.error(f"Failed to dispatch admin notification for recipient-less booking: {e}")
+
+            # Skip customer email but log the skip
             log_entry = EmailLog(
                 booking_id=booking.id,
                 recipient_email=None,
@@ -211,13 +224,14 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             )
             db.add(log_entry)
             await db.commit()
+            logger.info(f"No customer email recipient for booking {booking_id}; admin notified.")
             return
 
         # Build premium, email-client-safe HTML content.
         office_phone = "+91 95420 69573"
         office_address = "Telangana Boat Tourism, near SBI ATM, SREE SEETHA RAMA TEMPLE PARKING, DR-NO-4-1-78/1, kalyana mandapam road, opp. sbi atm, Bhadrachalam, Telangana 507111"
         office_maps_url = "https://maps.app.goo.gl/6YDfViEq3RLuvNN36?g_st=awb"
-        safe_recipient_name = escape(recipient_name or "Guest")
+        # Recipient name is handled per-recipient in _generate_html
         safe_booking_id = escape(booking.public_id)
         safe_ticket_url = escape(ticket_url, quote=True)
         safe_form_url = escape(form_url, quote=True)
@@ -446,11 +460,12 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                         </tr>
             """.rstrip()
 
-        html_content = base_html.format(
-            subject=escape(subject),
-            recipient_name=safe_recipient_name,
-            message_body=message_body,
-            booking_id=safe_booking_id,
+        def _generate_html(recipient_name_val):
+            return base_html.format(
+                subject=escape(subject),
+                recipient_name=escape(recipient_name_val),
+                message_body=message_body,
+                booking_id=safe_booking_id,
             financial_details=financial_details,
             logo1_url=safe_logo1_url,
             logo2_url=safe_logo2_url,
@@ -465,25 +480,37 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         )
 
 
-        success, error_reason = await email_service.send_booking_email(
-            recipient_email=recipient_email,
-            recipient_name=recipient_name,
-            subject=subject,
-            html_content=html_content
-        )
-        
-        # Send admin notification
+        # Send to all resolved recipients — pass db so send_booking_email reuses
+        # this session instead of opening a new one (prevents connection pool exhaustion).
+        success = False
+        error_reason = "No recipients"
+        for r_email, r_name in recipients:
+            html = _generate_html(r_name)
+            s, err = await email_service.send_booking_email(
+                recipient_email=r_email,
+                recipient_name=r_name,
+                subject=subject,
+                html_content=html,
+                db=db,
+            )
+            if s: success = True
+            else: error_reason = err
+
+            # Log each recipient
+            log_entry = EmailLog(
+                booking_id=booking.id,
+                recipient_email=r_email,
+                email_type=email_type,
+                delivery_status="SENT" if s else "FAILED",
+                failure_reason=err if not s else None
+            )
+            db.add(log_entry)
+
+        # Send admin notification — reuse same session
         try:
-            await send_admin_booking_notification(booking)
+            await send_admin_booking_notification(booking, db=db)
         except Exception as e:
             logger.error(f"Failed to dispatch admin notification: {e}")
 
-        log_entry = EmailLog(
-            booking_id=booking.id,
-            recipient_email=recipient_email,
-            email_type=email_type,
-            delivery_status="SENT" if success else "FAILED",
-            failure_reason=error_reason if not success else None
-        )
-        db.add(log_entry)
         await db.commit()
+        logger.info(f"process_post_booking_documents_task completed for booking {booking_id}")

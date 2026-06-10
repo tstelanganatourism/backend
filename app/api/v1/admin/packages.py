@@ -168,7 +168,7 @@ async def create_package(
 ):
     """Create a new package with all nested relations in one transaction."""
     # Ensure slug is unique
-    slug = body.slug or slugify(body.title)
+    slug = slugify(body.slug) if body.slug else slugify(body.title)
     
     existing = await db.execute(select(Package).where(Package.slug == slug))
     if existing.scalar_one_or_none():
@@ -276,13 +276,15 @@ async def update_package(
     })
     
     # If slug is changing, verify uniqueness
-    if "slug" in update_data and update_data["slug"] != package.slug:
-        existing = await db.execute(select(Package).where(Package.slug == update_data["slug"]))
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Slug already in use"
-            )
+    if "slug" in update_data and update_data["slug"]:
+        update_data["slug"] = slugify(update_data["slug"])
+        if update_data["slug"] != package.slug:
+            existing = await db.execute(select(Package).where(Package.slug == update_data["slug"]))
+            if existing.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Slug already in use"
+                )
             
     old_slug = package.slug
     old_brochure_pdf_url = package.brochure_pdf_url
@@ -365,7 +367,7 @@ async def update_package(
     clear_cache_prefix(f"packages:detail:{package.slug}")
     clear_cache_prefix("carousel:")
     from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
+    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}", f"package:{old_slug}"])
     
     # Reload package with all relationships loaded to prevent MissingGreenlet errors during serialization
     refresh_query = (
@@ -433,7 +435,7 @@ async def delete_package(
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{package.slug}")
     from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
+    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}"])
     
     return None
 
@@ -544,7 +546,7 @@ async def publish_package(
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{package.slug}")
     from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"package-{package.id}"])
+    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}"])
     
     # ─── Document Architecture Trigger ─────────────────────────────
     from app.models.enums import DocumentGenerationStatus

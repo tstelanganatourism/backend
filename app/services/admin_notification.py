@@ -61,7 +61,27 @@ async def send_admin_booking_notification(
     # ── 3. Passenger roster HTML ──────────────────────────────────────────────
     passenger_rows = ""
     if booking.passengers:
-        for idx, p in enumerate(booking.passengers, 1):
+        real_passengers = []
+        quick_adults = 0
+        quick_children = 0
+        
+        for p in booking.passengers:
+            is_quick_guest = not p.is_primary and (
+                (pricing.get("booking_mode") == "QUICK") or
+                ("quick ticket" in p.full_name.lower()) or
+                ("guest adult" in p.full_name.lower()) or
+                ("guest child" in p.full_name.lower())
+            )
+            if is_quick_guest:
+                if p.age and p.age < 11:
+                    quick_children += 1
+                else:
+                    quick_adults += 1
+            else:
+                real_passengers.append(p)
+                
+        row_idx = 1
+        for p in real_passengers:
             gender = (p.gender.value if p.gender else "—").capitalize()
             badge_color = "#0d9488" if p.is_primary else "#64748b"
             primary_badge = (
@@ -75,13 +95,44 @@ async def send_admin_booking_notification(
               <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#1e293b;">
                 <table cellpadding="0" cellspacing="0" border="0" style="margin:0;padding:0;">
                   <tr>
-                    <td style="width:22px;height:22px;background:{badge_color};color:#fff;text-align:center;vertical-align:middle;border-radius:50%;font-size:10px;font-weight:700;">{idx}</td>
+                    <td style="width:22px;height:22px;background:{badge_color};color:#fff;text-align:center;vertical-align:middle;border-radius:50%;font-size:10px;font-weight:700;">{row_idx}</td>
                     <td style="padding-left:8px;vertical-align:middle;"><strong>{p.full_name}</strong>{primary_badge}</td>
                   </tr>
                 </table>
               </td>
               <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#475569;text-align:center;">{p.age} yrs</td>
               <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#475569;text-align:center;">{gender}</td>
+            </tr>"""
+            row_idx += 1
+            
+        if quick_adults > 0:
+            passenger_rows += f"""
+            <tr>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#64748b;font-style:italic;">
+                <table cellpadding="0" cellspacing="0" border="0" style="margin:0;padding:0;">
+                  <tr>
+                    <td style="width:22px;height:22px;background:#e2e8f0;color:#64748b;text-align:center;vertical-align:middle;border-radius:50%;font-size:10px;font-weight:700;">QT</td>
+                    <td style="padding-left:8px;vertical-align:middle;"><strong>Not Provided (Adult) x {quick_adults}</strong></td>
+                  </tr>
+                </table>
+              </td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
+            </tr>"""
+            
+        if quick_children > 0:
+            passenger_rows += f"""
+            <tr>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#64748b;font-style:italic;">
+                <table cellpadding="0" cellspacing="0" border="0" style="margin:0;padding:0;">
+                  <tr>
+                    <td style="width:22px;height:22px;background:#e2e8f0;color:#64748b;text-align:center;vertical-align:middle;border-radius:50%;font-size:10px;font-weight:700;">QT</td>
+                    <td style="padding-left:8px;vertical-align:middle;"><strong>Not Provided (Child) x {quick_children}</strong></td>
+                  </tr>
+                </table>
+              </td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
             </tr>"""
 
     # ── 4. Travel date / room dates ───────────────────────────────────────────
@@ -534,6 +585,7 @@ async def send_admin_booking_notification(
         subject=subject,
         html_content=html_content,
         is_admin=True,
+        db=db,  # Reuse caller's session; never open a new connection here
     )
 
     if not success:
