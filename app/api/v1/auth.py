@@ -258,7 +258,7 @@ def _build_otp_email_html(
                     </table>
                 </td>
             </tr>
-        </table>s
+        </table>
     </body>
     </html>
     """
@@ -266,44 +266,67 @@ def _build_otp_email_html(
 
 async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
     """Send a password reset OTP email via Brevo."""
-    if not settings.BREVO_API_KEY:
-        return
+    primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
+    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+    backup_key = settings.BREVO_API_KEY_BACKUP
+    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
 
-    payload = {
-        "sender": {"email": settings.BREVO_FROM_EMAIL, "name": "TS Tourism"},
-        "to": [{"email": email, "name": full_name}],
-        "subject": "Password Reset Code - TS Tourism",
-        "htmlContent": _build_otp_email_html(
-            full_name=full_name,
-            otp=otp,
-            title="Password Reset Code",
-            eyebrow="Account recovery",
-            intro="We received a request to reset your TS Boating & Tourism password. Enter the code below to continue and create a new password.",
-            expiry_text="This code expires in 10 minutes.",
-            security_note="If you did not request a password reset, ignore this email and keep your current password unchanged.",
-            accent_color="#b42318",
-        ),
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.brevo.com/v3/smtp/email",
-                json=payload,
-                headers={
-                    "api-key": settings.BREVO_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                timeout=10.0,
-            )
-            if resp.status_code not in (200, 201):
-                logger.error(f"Brevo API Error (Password Reset): {resp.status_code} - {resp.text}")
-                return False
-            logger.info(f"Password reset email sent to {email} successfully.")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to send password reset email: {str(e)}")
+    if not primary_key and not backup_key:
+        logger.warning("No BREVO_API_KEY_ADMIN, BREVO_API_KEY, or BREVO_API_KEY_BACKUP configured, skipping reset email.")
         return False
+
+    html_content = _build_otp_email_html(
+        full_name=full_name,
+        otp=otp,
+        title="Password Reset Code",
+        eyebrow="Account recovery",
+        intro="We received a request to reset your TS Boating & Tourism password. Enter the code below to continue and create a new password.",
+        expiry_text="This code expires in 10 minutes.",
+        security_note="If you did not request a password reset, ignore this email and keep your current password unchanged.",
+        accent_color="#b42318",
+    )
+
+    async def _attempt_send(api_key: str, from_email: str) -> tuple[bool, str]:
+        payload = {
+            "sender": {"email": from_email, "name": "TS Tourism"},
+            "to": [{"email": email, "name": full_name}],
+            "subject": "Password Reset Code - TS Tourism",
+            "htmlContent": html_content,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    json=payload,
+                    headers={
+                        "api-key": api_key,
+                        "Content-Type": "application/json"
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code not in (200, 201):
+                    return False, f"Brevo API Error: {resp.status_code} - {resp.text}"
+                return True, ""
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
+
+    # 1. Try Admin (Secondary) key
+    if primary_key:
+        success, error_msg = await _attempt_send(primary_key, primary_from)
+        if success:
+            logger.info(f"Password reset email sent to {email} successfully using primary admin key.")
+            return True
+        logger.warning(f"Primary Admin Brevo key failed for Reset OTP to {email}: {error_msg}. Attempting Backup key...")
+
+    # 2. Try Backup key
+    if backup_key:
+        success, error_msg = await _attempt_send(backup_key, backup_from)
+        if success:
+            logger.info(f"Password reset email sent to {email} successfully using backup key.")
+            return True
+        logger.error(f"Backup Brevo key also failed for Reset OTP to {email}: {error_msg}")
+
+    return False
 
 
 async def _send_admin_otp_email(email: str, full_name: str, otp: str):
@@ -320,41 +343,67 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
         except Exception as e:
             logger.error(f"Failed to write OTP to current_otp.txt: {str(e)}")
 
-    if not settings.BREVO_API_KEY:
-        logger.warning("No BREVO_API_KEY found, skipping actual email send.")
+    primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
+    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+    backup_key = settings.BREVO_API_KEY_BACKUP
+    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
+
+    if not primary_key and not backup_key:
+        logger.warning("No BREVO_API_KEY_ADMIN, BREVO_API_KEY, or BREVO_API_KEY_BACKUP configured, skipping actual email send.")
         return
 
-    payload = {
-        "sender": {"email": settings.BREVO_FROM_EMAIL, "name": "TS Tourism Services"},
-        "to": [{"email": email, "name": full_name}],
-        "subject": "Verification Code - TS Tourism Admin",
-        "htmlContent": _build_otp_email_html(
-            full_name=full_name,
-            otp=otp,
-            title="Admin Verification Code",
-            eyebrow="Secure admin portal",
-            intro="Use this one-time security code to finish signing in to the TS Tourism Admin Portal.",
-            expiry_text="This code expires in 5 minutes.",
-            security_note="If you did not try to sign in, ignore this email and review access to your admin account.",
-            accent_color="#075b60",
-        ),
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.brevo.com/v3/smtp/email",
-                json=payload,
-                headers={
-                    "api-key": settings.BREVO_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                timeout=10.0,
-            )
-            if resp.status_code not in (200, 201):
-                logger.error(f"Brevo API Error: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        logger.error(f"Failed to send OTP email: {str(e)}")
+    html_content = _build_otp_email_html(
+        full_name=full_name,
+        otp=otp,
+        title="Admin Verification Code",
+        eyebrow="Secure admin portal",
+        intro="Use this one-time security code to finish signing in to the TS Tourism Admin Portal.",
+        expiry_text="This code expires in 5 minutes.",
+        security_note="If you did not try to sign in, ignore this email and review access to your admin account.",
+        accent_color="#075b60",
+    )
+
+    async def _attempt_send(api_key: str, from_email: str) -> tuple[bool, str]:
+        payload = {
+            "sender": {"email": from_email, "name": "TS Tourism Services"},
+            "to": [{"email": email, "name": full_name}],
+            "subject": "Verification Code - TS Tourism Admin",
+            "htmlContent": html_content,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    json=payload,
+                    headers={
+                        "api-key": api_key,
+                        "Content-Type": "application/json"
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code not in (200, 201):
+                    return False, f"Brevo API Error: {resp.status_code} - {resp.text}"
+                return True, ""
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
+
+    # 1. Try Admin (Secondary) key
+    if primary_key:
+        success, error_msg = await _attempt_send(primary_key, primary_from)
+        if success:
+            logger.info(f"Admin OTP email sent to {email} successfully using primary admin key.")
+            return True
+        logger.warning(f"Primary Admin Brevo key failed for OTP to {email}: {error_msg}. Attempting Backup key...")
+
+    # 2. Try Backup key
+    if backup_key:
+        success, error_msg = await _attempt_send(backup_key, backup_from)
+        if success:
+            logger.info(f"Admin OTP email sent to {email} successfully using backup key.")
+            return True
+        logger.error(f"Backup Brevo key also failed for OTP to {email}: {error_msg}")
+
+    return False
 
 
 @router.post("/admin/resend-otp")
