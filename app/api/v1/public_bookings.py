@@ -90,6 +90,8 @@ class CheckoutRequest(BaseModel):
     expected_amount: Optional[float] = None
     quick_booking: Optional[bool] = False
     customer_email: Optional[str] = None
+    # Payment gateway selection: PHONEPE (default/primary) or CASHFREE (secondary)
+    gateway: Optional[str] = "PHONEPE"
 
 @router.post("/checkout")
 async def checkout(
@@ -596,7 +598,7 @@ async def checkout(
         if request.slot_end:
             pricing_snapshot["slot_end"] = str(request.slot_end)
         
-    # --- Razorpay Order Generation ---
+    # --- Payment Gateway Order Generation ---
     payment_percentage = request.payment_percentage if request.payment_percentage is not None else 100.0
     if not (35.0 <= payment_percentage <= 100.0):
         raise HTTPException(status_code=400, detail="Payment percentage must be between 35% and 100%")
@@ -613,40 +615,86 @@ async def checkout(
     pricing_snapshot["actual_paid_advance"] = str(payable_amount)
 
     if request.expected_amount is not None:
-        pass # Frontend sends expected_amount but we just process checkout with realtime calculated price.
+        pass  # Frontend sends expected_amount but we process checkout with realtime calculated price.
 
     draft_id = "DRF-" + str(uuid.uuid4())[:8].upper()
     merchant_txn_id = f"TXN_{draft_id}_{str(uuid.uuid4())[:4].upper()}"
-    
+
     host = fastapi_req.headers.get('host')
     protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
-    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}"
 
     user_phone = None
     if request.passengers:
         user_phone = next((p.phone for p in request.passengers if p.phone), None)
 
-    phonepe_order = await phonepe_service.create_payment_url(
-        amount=float(payable_amount),
-        transaction_id=merchant_txn_id,
-        user_id=str(current_user.id) if current_user else "guest",
-        redirect_url=redirect_url,
-        callback_url=callback_url,
-        phone_number=user_phone
-    )
-    
+    # Get lead passenger name + email for Cashfree
+    user_name = None
+    user_email = None
+    if request.passengers:
+        lead = request.passengers[0]
+        user_name = lead.full_name
+    if request.customer_email:
+        user_email = request.customer_email
+    elif current_user and current_user.email:
+        user_email = current_user.email
+
+    # Determine selected gateway (default: PHONEPE)
+    selected_gateway = (request.gateway or "PHONEPE").upper()
+    if selected_gateway not in ("PHONEPE", "CASHFREE"):
+        selected_gateway = "PHONEPE"
+
+    # --- Gateway-specific order creation ---
+    checkout_response = {}
+
+    if selected_gateway == "CASHFREE":
+        from app.services.cashfree_client import cashfree_service
+        cashfree_return_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
+        cf_order = await cashfree_service.create_order(
+            order_id=merchant_txn_id,
+            amount=float(payable_amount),
+            customer_id=str(current_user.id) if current_user else "guest",
+            customer_name=user_name or "Customer",
+            customer_email=user_email or "noreply@tsboattourism.org",
+            customer_phone=user_phone or "9999999999",
+            return_url=cashfree_return_url,
+        )
+        checkout_response = {
+            "gateway": "CASHFREE",
+            "payment_session_id": cf_order.get("payment_session_id"),
+            "pg_transaction_id": merchant_txn_id,
+            "amount": int(float(payable_amount) * 100),  # in paise for consistency
+            "currency": "INR",
+        }
+    else:
+        # Default: PhonePe
+        callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+        redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+        phonepe_order = await phonepe_service.create_payment_url(
+            amount=float(payable_amount),
+            transaction_id=merchant_txn_id,
+            user_id=str(current_user.id) if current_user else "guest",
+            redirect_url=redirect_url,
+            callback_url=callback_url,
+            phone_number=user_phone
+        )
+        checkout_response = {
+            "gateway": "PHONEPE",
+            "redirect_url": phonepe_order.get("redirect_url"),
+            "pg_transaction_id": merchant_txn_id,
+            "amount": phonepe_order.get("amount"),  # in paise
+            "currency": "INR",
+        }
+
     # --- Database Draft Persistence ---
     now = get_ist_now()
     expires_at = now + timedelta(minutes=5)
-    
-    # Serialize complete payload to JSON
-    # Safe dump of the entire request
+
     payload_dump = request.model_dump(mode='json')
-    
+
     draft = BookingDraft(
         draft_id=draft_id,
-        razorpay_order_id=merchant_txn_id, # map PhonePe transaction_id to razorpay_order_id to preserve DB schema
+        pg_transaction_id=merchant_txn_id,
+        payment_gateway=selected_gateway,
         user_id=current_user.id if current_user else None,
         agent_id=agent_id,
         checkout_payload=payload_dump,
@@ -665,7 +713,7 @@ async def checkout(
 
     import time
     from app.utils.sse import sse_manager
-    
+
     sse_payloads = []
     if request.target_type.lower() == 'package':
         sse_payloads.append({
@@ -703,17 +751,14 @@ async def checkout(
         target_id = p.get("package_id") if target_channel == "package" else p.get("room_id")
         await sse_manager.broadcast_event(target_channel, str(target_id), "INVENTORY_UPDATE", p)
 
-    logger.info(f"BookingDraft {draft_id} created | order={merchant_txn_id} | expires={expires_at.isoformat()}")
+    logger.info(f"BookingDraft {draft_id} created | gateway={selected_gateway} | order={merchant_txn_id} | expires={expires_at.isoformat()}")
 
     return {
         "status": "success",
         "message": "Draft created and inventory reserved.",
         "checkout_data": {
             "draft_id": draft.draft_id,
-            "razorpay_order_id": draft.razorpay_order_id,
-            "redirect_url": phonepe_order.get("redirect_url"),
-            "amount": phonepe_order.get("amount"), # in paise
-            "currency": "INR",
+            **checkout_response,
             "expires_at": draft.expires_at.isoformat()
         }
     }
@@ -1185,9 +1230,11 @@ async def get_booking_details(
         collected_by_label = p.collected_by_label
         if not collected_by_label:
             if p.collected_by_type == "RAZORPAY":
-                collected_by_label = "Razorpay"
+                collected_by_label = "PhonePe (Legacy)"
             elif p.collected_by_type == "PHONEPE":
                 collected_by_label = "PhonePe"
+            elif p.collected_by_type == "CASHFREE":
+                collected_by_label = "Cashfree"
             else:
                 collected_by_label = "Admin (Cash)"
         payment_ledger.append({
@@ -1396,10 +1443,11 @@ async def process_balance_checkout(
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
-    Tourist balance checkout.
-    Generates a PhonePe payment session for the remaining balance.
+    Tourist balance checkout — supports PhonePe and Cashfree.
+    Generates a payment session for the remaining balance.
     """
     from app.services.phonepe_client import phonepe_service
+    from app.services.cashfree_client import cashfree_service
     from app.models.payment import Payment
     from app.models.enums import PaymentStatus
     from app.core.config import settings
@@ -1462,35 +1510,78 @@ async def process_balance_checkout(
     else:
         payable_amount = float(booking.remaining_balance)
         
-    merchant_txn_id = f"BAL-{booking.public_id}-{uuid.uuid4().hex[:6].upper()}"
-    
+    # Determine gateway from query param (default PhonePe)
+    gateway_param = fastapi_req.query_params.get("gateway", "PHONEPE").upper()
+    if gateway_param not in ("PHONEPE", "CASHFREE"):
+        gateway_param = "PHONEPE"
+
     host = fastapi_req.headers.get('host')
     protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
-    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}"
 
     user_phone = None
     if booking.passengers:
         user_phone = next((p.phone_number for p in booking.passengers if p.phone_number), None)
 
-    phonepe_order = await phonepe_service.create_payment_url(
-        amount=payable_amount,
-        transaction_id=merchant_txn_id,
-        user_id=str(current_user.id),
-        redirect_url=redirect_url,
-        callback_url=callback_url,
-        phone_number=user_phone
-    )
+    # Get customer info for Cashfree
+    customer_name = None
+    customer_email = None
+    if booking.passengers:
+        lead = next((p for p in booking.passengers if p.is_primary), booking.passengers[0])
+        customer_name = lead.full_name
+    if current_user and current_user.email:
+        customer_email = current_user.email
+
+    import uuid
+    merchant_txn_id = f"TXN_BAL_{str(uuid.uuid4())[:8].upper()}_{str(uuid.uuid4())[:4].upper()}"
+
+    balance_response = {}
+
+    if gateway_param == "CASHFREE":
+        cashfree_return_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
+        cf_order = await cashfree_service.create_order(
+            order_id=merchant_txn_id,
+            amount=payable_amount,
+            customer_id=str(current_user.id),
+            customer_name=customer_name or "Customer",
+            customer_email=customer_email or "noreply@tsboattourism.org",
+            customer_phone=user_phone or "9999999999",
+            return_url=cashfree_return_url,
+        )
+        balance_response = {
+            "gateway": "CASHFREE",
+            "payment_session_id": cf_order.get("payment_session_id"),
+            "pg_transaction_id": merchant_txn_id,
+            "amount": int(payable_amount * 100),
+            "currency": "INR",
+        }
+    else:
+        callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+        redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+        phonepe_order = await phonepe_service.create_payment_url(
+            amount=payable_amount,
+            transaction_id=merchant_txn_id,
+            user_id=str(current_user.id),
+            redirect_url=redirect_url,
+            callback_url=callback_url,
+            phone_number=user_phone
+        )
+        balance_response = {
+            "gateway": "PHONEPE",
+            "redirect_url": phonepe_order.get("redirect_url"),
+            "pg_transaction_id": merchant_txn_id,
+            "amount": phonepe_order.get("amount"),
+            "currency": "INR",
+        }
 
     # Create CREATED payment ledger row to track this attempt
     payment = Payment(
         booking_id=booking.id,
-        payment_reference_id=merchant_txn_id,  # idempotency key
-        razorpay_order_id=merchant_txn_id,
+        payment_reference_id=merchant_txn_id,
+        pg_order_id=merchant_txn_id,
         amount=Decimal(str(payable_amount)),
         status=PaymentStatus.CREATED,
-        payment_method="PHONEPE",
-        collected_by_type="PHONEPE",
+        payment_method=gateway_param,
+        collected_by_type=gateway_param,
     )
     db.add(payment)
     await db.commit()
@@ -1499,9 +1590,6 @@ async def process_balance_checkout(
         "status": "success",
         "checkout_data": {
             "booking_public_id": booking.public_id,
-            "razorpay_order_id": merchant_txn_id,
-            "redirect_url": phonepe_order.get("redirect_url"),
-            "amount": phonepe_order.get("amount"), # in paise
-            "currency": "INR",
+            **balance_response,
         }
     }

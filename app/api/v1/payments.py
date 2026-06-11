@@ -15,35 +15,13 @@ from app.models.package import PackageVariantInventory
 from app.models.room import RoomSlotInventory
 from app.models.coupon import Coupon
 from app.models.enums import BookingStatus, BookingSource, GenderType
-from app.services.razorpay_client import razorpay_service
 from app.services.phonepe_client import phonepe_service
+from app.services.cashfree_client import cashfree_service
 from app.core.security import AadharCryptography, AadharHashing
 from app.core.timezone import get_ist_now
 
 router = APIRouter()
 
-class VerifyPaymentRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
-
-class PaymentFailureRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: Optional[str] = None
-    error_code: Optional[str] = None
-    error_description: Optional[str] = None
-    error_source: Optional[str] = None
-    error_step: Optional[str] = None
-    error_reason: Optional[str] = None
-
-def _failure_description(req: PaymentFailureRequest) -> str:
-    parts = [
-        req.error_description,
-        f"source={req.error_source}" if req.error_source else None,
-        f"step={req.error_step}" if req.error_step else None,
-        f"reason={req.error_reason}" if req.error_reason else None,
-    ]
-    return " | ".join(p for p in parts if p)[:1000]
 
 async def _finalize_draft(
     draft: BookingDraft,
@@ -56,17 +34,18 @@ async def _finalize_draft(
     """
     Idempotent function to convert BookingDraft to Booking.
     Returns the public_id of the generated Booking.
+    Works for both PhonePe and Cashfree.
     """
-    # 1. Double check if a booking already exists for this order_id
+    # 1. Double check if a booking already exists for this transaction
     existing_booking = await db.execute(
-        select(Booking).where(Booking.pricing_snapshot['razorpay_order_id'].astext == draft.razorpay_order_id)
+        select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == draft.pg_transaction_id)
     )
     existing = existing_booking.scalar_one_or_none()
     if existing:
-        logger.info(f"Booking already finalized for order {draft.razorpay_order_id}")
+        logger.info(f"Booking already finalized for transaction {draft.pg_transaction_id}")
         return existing.public_id
 
-    # 2. Promote reserved_count -> booked_count in inventory
+    # 2. Promote reserved_count → booked_count in inventory
     if draft.target_type == 'package':
         inv_query = select(PackageVariantInventory).where(
             PackageVariantInventory.variant_id == draft.variant_id,
@@ -75,16 +54,13 @@ async def _finalize_draft(
         inv_res = await db.execute(inv_query)
         inventory = inv_res.scalar_one_or_none()
         if inventory:
-            # Shift quantity from reserved to booked
             inventory.reserved_count = max(0, inventory.reserved_count - draft.quantity)
             inventory.booked_count += draft.quantity
-            
+
             await db.flush()
             if sse_payloads is not None:
                 import time
                 from app.core.timezone import get_ist_now
-                # effective price lookup requires PackageVariant. We can retrieve it, or just omit if frontend handles patch
-                # But strict payload rule says full payload. Let's fetch it.
                 from app.models.package import PackageVariant
                 v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == draft.variant_id))
                 variant = v_res.scalar_one_or_none()
@@ -106,24 +82,22 @@ async def _finalize_draft(
                     })
 
     elif draft.target_type == 'room':
-        # Re-evaluate stay dates from payload
         payload = draft.checkout_payload
         from datetime import date, timedelta, time
         arrival = date.fromisoformat(payload['travel_date'])
         departure_str = payload.get('departure_date')
         departure = date.fromisoformat(departure_str) if departure_str else (arrival + timedelta(days=1))
-        
+
         current = arrival
         stay_dates = []
         while current < departure:
             stay_dates.append(current)
             current += timedelta(days=1)
-            
+
         slot_start = time.fromisoformat(payload['slot_start']) if payload.get('slot_start') else None
         slot_end = time.fromisoformat(payload['slot_end']) if payload.get('slot_end') else None
 
         from app.models.room import RoomVariant
-        # Calculate required rooms
         room_var = await db.execute(select(RoomVariant).where(RoomVariant.id == draft.room_variant_id))
         rv = room_var.scalar_one()
         from app.services.room_calculation import calculate_required_rooms
@@ -144,8 +118,9 @@ async def _finalize_draft(
 
     # 3. Prepare pricing snapshot
     snapshot = draft.pricing_snapshot
-    snapshot["razorpay_order_id"] = draft.razorpay_order_id
-    snapshot["razorpay_payment_id"] = payment_id
+    snapshot["pg_transaction_id"] = draft.pg_transaction_id
+    snapshot["pg_payment_id"] = payment_id
+    snapshot["payment_gateway"] = payment_source
     if draft.target_type == 'room':
         snapshot["slot_start"] = draft.checkout_payload.get('slot_start')
         snapshot["slot_end"] = draft.checkout_payload.get('slot_end')
@@ -158,15 +133,13 @@ async def _finalize_draft(
         if coupon:
             coupon.usage_count += 1
 
-    # 5. Calculate payment status based on TOURIST perspective
-    # The database must explicitly reflect what the tourist sees (the full amount).
-    # The agent's actual payment amount is properly tracked via the Payment table records.
+    # 5. Calculate payment status
     tourist_total = Decimal(snapshot['tourist_total'])
     tourist_amount_payable = Decimal(snapshot.get('tourist_amount_payable', str(draft.amount_payable)))
-    
+
     tourist_remaining = (tourist_total - tourist_amount_payable).quantize(Decimal("0.01"))
     tourist_remaining = max(Decimal("0.00"), tourist_remaining)
-    
+
     if tourist_remaining <= Decimal("0.01"):
         booking_status = BookingStatus.FULLY_PAID
         tourist_remaining = Decimal("0.00")
@@ -180,9 +153,6 @@ async def _finalize_draft(
         seq_val = seq_res.scalar()
         public_id = f"TBT_AC_{seq_val}"
     else:
-        # Determine if Boat Ride (TRIP -> SS, TOUR -> BT based on previous discussion, wait:
-        # user said: "as we did a tour and trip", I proposed TOUR = BT, TRIP = SS
-        # Let's fetch PackageType
         from app.models.package import PackageVariant, Package
         from app.models.enums import PackageType
         pkg_res = await db.execute(
@@ -191,13 +161,12 @@ async def _finalize_draft(
             .where(PackageVariant.id == draft.variant_id)
         )
         pkg_type = pkg_res.scalar_one_or_none()
-        
+
         if pkg_type == PackageType.TRIP:
             seq_res = await db.execute(text("SELECT nextval('booking_seq_ss')"))
             seq_val = seq_res.scalar()
             public_id = f"TBT_SS_{seq_val}"
         else:
-            # Default to Boat Ride (TOUR)
             seq_res = await db.execute(text("SELECT nextval('booking_seq_bt')"))
             seq_val = seq_res.scalar()
             public_id = f"TBT_BT_{seq_val}"
@@ -241,7 +210,6 @@ async def _finalize_draft(
             except (ValueError, KeyError):
                 pass
 
-        # Aadhaar: encrypt only if provided (optional for children <18)
         raw_aadhaar = (p.get('aadhaar') or '').strip()
         encrypted_aadhaar = crypto.encrypt(raw_aadhaar) if raw_aadhaar else None
         hashed_aadhaar = AadharHashing.hash_aadhar(raw_aadhaar) if raw_aadhaar else None
@@ -264,9 +232,9 @@ async def _finalize_draft(
     from app.models.enums import PaymentStatus
     payment_record = Payment(
         booking_id=booking.id,
-        payment_reference_id=draft.razorpay_order_id,  # idempotency key
-        razorpay_order_id=draft.razorpay_order_id,
-        razorpay_payment_id=payment_id,
+        payment_reference_id=draft.pg_transaction_id,  # idempotency key
+        pg_order_id=draft.pg_transaction_id,
+        pg_payment_id=payment_id,
         amount=draft.amount_payable,
         status=PaymentStatus.CAPTURED,
         payment_method=payment_source,
@@ -279,7 +247,7 @@ async def _finalize_draft(
         for sd in stay_dates:
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
-    # 7. Trigger ticket and invoice PDF generation tasks asynchronously (fire and forget)
+    # 7. Trigger document generation asynchronously
     async def _enqueue_documents_task_safe(b_id: int, p_id: str, is_fully_paid: bool):
         try:
             from app.worker import get_arq_pool
@@ -298,297 +266,7 @@ async def _finalize_draft(
     return booking.public_id
 
 
-@router.post("/verify-payment")
-async def verify_payment(
-    request: VerifyPaymentRequest,
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Frontend calls this immediately after Razorpay success callback.
-    Verifies signature and finalizes the booking draft or balance payment.
-    """
-    is_valid = razorpay_service.verify_signature(
-        order_id=request.razorpay_order_id,
-        payment_id=request.razorpay_payment_id,
-        signature=request.razorpay_signature
-    )
-    
-    if not is_valid:
-        raise HTTPException(status_code=400, detail="Invalid payment signature")
-
-    # Lock draft to prevent webhook race condition
-    draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == request.razorpay_order_id).with_for_update()
-    res = await db.execute(draft_query)
-    draft = res.scalar_one_or_none()
-
-    if not draft:
-        # Check if booking already finalized by webhook
-        existing = await db.execute(
-            select(Booking).where(Booking.pricing_snapshot['razorpay_order_id'].astext == request.razorpay_order_id)
-        )
-        booking = existing.scalar_one_or_none()
-        if booking:
-            return {"status": "success", "booking_id": booking.public_id}
-            
-        # Check if this is a balance payment
-        from app.models.payment import Payment
-        from app.models.enums import PaymentStatus
-        from sqlalchemy import func
-        
-        payment_stmt = select(Payment).where(
-            Payment.razorpay_order_id == request.razorpay_order_id
-        ).with_for_update()
-        p_res = await db.execute(payment_stmt)
-        payment = p_res.scalar_one_or_none()
-        
-        if payment:
-            booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
-            bk_res = await db.execute(booking_stmt)
-            booking = bk_res.scalar_one()
-
-            if payment.status != PaymentStatus.CAPTURED:
-                # Idempotency: check if this razorpay_payment_id was already captured
-                already_captured = await db.execute(
-                    select(Payment).where(
-                        Payment.razorpay_payment_id == request.razorpay_payment_id,
-                        Payment.status == PaymentStatus.CAPTURED
-                    )
-                )
-                if already_captured.scalar_one_or_none():
-                    return {"status": "success", "booking_id": booking.public_id}
-
-                payment.status = PaymentStatus.CAPTURED
-                payment.razorpay_payment_id = request.razorpay_payment_id
-                payment.razorpay_signature = request.razorpay_signature
-
-                # Recompute all balances from ledger — no manual arithmetic
-                from app.utils.ledger import recompute_booking_ledger
-                booking = await recompute_booking_ledger(booking.id, db)
-
-            # Use background tasks for balance payments too to prevent blocking
-            async def _enqueue_bal_task(b_id: int, is_fully_paid: bool):
-                try:
-                    from app.worker import get_arq_pool
-                    arq_pool = await get_arq_pool()
-                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
-                except Exception as arq_err:
-                    logger.warning(f"Failed to enqueue post-booking documents task for balance payment: {arq_err}")
-
-            if payment.status == PaymentStatus.CAPTURED:
-                background_tasks.add_task(_enqueue_bal_task, booking.id, booking.status == BookingStatus.FULLY_PAID)
-
-            await db.commit()
-            return {"status": "success", "booking_id": booking.public_id}
-            
-        raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
-
-    sse_payloads = []
-    public_id = await _finalize_draft(draft, request.razorpay_payment_id, db, background_tasks, sse_payloads, payment_source="RAZORPAY")
-    await db.commit()
-    
-    # Immediately invalidate L1+L2 cache so inventory/availability is live for next visitor
-    from app.utils.cache import clear_cache_prefix
-    if draft.target_type == 'package':
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix(f"packages:detail:")
-    elif draft.target_type == 'room':
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
-    
-    from app.utils.sse import sse_manager
-    for p in sse_payloads:
-        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-    
-    return {"status": "success", "booking_id": public_id}
-
-
-@router.post("/record-failure")
-async def record_payment_failure(
-    failure: PaymentFailureRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Persist Razorpay failure details for retryable balance-payment attempts.
-    Initial booking failures are draft-based, so they are logged and released by
-    the existing draft cleanup worker unless a later success/webhook arrives.
-    """
-    from app.models.payment import Payment
-    from app.models.enums import PaymentStatus
-
-    payment_stmt = (
-        select(Payment)
-        .where(Payment.razorpay_order_id == failure.razorpay_order_id)
-        .with_for_update()
-    )
-    result = await db.execute(payment_stmt)
-    payment = result.scalar_one_or_none()
-
-    if not payment:
-        draft_res = await db.execute(
-            select(BookingDraft)
-            .where(BookingDraft.razorpay_order_id == failure.razorpay_order_id)
-            .with_for_update()
-        )
-        draft = draft_res.scalar_one_or_none()
-        if draft:
-            from app.workers.draft_cleanup import release_draft_inventory
-            sse_payloads = await release_draft_inventory(draft, db)
-            await db.delete(draft)
-            await db.commit()
-
-            from app.utils.sse import sse_manager
-            for p in sse_payloads or []:
-                await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-
-            logger.info(
-                f"Released draft {draft.draft_id} after Razorpay failure/dismissal "
-                f"for order {failure.razorpay_order_id}"
-            )
-            return {"status": "ok"}
-
-        logger.info(
-            f"Razorpay failure for draft/unknown order {failure.razorpay_order_id}: "
-            f"{failure.error_code or 'unknown'} {failure.error_description or ''}"
-        )
-        return {"status": "ok"}
-
-    if payment.status == PaymentStatus.CAPTURED:
-        logger.info(f"Ignoring failure for already captured order {failure.razorpay_order_id}")
-        return {"status": "ok"}
-
-    payment.status = PaymentStatus.FAILED
-    payment.razorpay_payment_id = failure.razorpay_payment_id
-    payment.error_code = failure.error_code
-    payment.error_description = _failure_description(failure)
-    await db.commit()
-    return {"status": "ok"}
-
-
-@router.post("/webhook/razorpay")
-async def razorpay_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Final Authority for payment confirmation.
-    Verifies HMAC signature before processing.
-    """
-    payload = await request.body()
-    signature = request.headers.get("x-razorpay-signature")
-    
-    # Verify webhook HMAC signature
-    if not razorpay_service.verify_webhook_signature(payload, signature or ""):
-        logger.warning(f"Webhook signature verification failed. Rejecting payload.")
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
-    
-    try:
-        data = json.loads(payload)
-        event = data.get("event")
-        
-        if event == "payment.failed":
-            payment_entity = data.get("payload", {}).get("payment", {}).get("entity", {})
-            order_id = payment_entity.get("order_id")
-            if order_id:
-                from app.models.payment import Payment
-                from app.models.enums import PaymentStatus
-
-                p_res = await db.execute(
-                    select(Payment)
-                    .where(Payment.razorpay_order_id == order_id)
-                    .with_for_update()
-                )
-                payment = p_res.scalar_one_or_none()
-                if payment and payment.status != PaymentStatus.CAPTURED:
-                    payment.status = PaymentStatus.FAILED
-                    payment.razorpay_payment_id = payment_entity.get("id")
-                    payment.error_code = payment_entity.get("error_code")
-                    payment.error_description = payment_entity.get("error_description")
-                    await db.commit()
-                    logger.info(f"Webhook marked Razorpay payment failed for order {order_id}")
-
-        if event == "payment.captured" or event == "order.paid":
-            payment_entity = data.get("payload", {}).get("payment", {}).get("entity", {})
-            order_id = payment_entity.get("order_id")
-            payment_id = payment_entity.get("id")
-            
-            if order_id:
-                # Lock draft
-                draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == order_id).with_for_update()
-                res = await db.execute(draft_query)
-                draft = res.scalar_one_or_none()
-
-                if draft:
-                    sse_payloads = []
-                    target_type = draft.target_type
-                    public_id = await _finalize_draft(draft, payment_id, db, sse_payloads=sse_payloads, payment_source="RAZORPAY")
-                    await db.commit()
-                    
-                    # Invalidate L1+L2 cache immediately
-                    from app.utils.cache import clear_cache_prefix
-                    if target_type == 'package':
-                        clear_cache_prefix("packages:list:")
-                        clear_cache_prefix("packages:detail:")
-                    elif target_type == 'room':
-                        clear_cache_prefix("rooms:list:")
-                        clear_cache_prefix("rooms:detail:")
-                    
-                    from app.utils.sse import sse_manager
-                    for p in sse_payloads:
-                        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-                    finalized_booking = await db.execute(
-                        select(Booking).where(Booking.public_id == public_id).limit(1)
-                    )
-                    booking = finalized_booking.scalar_one_or_none()
-                    if booking:
-                        try:
-                            from app.worker import get_arq_pool
-                            arq_pool = await get_arq_pool()
-                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
-                        except Exception as arq_err:
-                            logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
-                    logger.info(f"Webhook finalized booking for order {order_id}")
-                else:
-                    # Check if this is a balance payment
-                    from app.models.payment import Payment
-                    from app.models.enums import PaymentStatus
-
-                    payment_stmt = select(Payment).where(
-                        Payment.razorpay_order_id == order_id
-                    ).with_for_update()
-                    p_res = await db.execute(payment_stmt)
-                    payment = p_res.scalar_one_or_none()
-
-                    if payment and payment.status != PaymentStatus.CAPTURED:
-                        payment.status = PaymentStatus.CAPTURED
-                        payment.razorpay_payment_id = payment_id
-
-                        # Recompute balances from ledger
-                        from app.utils.ledger import recompute_booking_ledger
-                        booking = await recompute_booking_ledger(payment.booking_id, db)
-
-                        try:
-                            from app.worker import get_arq_pool
-                            arq_pool = await get_arq_pool()
-                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
-                        except Exception as arq_err:
-                            logger.warning(f"Failed to enqueue post-booking documents task from webhook: {arq_err}")
-
-                        await db.commit()
-                        logger.info(f"Webhook finalized balance payment for order {order_id}")
-                    
-    except Exception as e:
-        logger.error(f"Webhook processing failed: {str(e)}")
-        await db.rollback()
-        return {"status": "error"}
-        
-    except Exception as e:
-        logger.error(f"Webhook processing failed: {str(e)}")
-        await db.rollback()
-        return {"status": "error"}
-        
-    return {"status": "ok"}
-
+# ─── PhonePe: Verify Status (polling after redirect) ─────────────────────────
 
 @router.get("/verify-status")
 async def verify_status(
@@ -597,7 +275,7 @@ async def verify_status(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Frontend queries this endpoint to verify payment status of a PhonePe transaction.
+    Frontend polls this after PhonePe redirect to check payment status.
     If success, booking is finalized.
     """
     check_res = await phonepe_service.get_transaction_status(transaction_id)
@@ -607,8 +285,7 @@ async def verify_status(
     if status_str == "PENDING":
         return {"status": "pending", "message": "Transaction is pending verification."}
     elif status_str == "FAILED":
-        # Check if draft exists to clean it up (releasing inventory)
-        draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == transaction_id).with_for_update()
+        draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == transaction_id).with_for_update()
         res = await db.execute(draft_query)
         draft = res.scalar_one_or_none()
         if draft:
@@ -616,46 +293,45 @@ async def verify_status(
             sse_payloads = await release_draft_inventory(draft, db)
             await db.delete(draft)
             await db.commit()
-            
+
             from app.utils.sse import sse_manager
             for p in sse_payloads or []:
                 await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
         return {"status": "failed", "message": "Transaction failed."}
 
     # Lock draft to prevent webhook race condition
-    draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == transaction_id).with_for_update()
+    draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == transaction_id).with_for_update()
     res = await db.execute(draft_query)
     draft = res.scalar_one_or_none()
 
     if not draft:
-        # Check if booking already finalized by webhook
+        # Check if booking already finalized
         existing = await db.execute(
-            select(Booking).where(Booking.pricing_snapshot['razorpay_order_id'].astext == transaction_id)
+            select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == transaction_id)
         )
         booking = existing.scalar_one_or_none()
         if booking:
             return {"status": "success", "booking_id": booking.public_id}
-            
+
         # Check if this is a balance payment
         from app.models.payment import Payment
         from app.models.enums import PaymentStatus
-        
+
         payment_stmt = select(Payment).where(
-            Payment.razorpay_order_id == transaction_id
+            Payment.pg_order_id == transaction_id
         ).with_for_update()
         p_res = await db.execute(payment_stmt)
         payment = p_res.scalar_one_or_none()
-        
+
         if payment:
             booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
             bk_res = await db.execute(booking_stmt)
             booking = bk_res.scalar_one()
 
             if payment.status != PaymentStatus.CAPTURED:
-                # Idempotency check
                 already_captured = await db.execute(
                     select(Payment).where(
-                        Payment.razorpay_payment_id == payment_id,
+                        Payment.pg_payment_id == payment_id,
                         Payment.status == PaymentStatus.CAPTURED
                     )
                 )
@@ -663,7 +339,7 @@ async def verify_status(
                     return {"status": "success", "booking_id": booking.public_id}
 
                 payment.status = PaymentStatus.CAPTURED
-                payment.razorpay_payment_id = payment_id
+                payment.pg_payment_id = payment_id
 
                 from app.utils.ledger import recompute_booking_ledger
                 booking = await recompute_booking_ledger(booking.id, db)
@@ -681,14 +357,13 @@ async def verify_status(
 
             await db.commit()
             return {"status": "success", "booking_id": booking.public_id}
-            
+
         raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
 
     sse_payloads = []
     public_id = await _finalize_draft(draft, payment_id, db, background_tasks, sse_payloads, payment_source="PHONEPE")
     await db.commit()
-    
-    # Invalidate cache
+
     from app.utils.cache import clear_cache_prefix
     if draft.target_type == 'package':
         clear_cache_prefix("packages:list:")
@@ -696,13 +371,116 @@ async def verify_status(
     elif draft.target_type == 'room':
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
-    
+
     from app.utils.sse import sse_manager
     for p in sse_payloads:
         await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-    
+
     return {"status": "success", "booking_id": public_id}
 
+
+# ─── Cashfree: Verify Status (polling after popup closes) ────────────────────
+
+@router.get("/verify-cashfree-status")
+async def verify_cashfree_status(
+    order_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Frontend polls this after the Cashfree popup closes to check payment status.
+    order_id = the pg_transaction_id (Cashfree order ID) created during checkout.
+    """
+    check_res = await cashfree_service.get_order_status(order_id)
+    order_status = check_res.get("status")  # PAID | ACTIVE | EXPIRED | CANCELLED | ERROR
+    payment_id = check_res.get("pg_payment_id")
+
+    if order_status == "ACTIVE":
+        return {"status": "pending", "message": "Payment is still being processed."}
+    elif order_status in ("EXPIRED", "CANCELLED", "ERROR"):
+        # Release draft inventory
+        draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
+        res = await db.execute(draft_query)
+        draft = res.scalar_one_or_none()
+        if draft:
+            from app.workers.draft_cleanup import release_draft_inventory
+            sse_payloads = await release_draft_inventory(draft, db)
+            await db.delete(draft)
+            await db.commit()
+            from app.utils.sse import sse_manager
+            for p in sse_payloads or []:
+                await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+        return {"status": "failed", "message": "Payment was not completed."}
+
+    if order_status != "PAID":
+        return {"status": "pending", "message": "Payment status unknown. Please wait."}
+
+    # PAID — finalize booking
+    draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
+    res = await db.execute(draft_query)
+    draft = res.scalar_one_or_none()
+
+    if not draft:
+        # Already finalized?
+        existing = await db.execute(
+            select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == order_id)
+        )
+        booking = existing.scalar_one_or_none()
+        if booking:
+            return {"status": "success", "booking_id": booking.public_id}
+
+        # Balance payment?
+        from app.models.payment import Payment
+        from app.models.enums import PaymentStatus
+        payment_stmt = select(Payment).where(Payment.pg_order_id == order_id).with_for_update()
+        p_res = await db.execute(payment_stmt)
+        payment = p_res.scalar_one_or_none()
+
+        if payment:
+            booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
+            bk_res = await db.execute(booking_stmt)
+            booking = bk_res.scalar_one()
+
+            if payment.status != PaymentStatus.CAPTURED:
+                payment.status = PaymentStatus.CAPTURED
+                payment.pg_payment_id = payment_id
+                from app.utils.ledger import recompute_booking_ledger
+                booking = await recompute_booking_ledger(booking.id, db)
+
+            async def _enqueue_cashfree_bal(b_id: int, is_fully_paid: bool):
+                try:
+                    from app.worker import get_arq_pool
+                    arq_pool = await get_arq_pool()
+                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
+                except Exception as arq_err:
+                    logger.warning(f"Failed to enqueue documents task: {arq_err}")
+
+            background_tasks.add_task(_enqueue_cashfree_bal, booking.id, booking.status == BookingStatus.FULLY_PAID)
+            await db.commit()
+            return {"status": "success", "booking_id": booking.public_id}
+
+        raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
+
+    sse_payloads = []
+    public_id = await _finalize_draft(draft, payment_id, db, background_tasks, sse_payloads, payment_source="CASHFREE")
+    await db.commit()
+
+    from app.utils.cache import clear_cache_prefix
+    if draft.target_type == 'package':
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+    elif draft.target_type == 'room':
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+
+    from app.utils.sse import sse_manager
+    for p in sse_payloads:
+        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+
+    return {"status": "success", "booking_id": public_id}
+
+
+# ─── PhonePe Webhook ──────────────────────────────────────────────────────────
 
 @router.post("/webhook/phonepe")
 async def phonepe_webhook(
@@ -727,13 +505,11 @@ async def phonepe_webhook(
     if not response_base64:
         raise HTTPException(status_code=400, detail="Missing response payload")
 
-    # Verify signature
     is_valid = phonepe_service.verify_webhook_signature(response_base64, signature)
     if not is_valid:
         logger.warning("PhonePe Webhook signature verification failed.")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    # Decode payload
     try:
         decoded_bytes = base64.b64decode(response_base64)
         payload = json.loads(decoded_bytes)
@@ -744,7 +520,7 @@ async def phonepe_webhook(
     success = payload.get("success")
     code = payload.get("code")
     payload_data = payload.get("data", {})
-    
+
     merchant_txn_id = payload_data.get("merchantTransactionId")
     gateway_payment_id = payload_data.get("transactionId")
     payment_instrument = payload_data.get("paymentInstrument", {}).get("type")
@@ -755,8 +531,7 @@ async def phonepe_webhook(
 
     try:
         if success and code == "PAYMENT_SUCCESS":
-            # Lock draft
-            draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == merchant_txn_id).with_for_update()
+            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == merchant_txn_id).with_for_update()
             res = await db.execute(draft_query)
             draft = res.scalar_one_or_none()
 
@@ -765,8 +540,7 @@ async def phonepe_webhook(
                 target_type = draft.target_type
                 public_id = await _finalize_draft(draft, gateway_payment_id, db, sse_payloads=sse_payloads, payment_source="PHONEPE")
                 await db.commit()
-                
-                # Invalidate cache
+
                 from app.utils.cache import clear_cache_prefix
                 if target_type == 'package':
                     clear_cache_prefix("packages:list:")
@@ -774,11 +548,11 @@ async def phonepe_webhook(
                 elif target_type == 'room':
                     clear_cache_prefix("rooms:list:")
                     clear_cache_prefix("rooms:detail:")
-                
+
                 from app.utils.sse import sse_manager
                 for p in sse_payloads:
                     await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-                
+
                 finalized_booking = await db.execute(
                     select(Booking).where(Booking.public_id == public_id).limit(1)
                 )
@@ -792,19 +566,19 @@ async def phonepe_webhook(
                         logger.warning(f"Failed to enqueue document tasks from PhonePe webhook: {arq_err}")
                 logger.info(f"PhonePe Webhook finalized booking for transaction {merchant_txn_id}")
             else:
-                # Check balance payment
+                # Balance payment
                 from app.models.payment import Payment
                 from app.models.enums import PaymentStatus
 
                 payment_stmt = select(Payment).where(
-                    Payment.razorpay_order_id == merchant_txn_id
+                    Payment.pg_order_id == merchant_txn_id
                 ).with_for_update()
                 p_res = await db.execute(payment_stmt)
                 payment = p_res.scalar_one_or_none()
 
                 if payment and payment.status != PaymentStatus.CAPTURED:
                     payment.status = PaymentStatus.CAPTURED
-                    payment.razorpay_payment_id = gateway_payment_id
+                    payment.pg_payment_id = gateway_payment_id
                     if payment_instrument:
                         payment.payment_method = payment_instrument
 
@@ -821,8 +595,8 @@ async def phonepe_webhook(
                     await db.commit()
                     logger.info(f"PhonePe Webhook finalized balance payment for transaction {merchant_txn_id}")
         else:
-            # Payment failed/error webhook
-            draft_query = select(BookingDraft).where(BookingDraft.razorpay_order_id == merchant_txn_id).with_for_update()
+            # Payment failed
+            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == merchant_txn_id).with_for_update()
             res = await db.execute(draft_query)
             draft = res.scalar_one_or_none()
             if draft:
@@ -830,7 +604,7 @@ async def phonepe_webhook(
                 sse_payloads = await release_draft_inventory(draft, db)
                 await db.delete(draft)
                 await db.commit()
-                
+
                 from app.utils.sse import sse_manager
                 for p in sse_payloads or []:
                     await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
@@ -840,7 +614,7 @@ async def phonepe_webhook(
                 from app.models.enums import PaymentStatus
 
                 payment_stmt = select(Payment).where(
-                    Payment.razorpay_order_id == merchant_txn_id
+                    Payment.pg_order_id == merchant_txn_id
                 ).with_for_update()
                 p_res = await db.execute(payment_stmt)
                 payment = p_res.scalar_one_or_none()
@@ -852,6 +626,120 @@ async def phonepe_webhook(
                     logger.info(f"PhonePe Webhook marked balance payment failed for transaction {merchant_txn_id}")
     except Exception as e:
         logger.error(f"PhonePe Webhook processing failed: {str(e)}")
+        await db.rollback()
+        return {"status": "error"}
+
+    return {"status": "ok"}
+
+
+# ─── Cashfree Webhook (optional — we use polling as primary) ──────────────────
+
+@router.post("/webhook/cashfree")
+async def cashfree_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Cashfree S2S Webhook — fires on payment events.
+    We use polling (verify-cashfree-status) as primary, but this handles edge cases.
+    """
+    body_bytes = await request.body()
+    raw_body = body_bytes.decode("utf-8")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    signature = request.headers.get("x-webhook-signature", "")
+
+    is_valid = cashfree_service.verify_webhook_signature(timestamp, raw_body, signature)
+    if not is_valid:
+        logger.warning("Cashfree Webhook signature verification failed.")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    try:
+        data = json.loads(raw_body)
+        event_type = data.get("type", "")
+        order_data = data.get("data", {}).get("order", {})
+        payment_data = data.get("data", {}).get("payment", {})
+
+        order_id = order_data.get("order_id")
+        payment_status = payment_data.get("payment_status")  # SUCCESS | FAILED | USER_DROPPED
+        cf_payment_id = str(payment_data.get("cf_payment_id", "") or "")
+
+        if not order_id:
+            return {"status": "ok"}
+
+        if payment_status == "SUCCESS":
+            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
+            res = await db.execute(draft_query)
+            draft = res.scalar_one_or_none()
+
+            if draft:
+                sse_payloads = []
+                target_type = draft.target_type
+                public_id = await _finalize_draft(draft, cf_payment_id, db, sse_payloads=sse_payloads, payment_source="CASHFREE")
+                await db.commit()
+
+                from app.utils.cache import clear_cache_prefix
+                if target_type == 'package':
+                    clear_cache_prefix("packages:list:")
+                    clear_cache_prefix("packages:detail:")
+                elif target_type == 'room':
+                    clear_cache_prefix("rooms:list:")
+                    clear_cache_prefix("rooms:detail:")
+
+                from app.utils.sse import sse_manager
+                for p in sse_payloads:
+                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+
+                finalized_booking = await db.execute(
+                    select(Booking).where(Booking.public_id == public_id).limit(1)
+                )
+                booking = finalized_booking.scalar_one_or_none()
+                if booking:
+                    try:
+                        from app.worker import get_arq_pool
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                    except Exception as arq_err:
+                        logger.warning(f"Failed to enqueue document tasks from Cashfree webhook: {arq_err}")
+                logger.info(f"Cashfree Webhook finalized booking for order {order_id}")
+            else:
+                # Balance payment
+                from app.models.payment import Payment
+                from app.models.enums import PaymentStatus
+                payment_stmt = select(Payment).where(Payment.pg_order_id == order_id).with_for_update()
+                p_res = await db.execute(payment_stmt)
+                payment = p_res.scalar_one_or_none()
+
+                if payment and payment.status != PaymentStatus.CAPTURED:
+                    payment.status = PaymentStatus.CAPTURED
+                    payment.pg_payment_id = cf_payment_id
+                    from app.utils.ledger import recompute_booking_ledger
+                    booking = await recompute_booking_ledger(payment.booking_id, db)
+                    try:
+                        from app.worker import get_arq_pool
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                    except Exception as arq_err:
+                        logger.warning(f"Failed to enqueue documents task from Cashfree webhook: {arq_err}")
+                    await db.commit()
+                    logger.info(f"Cashfree Webhook finalized balance payment for order {order_id}")
+
+        elif payment_status in ("FAILED", "USER_DROPPED"):
+            # Release draft inventory if payment failed
+            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
+            res = await db.execute(draft_query)
+            draft = res.scalar_one_or_none()
+            if draft:
+                from app.workers.draft_cleanup import release_draft_inventory
+                sse_payloads = await release_draft_inventory(draft, db)
+                await db.delete(draft)
+                await db.commit()
+                from app.utils.sse import sse_manager
+                for p in sse_payloads or []:
+                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                logger.info(f"Cashfree Webhook released draft after payment {payment_status} for order {order_id}")
+
+    except Exception as e:
+        logger.error(f"Cashfree Webhook processing failed: {str(e)}")
         await db.rollback()
         return {"status": "error"}
 

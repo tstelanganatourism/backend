@@ -39,9 +39,10 @@ class Settings(BaseSettings):
     R2_SECRET_ACCESS_KEY: Optional[str] = None
     R2_BUCKET_NAME: Optional[str] = None
     
-    # Razorpay
-    RAZORPAY_KEY_ID: Optional[str] = None
-    RAZORPAY_KEY_SECRET: Optional[str] = None
+    # Cashfree
+    CASHFREE_APP_ID: Optional[str] = None
+    CASHFREE_SECRET_KEY: Optional[str] = None
+    CASHFREE_ENV: str = "PRODUCTION"  # PRODUCTION or TEST
     
     # PhonePe
     PHONEPE_MERCHANT_ID: Optional[str] = None

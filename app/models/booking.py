@@ -113,12 +113,15 @@ class CancellationRequest(BaseModel):
 
 class BookingDraft(BaseModel):
     """
-    Temporary hold for checkouts. Converted to Booking only on Razorpay Webhook success.
+    Temporary hold for checkouts. Converted to Booking only on payment webhook success.
+    Works for both PhonePe and Cashfree gateways.
     """
     __tablename__ = "booking_drafts"
 
     draft_id = Column(String, unique=True, nullable=False, index=True)
-    razorpay_order_id = Column(String, unique=True, nullable=True, index=True)
+    pg_transaction_id = Column(String, unique=True, nullable=True, index=True)  # PhonePe: merchant_txn_id | Cashfree: order_id
+    payment_gateway = Column(String(20), nullable=True, server_default="PHONEPE")  # PHONEPE | CASHFREE
+
     user_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     agent_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     

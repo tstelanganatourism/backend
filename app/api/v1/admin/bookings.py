@@ -401,7 +401,7 @@ async def admin_create_booking(
     current_admin: User = Depends(require_admin),
 ):
     """
-    Admin direct booking — bypasses Razorpay completely.
+    Admin direct booking — bypasses payment gateway completely.
     Creates a CONFIRMED booking, locks inventory directly.
     """
     import uuid
@@ -453,11 +453,11 @@ async def admin_create_booking(
         inv = inv_res.scalar_one_or_none()
 
         if inv is None:
-            # Auto-create an inventory row on the fly so booked_count is tracked
+            # Auto-create an inventory row on the fly
             inv = PackageVariantInventory(
                 variant_id=request.variant_id,
                 date=travel_date,
-                total_capacity=request.quantity,  # set to at least what admin is booking
+                total_capacity=0,  # Admin direct bookings do not occupy capacity, start at 0
                 booked_count=0,
                 reserved_count=0,
                 is_closed=False,
@@ -465,9 +465,7 @@ async def admin_create_booking(
             db.add(inv)
             await db.flush()
 
-        # Admin always goes through — just increase total_capacity if we'd go over
-        if inv.booked_count + request.quantity > inv.total_capacity:
-            inv.total_capacity = inv.booked_count + inv.reserved_count + request.quantity
+        # Admin direct bookings do not occupy capacity, so we do not adjust total_capacity here
 
         # Calculate subtotal using effective prices (use base variant prices if no override)
         eff_adult, eff_child = get_effective_package_prices(
@@ -520,8 +518,8 @@ async def admin_create_booking(
                 subtotal_amount += ref_cost
                 refreshment_subtotal = ref_cost
         
-        # Lock the seat in inventory
-        inv.booked_count += request.quantity
+        # Admin direct bookings do not occupy package inventory, so we do not increment booked_count here.
+        pass
 
     elif request.target_type == 'room':
         if not request.room_variant_id:
@@ -701,8 +699,8 @@ async def admin_create_booking(
         db.add(Payment(
             booking_id=booking.id,
             payment_reference_id=f"ADMIN_{booking.public_id}_{uuid.uuid4().hex[:8].upper()}",
-            razorpay_order_id=None,
-            razorpay_payment_id=None,
+            pg_order_id=None,
+            pg_payment_id=None,
             amount=paid_amount_val,
             status=PaymentStatus.CAPTURED,
             payment_method="ADMIN_MANUAL",
@@ -869,7 +867,7 @@ async def admin_cancel_booking(
     3. Perform calculations: deduct 35% fee if APPROVED and set refund_amount. Refund is manual.
     4. Release reserved seats/rooms back to inventories if booking is APPROVED.
     """
-    from app.models.enums import BookingStatus, CancellationStatus
+    from app.models.enums import BookingStatus, CancellationStatus, BookingSource
     from app.models.booking import CancellationRequest
     from loguru import logger
     from datetime import date, timedelta, time
@@ -937,10 +935,10 @@ async def admin_cancel_booking(
         inv_res = await db.execute(inv_stmt)
         inv = inv_res.scalar_one_or_none()
         if inv:
-            quantity = booking.adult_count + booking.child_count
-            inv.booked_count = max(0, inv.booked_count - quantity)
-            logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
-            
+            if booking.source != BookingSource.ADMIN_DIRECT:
+                quantity = booking.adult_count + booking.child_count
+                inv.booked_count = max(0, inv.booked_count - quantity)
+                logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
             await db.flush()
             import time
             from app.core.timezone import get_ist_now
@@ -1206,8 +1204,8 @@ async def _do_record_cash_payment(
     manual_payment = Payment(
         booking_id=booking.id,
         payment_reference_id=payment_reference_id,
-        razorpay_order_id=None,
-        razorpay_payment_id=None,
+        pg_order_id=None,
+        pg_payment_id=None,
         amount=record_amount,
         status=PaymentStatus.CAPTURED,
         payment_method=payment_method.upper(),

@@ -33,7 +33,7 @@ async def release_expired_drafts():
             return
 
         for draft in drafts:
-            logger.info(f"Releasing expired draft {draft.draft_id} for order {draft.razorpay_order_id}")
+            logger.info(f"Releasing expired draft {draft.draft_id} for order {draft.pg_transaction_id}")
             
             try:
                 if draft.target_type == 'package':

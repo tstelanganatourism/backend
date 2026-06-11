@@ -269,6 +269,28 @@ async def send_admin_booking_notification(
             f"Agent Commission ({commission_pct_meta}%)" if commission_pct_meta else "Agent Commission"
         )
 
+        # Determine actual payment method dynamically from the payment ledger
+        from app.models.enums import PaymentStatus
+        pm_label = "Agent Cash"
+        if hasattr(booking, "payments") and booking.payments:
+            captured_p = [p for p in booking.payments if p.status == PaymentStatus.CAPTURED]
+            if captured_p:
+                p_methods = []
+                for p in captured_p:
+                    m = (p.payment_method or p.collected_by_type or "").upper()
+                    if "CASHFREE" in m:
+                        p_methods.append("Cashfree")
+                    elif "PHONEPE" in m or "RAZORPAY" in m:
+                        p_methods.append("PhonePe")
+                    elif "CASH" in m:
+                        p_methods.append("Agent Cash")
+                    elif "BANK" in m:
+                        p_methods.append("Bank Transfer")
+                    else:
+                        p_methods.append(p.payment_method.capitalize() if p.payment_method else "Online")
+                if p_methods:
+                    pm_label = " & ".join(sorted(list(set(p_methods))))
+
         agent_section_html = f"""
         <!-- AGENT SECTION -->
         <tr>
@@ -313,7 +335,7 @@ async def send_admin_booking_notification(
               <!-- Payment Progress -->
               <div style="margin-top:14px;">
                 <div style="font-size:11px;font-weight:700;color:#92400e;text-transform:uppercase;
-                    letter-spacing:.6px;margin-bottom:6px;">Payment Progress (Agent Cash)</div>
+                    letter-spacing:.6px;margin-bottom:6px;">Payment Progress ({pm_label})</div>
                 <table width="100%" cellpadding="0" cellspacing="0" border="0">
                   <tr>
                     <td width="50%" style="background:#d1fae5;border-radius:6px 0 0 6px;

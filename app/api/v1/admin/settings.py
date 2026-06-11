@@ -24,7 +24,7 @@ class SystemSettingsUpdateDTO(BaseModel):
     address: Optional[str] = None
     gst_number: Optional[str] = None
     global_tax_percentage: Optional[int] = None
-    razorpay_key_id: Optional[str] = None
+    cashfree_app_id: Optional[str] = None
     booking_rules: Optional[str] = None
     cancellation_policies: Optional[str] = None
     social_links: Optional[Dict[str, Any]] = None

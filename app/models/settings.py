@@ -14,7 +14,7 @@ class SystemSettings(BaseModel):
     
     # Financials
     global_tax_percentage = Column(Integer, default=0, server_default="0") # e.g., 5 for 5%
-    razorpay_key_id = Column(String, nullable=True) # Public key can be stored here if dynamic, otherwise .env
+    cashfree_app_id = Column(String, nullable=True)  # Public App ID for Cashfree (stored for frontend reference)
     
     # Policies & Content (Stored as JSON or Text, rich text)
     booking_rules = Column(String, nullable=True)

@@ -10,7 +10,7 @@ passlib==1.7.4
 bcrypt==3.2.2
 redis==5.3.1
 cloudinary==1.44.2
-razorpay==2.0.1
+cashfree-pg==4.0.3
 resend==2.30.1
 python-multipart==0.0.29
 httpx==0.28.1
