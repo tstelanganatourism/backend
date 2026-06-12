@@ -28,6 +28,7 @@ class Booking(BaseModel):
     travel_date = Column(Date, nullable=False, index=True)
     adult_count = Column(Integer, default=1, server_default="1", nullable=False)
     child_count = Column(Integer, default=0, server_default="0", nullable=False)
+    student_count = Column(Integer, default=0, server_default="0", nullable=False)  # for student packages
     has_refreshment_addon = Column(Boolean, default=False, server_default="false", nullable=False)
 
     # Monetary Calculations (BR-08 / BR-09 / BR-10 / BR-11)
@@ -86,6 +87,7 @@ class BookingPassenger(BaseModel):
     phone_number = Column(String, nullable=True)
     relationship_to_lead = Column(String(50), nullable=True)
     is_primary = Column(Boolean, default=False, server_default="false", nullable=False)
+    student_class = Column(String(100), nullable=True)  # free-text class for student packages (e.g. "Class 5", "Inter 1st Year")
     
     # Secure Encrypted Aadhaar fields (BR-12) — nullable for children (<18)
     aadhar_encrypted = Column(String(512), nullable=True)

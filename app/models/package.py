@@ -31,6 +31,9 @@ class Package(BaseModel, SEOMixin):
     has_refreshments = Column(Boolean, default=False, server_default="false", nullable=False)
     refreshment_adult_price = Column(Numeric(10, 2), nullable=True)
     refreshment_child_price = Column(Numeric(10, 2), nullable=True)
+    # Student Package support
+    is_student_package = Column(Boolean, default=False, server_default="false", nullable=False)
+    refreshment_student_price = Column(Numeric(10, 2), nullable=True)  # per-student refreshment cost
     is_featured = Column(Boolean, default=False, server_default="false", nullable=False)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
     status = Column(SQLEnum(PublishStatus), default=PublishStatus.DRAFT, server_default="DRAFT", nullable=False, index=True)
@@ -137,6 +140,9 @@ class PackageVariant(BaseModel):
     child_price = Column(Numeric(10, 2), nullable=False)
     weekend_adult_price = Column(Numeric(10, 2), nullable=True)
     weekend_child_price = Column(Numeric(10, 2), nullable=True)
+    # Student Package pricing
+    student_price = Column(Numeric(10, 2), nullable=True)  # per-student price (used when package.is_student_package=True)
+    weekend_student_price = Column(Numeric(10, 2), nullable=True)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
 
     package = relationship("Package", back_populates="variants")
@@ -179,6 +185,9 @@ class PackageTransportOption(BaseModel):
     child_price = Column(Numeric(10, 2), nullable=True)
     weekend_adult_price = Column(Numeric(10, 2), nullable=True)
     weekend_child_price = Column(Numeric(10, 2), nullable=True)
+    # Student pricing for SHARED transport
+    student_price = Column(Numeric(10, 2), nullable=True)
+    weekend_student_price = Column(Numeric(10, 2), nullable=True)
     
     # Pricing for SEPARATE_VEHICLE
     fixed_price = Column(Numeric(10, 2), nullable=True)
