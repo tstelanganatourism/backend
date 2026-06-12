@@ -708,7 +708,7 @@ async def checkout(
 
     if selected_gateway == "CASHFREE":
         from app.services.cashfree_client import cashfree_service
-        cashfree_return_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
+        cashfree_return_url = f"{protocol}://{host}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
         cf_order = await cashfree_service.create_order(
             order_id=merchant_txn_id,
             amount=float(payable_amount),
