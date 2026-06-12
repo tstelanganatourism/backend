@@ -183,6 +183,7 @@ async def _finalize_draft(
         travel_date=draft.travel_date,
         adult_count=draft.checkout_payload.get('adult_count') or draft.quantity,
         child_count=draft.checkout_payload.get('child_count') or 0,
+        student_count=snapshot.get('student_count') or draft.checkout_payload.get('student_count') or 0,
         has_refreshment_addon=bool(snapshot.get('has_refreshment_addon', False)),
         subtotal_amount=Decimal(snapshot['subtotal_amount']),
         coupon_discount=Decimal(snapshot['coupon_discount']),
@@ -217,13 +218,14 @@ async def _finalize_draft(
         passenger = BookingPassenger(
             booking_id=booking.id,
             full_name=p['full_name'],
-            age=p['age'],
+            age=p.get('age') or 0,  # 0 = sentinel for student passengers (no age)
             gender=gender_enum,
             phone_number=p.get('phone'),
             relationship_to_lead=p.get('relationship'),
             is_primary=p.get('is_primary', False),
             aadhar_encrypted=encrypted_aadhaar,
             aadhar_hash=hashed_aadhaar,
+            student_class=p.get('student_class') or None,
         )
         db.add(passenger)
 

@@ -1,5 +1,6 @@
 from typing import Optional, List
 from datetime import date, timedelta
+from decimal import Decimal
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_, text
@@ -19,6 +20,11 @@ router = APIRouter()
 PUBLIC_CACHE_TTL_SECONDS = 60
 
 def get_active_paid_variants(pkg: Package) -> list[PackageVariant]:
+    if getattr(pkg, "is_student_package", False):
+        return [
+            v for v in pkg.variants
+            if v.is_active and not v.deleted_at and v.student_price and v.student_price > 0
+        ]
     return [
         v for v in pkg.variants
         if v.is_active and not v.deleted_at and v.adult_price and v.adult_price > 0
@@ -102,6 +108,7 @@ async def get_packages(
                 Package.brochure_pdf_url,
                 Package.generated_brochure_url,
                 Package.is_featured,
+                Package.is_student_package,
                 Package.starting_price,
                 Package.min_passengers,
                 func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
@@ -137,10 +144,12 @@ async def get_packages(
                 variants_by_pkg.setdefault(v.package_id, []).append(PackageVariantPublicDTO(
                     id=v.id,
                     title=v.title,
-                    adult_price=v.adult_price,
-                    child_price=v.child_price,
+                    adult_price=v.adult_price or Decimal("0.00"),
+                    child_price=v.child_price or Decimal("0.00"),
                     weekend_adult_price=v.weekend_adult_price,
                     weekend_child_price=v.weekend_child_price,
+                    student_price=v.student_price,
+                    weekend_student_price=v.weekend_student_price,
                     transport_info=None
                 ))
 
@@ -166,6 +175,7 @@ async def get_packages(
                 generated_brochure_url=gen_brochure_url,
                 cover_image_url=pkg.cover_image_url,
                 is_featured=pkg.is_featured,
+                is_student_package=pkg.is_student_package,
                 min_passengers=pkg.min_passengers or 1,
                 tags=pkg.tags_list or [],
                 starting_price=pkg.starting_price,
@@ -258,7 +268,10 @@ async def get_package_detail(
         pkg_policies = results[8]
         pkg_transport_options = results[9]
             
-        starting_price = min((v.adult_price for v in pkg_variants), default=None)
+        if pkg.is_student_package:
+            starting_price = min((v.student_price for v in pkg_variants if v.student_price is not None), default=None)
+        else:
+            starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
         
         from app.services.r2_storage import r2_service
         active_brochure_key = pkg.brochure_pdf_url or pkg.generated_brochure_url
@@ -282,6 +295,7 @@ async def get_package_detail(
             starting_price=starting_price,
             min_passengers=pkg.min_passengers or 1,
             # Transport & Refreshments
+            is_student_package=pkg.is_student_package or False,
             has_transport=pkg.has_transport or False,
             transport_options=[
                 TransportOptionPublicDTO(
@@ -293,6 +307,8 @@ async def get_package_detail(
                     child_price=t.child_price,
                     weekend_adult_price=t.weekend_adult_price,
                     weekend_child_price=t.weekend_child_price,
+                    student_price=t.student_price,
+                    weekend_student_price=t.weekend_student_price,
                     fixed_price=t.fixed_price,
                     weekend_fixed_price=t.weekend_fixed_price,
                 ) for t in pkg_transport_options
@@ -300,6 +316,7 @@ async def get_package_detail(
             has_refreshments=pkg.has_refreshments or False,
             refreshment_adult_price=pkg.refreshment_adult_price,
             refreshment_child_price=pkg.refreshment_child_price,
+            refreshment_student_price=pkg.refreshment_student_price,
             meta_title=pkg.meta_title,
             meta_description=pkg.meta_description,
             og_image_url=pkg.og_image_url,
@@ -308,10 +325,12 @@ async def get_package_detail(
                 PackageVariantPublicDTO(
                     id=v.id,
                     title=v.title,
-                    adult_price=v.adult_price,
-                    child_price=v.child_price,
+                    adult_price=v.adult_price or Decimal("0.00"),
+                    child_price=v.child_price or Decimal("0.00"),
                     weekend_adult_price=v.weekend_adult_price,
                     weekend_child_price=v.weekend_child_price,
+                    student_price=v.student_price,
+                    weekend_student_price=v.weekend_student_price,
                     transport_info=None
                 ) for v in pkg_variants
             ],
@@ -451,11 +470,28 @@ async def get_package_availability(
             inv = inv_map.get((variant.id, current))
 
             is_weekend = current.weekday() in (5, 6)
-            base_adult = variant.weekend_adult_price if is_weekend and variant.weekend_adult_price is not None else variant.adult_price
-            base_child = variant.weekend_child_price if is_weekend and variant.weekend_child_price is not None else variant.child_price
+            is_student = pkg.is_student_package
+
+            if is_student:
+                base_student = variant.weekend_student_price if is_weekend and variant.weekend_student_price is not None else variant.student_price
+                base_adult = Decimal("0.00")
+                base_child = Decimal("0.00")
+            else:
+                base_student = None
+                base_adult = variant.weekend_adult_price if is_weekend and variant.weekend_adult_price is not None else variant.adult_price
+                base_child = variant.weekend_child_price if is_weekend and variant.weekend_child_price is not None else variant.child_price
+
+            modifier = inv.price_override if (inv and inv.price_override is not None) else Decimal("0.00")
+            if is_student:
+                eff_student = max(Decimal("0.00"), (base_student or Decimal("0.00")) + modifier)
+                eff_adult = Decimal("0.00")
+                eff_child = Decimal("0.00")
+            else:
+                eff_student = None
+                eff_adult = max(Decimal("0.00"), (base_adult or Decimal("0.00")) + modifier)
+                eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
 
             if inv is None:
-                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, None)
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -465,13 +501,14 @@ async def get_package_availability(
                         child_price=base_child,
                         effective_adult_price=eff_adult,
                         effective_child_price=eff_child,
+                        student_price=base_student,
+                        effective_student_price=eff_student,
                         available_seats=0,
                         is_closed=False,
                         status="NO_INVENTORY",
                     )
                 )
             elif inv.is_closed:
-                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, inv.price_override)
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -481,13 +518,14 @@ async def get_package_availability(
                         child_price=base_child,
                         effective_adult_price=eff_adult,
                         effective_child_price=eff_child,
+                        student_price=base_student,
+                        effective_student_price=eff_student,
                         available_seats=max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count)),
                         is_closed=True,
                         status="CLOSED",
                     )
                 )
             else:
-                eff_adult, eff_child = get_effective_package_prices(base_adult, base_child, inv.price_override)
                 avail_seats = max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count))
                 slot_status = "OPEN" if avail_seats > 0 else "SOLD_OUT"
                 availability.append(
@@ -499,6 +537,8 @@ async def get_package_availability(
                         child_price=base_child,
                         effective_adult_price=eff_adult,
                         effective_child_price=eff_child,
+                        student_price=base_student,
+                        effective_student_price=eff_student,
                         available_seats=avail_seats,
                         is_closed=False,
                         status=slot_status,

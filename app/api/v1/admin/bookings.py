@@ -368,6 +368,7 @@ class AdminPassengerInput(BaseModel):
     aadhaar: Optional[str] = None
     relationship: Optional[str] = None
     is_primary: Optional[bool] = False
+    student_class: Optional[str] = Field(None, max_length=100)  # for student packages
 
 class AdminCreateBookingRequest(BaseModel):
     target_type: str  # 'package' or 'room'
@@ -377,6 +378,7 @@ class AdminCreateBookingRequest(BaseModel):
     room_variant_id: Optional[int] = None
     adult_count: Optional[int] = None
     child_count: Optional[int] = None
+    student_count: Optional[int] = None  # for student packages
     user_id: Optional[int] = None  # optional: assign to a registered user
     agent_id: Optional[int] = None  # optional: assign under an agent
     customer_email: Optional[str] = None # Tourist email (for admin direct / agent bookings)
@@ -432,10 +434,21 @@ async def admin_create_booking(
         variant = variant_result.scalar_one_or_none()
         if not variant:
             raise HTTPException(status_code=404, detail="Package variant not found")
-        
+
+        is_student_pkg = bool(getattr(variant.package, 'is_student_package', False))
+
+        if is_student_pkg:
+            student_count = request.student_count if request.student_count is not None else request.quantity
+            adult_count = 0
+            child_count = 0
+        else:
+            adult_count = request.adult_count or request.quantity
+            child_count = request.child_count or 0
+            student_count = 0
+
         # Minimum passengers check for admins/agents as well
         min_pax = getattr(variant.package, 'min_passengers', 1) or 1
-        total_passengers = adult_count + child_count
+        total_passengers = student_count if is_student_pkg else (adult_count + child_count)
         if total_passengers < min_pax:
             raise HTTPException(
                 status_code=400,
@@ -453,11 +466,10 @@ async def admin_create_booking(
         inv = inv_res.scalar_one_or_none()
 
         if inv is None:
-            # Auto-create an inventory row on the fly
             inv = PackageVariantInventory(
                 variant_id=request.variant_id,
                 date=travel_date,
-                total_capacity=0,  # Admin direct bookings do not occupy capacity, start at 0
+                total_capacity=0,
                 booked_count=0,
                 reserved_count=0,
                 is_closed=False,
@@ -465,14 +477,20 @@ async def admin_create_booking(
             db.add(inv)
             await db.flush()
 
-        # Admin direct bookings do not occupy capacity, so we do not adjust total_capacity here
-
-        # Calculate subtotal using effective prices (use base variant prices if no override)
-        eff_adult, eff_child = get_effective_package_prices(
-            variant.adult_price, variant.child_price, inv.price_override if hasattr(inv, 'price_override') else None
-        )
-        subtotal_amount = (Decimal(str(eff_adult)) * adult_count) + \
-                          (Decimal(str(eff_child)) * child_count)
+        # Calculate subtotal using effective prices
+        is_weekend_admin = travel_date.weekday() in (5, 6)
+        if is_student_pkg:
+            base_student_price = getattr(variant, 'student_price', None) or Decimal("0.00")
+            if is_weekend_admin and getattr(variant, 'weekend_student_price', None):
+                base_student_price = variant.weekend_student_price
+            eff_student = Decimal(str(base_student_price))
+            subtotal_amount = eff_student * student_count
+        else:
+            eff_adult, eff_child = get_effective_package_prices(
+                variant.adult_price, variant.child_price, inv.price_override if hasattr(inv, 'price_override') else None
+            )
+            subtotal_amount = (Decimal(str(eff_adult)) * adult_count) + \
+                              (Decimal(str(eff_child)) * child_count)
         
         # Transport pricing for admin direct booking
         transport_snapshot_items = []
@@ -494,11 +512,19 @@ async def admin_create_booking(
                     if not t_opt:
                         continue
                     if t_opt.type == 'SHARED':
-                        t_adult = (t_opt.weekend_adult_price if is_weekend_admin and t_opt.weekend_adult_price else t_opt.adult_price) or Decimal("0.00")
-                        t_child = (t_opt.weekend_child_price if is_weekend_admin and t_opt.weekend_child_price else t_opt.child_price) or Decimal("0.00")
-                        item_cost = Decimal(str(adult_count)) * Decimal(str(t_adult)) + Decimal(str(child_count)) * Decimal(str(t_child))
-                        subtotal_amount += item_cost
-                        transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SHARED", "capacity": int(t_opt.capacity or 0), "quantity": 1, "adult_price": float(t_adult), "child_price": float(t_child), "item_total": float(item_cost)})
+                        if is_student_pkg:
+                            t_student = getattr(t_opt, 'student_price', None) or Decimal("0.00")
+                            if is_weekend_admin and getattr(t_opt, 'weekend_student_price', None):
+                                t_student = t_opt.weekend_student_price
+                            item_cost = Decimal(str(student_count)) * Decimal(str(t_student))
+                            subtotal_amount += item_cost
+                            transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SHARED", "capacity": int(t_opt.capacity or 0), "quantity": 1, "student_price": float(t_student), "item_total": float(item_cost)})
+                        else:
+                            t_adult = (t_opt.weekend_adult_price if is_weekend_admin and t_opt.weekend_adult_price else t_opt.adult_price) or Decimal("0.00")
+                            t_child = (t_opt.weekend_child_price if is_weekend_admin and t_opt.weekend_child_price else t_opt.child_price) or Decimal("0.00")
+                            item_cost = Decimal(str(adult_count)) * Decimal(str(t_adult)) + Decimal(str(child_count)) * Decimal(str(t_child))
+                            subtotal_amount += item_cost
+                            transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SHARED", "capacity": int(t_opt.capacity or 0), "quantity": 1, "adult_price": float(t_adult), "child_price": float(t_child), "item_total": float(item_cost)})
                     elif t_opt.type == 'SEPARATE_VEHICLE':
                         t_fixed = (t_opt.weekend_fixed_price if is_weekend_admin and t_opt.weekend_fixed_price else t_opt.fixed_price) or Decimal("0.00")
                         item_cost = Decimal(str(sel_qty)) * Decimal(str(t_fixed))
@@ -512,9 +538,14 @@ async def admin_create_booking(
             )
             parent_pkg_ref = pkg_res_for_ref.scalar_one_or_none()
             if parent_pkg_ref and parent_pkg_ref.has_refreshments:
-                r_adult = parent_pkg_ref.refreshment_adult_price or Decimal("0.00")
-                r_child = parent_pkg_ref.refreshment_child_price or Decimal("0.00")
-                ref_cost = Decimal(str(adult_count)) * Decimal(str(r_adult)) + Decimal(str(child_count)) * Decimal(str(r_child))
+                if is_student_pkg:
+                    r_student = getattr(parent_pkg_ref, 'refreshment_student_price', None) or \
+                                parent_pkg_ref.refreshment_adult_price or Decimal("0.00")
+                    ref_cost = Decimal(str(student_count)) * Decimal(str(r_student))
+                else:
+                    r_adult = parent_pkg_ref.refreshment_adult_price or Decimal("0.00")
+                    r_child = parent_pkg_ref.refreshment_child_price or Decimal("0.00")
+                    ref_cost = Decimal(str(adult_count)) * Decimal(str(r_adult)) + Decimal(str(child_count)) * Decimal(str(r_child))
                 subtotal_amount += ref_cost
                 refreshment_subtotal = ref_cost
         
@@ -673,6 +704,7 @@ async def admin_create_booking(
         travel_date=travel_date,
         adult_count=adult_count,
         child_count=child_count,
+        student_count=student_count if 'student_count' in locals() else 0,
         subtotal_amount=subtotal_amount,
         coupon_discount=Decimal("0.00"),
         coupon_applied=None,
@@ -735,6 +767,7 @@ async def admin_create_booking(
             is_primary=p_data.is_primary or False,
             aadhar_encrypted=encrypted,
             aadhar_hash=hashed,
+            student_class=getattr(p_data, 'student_class', None) or None,
         )
         db.add(passenger)
 
@@ -936,18 +969,32 @@ async def admin_cancel_booking(
         inv = inv_res.scalar_one_or_none()
         if inv:
             if booking.source != BookingSource.ADMIN_DIRECT:
-                quantity = booking.adult_count + booking.child_count
+                quantity = booking.student_count if booking.student_count else (booking.adult_count + booking.child_count)
                 inv.booked_count = max(0, inv.booked_count - quantity)
                 logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
             await db.flush()
             import time
             from app.core.timezone import get_ist_now
             from app.models.package import PackageVariant
-            v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == booking.variant_id))
+            from sqlalchemy.orm import joinedload
+            v_res = await db.execute(
+                select(PackageVariant)
+                .options(joinedload(PackageVariant.package))
+                .where(PackageVariant.id == booking.variant_id)
+            )
             variant = v_res.scalar_one_or_none()
             if variant:
-                from app.api.v1.public_packages import get_effective_package_prices
-                eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, inv.price_override)
+                is_student = variant.package.is_student_package
+                modifier = inv.price_override if inv.price_override is not None else Decimal("0.00")
+                if is_student:
+                    eff_student = max(Decimal("0.00"), (variant.student_price or Decimal("0.00")) + modifier)
+                    eff_adult = Decimal("0.00")
+                    eff_child = Decimal("0.00")
+                else:
+                    eff_student = None
+                    eff_adult = max(Decimal("0.00"), (variant.adult_price or Decimal("0.00")) + modifier)
+                    eff_child = max(Decimal("0.00"), (variant.child_price or Decimal("0.00")) + modifier)
+
                 sse_payload = {
                     "version": int(time.time() * 1000),
                     "timestamp": get_ist_now().isoformat(),
@@ -959,6 +1006,7 @@ async def admin_cancel_booking(
                     "is_closed": inv.is_closed,
                     "effective_adult_price": float(eff_adult),
                     "effective_child_price": float(eff_child),
+                    "effective_student_price": float(eff_student) if eff_student is not None else None,
                     "variant_id": booking.variant_id
                 }
 
@@ -1365,7 +1413,8 @@ async def get_transport_planning(
                     next((p.full_name for p in b.passengers if p.is_primary), None)
                     or (b.passengers[0].full_name if b.passengers else "Guest")
                 )
-                pax = b.adult_count + b.child_count
+                is_student_pkg = getattr(pkg, 'is_student_package', False)
+                pax = b.student_count if is_student_pkg else (b.adult_count + b.child_count)
                 date_total_bookings += 1
                 date_total_pax += pax
 
@@ -1417,6 +1466,7 @@ async def get_transport_planning(
                     "customer_email": customer.email if customer else None,
                     "adult_count": b.adult_count,
                     "child_count": b.child_count,
+                    "student_count": b.student_count,
                     "total_pax": pax,
                     "has_transport": has_transport,
                     "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),

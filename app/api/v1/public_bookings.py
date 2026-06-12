@@ -45,6 +45,7 @@ class PassengerInput(BaseModel):
     aadhaar: Optional[str] = Field(None, max_length=20)  # Required for adults, optional for children (<10)
     relationship: Optional[str] = None  # e.g. 'self', 'spouse', 'child'
     is_primary: Optional[bool] = False
+    student_class: Optional[str] = Field(None, max_length=100)  # Class/grade for student packages
 
 class TransportSelection(BaseModel):
     """A single transport option with the quantity of vehicles/passes selected."""
@@ -78,6 +79,7 @@ class CheckoutRequest(BaseModel):
     coupon_code: Optional[str] = None
     adult_count: Optional[int] = None
     child_count: Optional[int] = None
+    student_count: Optional[int] = None  # for student packages
     has_refreshment_addon: Optional[bool] = False
 
     # Passenger manifest
@@ -111,69 +113,59 @@ async def checkout(
     from app.utils.verhoeff import is_valid_aadhaar
     from app.core.config import settings
     
-    # Derive adult and child count safely
+    # Derive adult, child, and student counts safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
     child_count = request.child_count if request.child_count is not None else 0
-    
-    if request.target_type == 'package' and (adult_count + child_count) != request.quantity:
-        raise HTTPException(status_code=400, detail="Adult and child count must equal total quantity")
-        
+    student_count = request.student_count if request.student_count is not None else 0
+
+    # Passenger count validation — deferred until after we know if it's a student package
     if not request.passengers or len(request.passengers) != request.quantity:
         raise HTTPException(status_code=400, detail="Passenger details must be provided for all guests")
     
-    # Validate passenger Aadhaar and Age data strictly
+    # ── Passenger validation ──────────────────────────────────────────────────
+    from app.models.enums import UserRole
+    is_student_pkg = False
+    if request.target_type == 'package' and request.variant_id:
+        from app.models.package import PackageVariant, Package
+        res_stud = await db.execute(
+            select(Package.is_student_package)
+            .join(PackageVariant, PackageVariant.package_id == Package.id)
+            .where(PackageVariant.id == request.variant_id)
+        )
+        is_student_pkg = bool(res_stud.scalar())
+
     if request.passengers:
         for i, p in enumerate(request.passengers):
             is_child = i >= adult_count
-            
+
             if request.quick_booking:
                 # Quick booking is only allowed for agent and admin
                 is_agent_or_admin = current_user is not None and current_user.role in (UserRole.AGENT, UserRole.ADMIN)
                 if not is_agent_or_admin:
                     raise HTTPException(status_code=403, detail="Quick booking is only allowed for admins and agents")
-                
+
                 # Check lead passenger constraints and bypass the rest
                 if i == 0:
-                    if p.age < 18:
-                        raise HTTPException(status_code=400, detail="Primary passenger must be an adult (18+) for quick booking")
-                    if not p.phone:
-                        raise HTTPException(status_code=400, detail="Phone number is required for the primary passenger")
-                    if not p.aadhaar or not p.aadhaar.strip():
-                        raise HTTPException(status_code=400, detail="Aadhaar is required for the primary passenger")
-                    if not is_valid_aadhaar(p.aadhaar.strip()):
-                        raise HTTPException(status_code=400, detail="Invalid Aadhaar format for the primary passenger")
+                    if not is_student_pkg:
+                        if p.age < 18:
+                            raise HTTPException(status_code=400, detail="Primary passenger must be an adult (18+) for quick booking")
+                        if not p.phone:
+                            raise HTTPException(status_code=400, detail="Phone number is required for the primary passenger")
+                        if not p.aadhaar or not p.aadhaar.strip():
+                            raise HTTPException(status_code=400, detail="Aadhaar is required for the primary passenger")
+                        if not is_valid_aadhaar(p.aadhaar.strip()):
+                            raise HTTPException(status_code=400, detail="Invalid Aadhaar format for the primary passenger")
+                    else:
+                        # Student package: Aadhaar/phone are optional but validate format if provided
+                        if p.phone and p.phone.strip() and len(p.phone.strip()) != 10:
+                            raise HTTPException(status_code=400, detail="Contact number must be exactly 10 digits")
+                        if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
+                            raise HTTPException(status_code=400, detail="Invalid Aadhaar format for the primary passenger")
                 else:
-                    # Skip Aadhaar and other constraints for non-primary passengers in quick booking
                     continue
             else:
-                # Age constraints
-                if request.target_type == 'package':
-                    if is_child:
-                        if not (4 <= p.age <= 10):
-                            raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
-                    else:
-                        if p.age < 11:
-                            raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
-                        if i == 0 and not p.phone:
-                            raise HTTPException(status_code=400, detail=f"Phone number is required for the primary adult passenger")
-                else:
-                    # Room bookings treat all guests generically, but still need phone for primary
-                    if i == 0 and not p.phone:
-                        raise HTTPException(status_code=400, detail=f"Phone number is required for the primary passenger")
-                
-                # Aadhaar validation contract: optional for children <= 10, mandatory for anyone >= 11
-                is_child_age = p.age <= 10
-                if not request.quick_booking:
-                    if not is_child_age:
-                        # 11+ MUST provide a valid Aadhaar
-                        if not p.aadhaar or not p.aadhaar.strip():
-                            raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
-                        if not is_valid_aadhaar(p.aadhaar.strip()):
-                            raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
-                    else:
-                        # Children (<= 10): validate only if provided
-                        if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
-                            raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+                # Skip strict age/aadhaar for now — re-checked below for non-student packages only
+                pass
     has_refreshment_addon = request.has_refreshment_addon or False
     
     subtotal_amount = Decimal("0.00")
@@ -242,34 +234,85 @@ async def checkout(
             raise HTTPException(status_code=400, detail="Package variant not found")
             
         parent_package = variant.package
+        is_student_pkg = bool(getattr(parent_package, 'is_student_package', False))
 
-        # Minimum passengers check
+        # ── Pax count validation ─────────────────────────────────────────────
+        if is_student_pkg:
+            # For student packages: student_count must equal quantity
+            student_count = request.student_count if request.student_count is not None else request.quantity
+            adult_count = 0
+            child_count = 0
+            if student_count != request.quantity:
+                raise HTTPException(status_code=400, detail="student_count must equal total quantity for student packages")
+        else:
+            # Normal packages: adult + child must equal quantity
+            if (adult_count + child_count) != request.quantity:
+                raise HTTPException(status_code=400, detail="Adult and child count must equal total quantity")
+
+        # ── Passenger validation for non-quick, non-student packages ────────
+        if not request.quick_booking and not is_student_pkg:
+            for i, p in enumerate(request.passengers):
+                is_child = i >= adult_count
+                if is_child:
+                    if not (4 <= p.age <= 10):
+                        raise HTTPException(status_code=400, detail=f"Child age must be between 4 and 10 years for passenger {i+1}")
+                else:
+                    if p.age < 11:
+                        raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
+                    if i == 0 and not p.phone:
+                        raise HTTPException(status_code=400, detail="Phone number is required for the primary adult passenger")
+                # Aadhaar validation: optional for children <=10, mandatory for 11+
+                is_child_age = p.age <= 10
+                if not is_child_age:
+                    if not p.aadhaar or not p.aadhaar.strip():
+                        raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
+                    if not is_valid_aadhaar(p.aadhaar.strip()):
+                        raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+                else:
+                    if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
+                        raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+        elif not request.quick_booking and is_student_pkg:
+            # Student packages: Aadhaar optional but validate format if provided
+            for i, p in enumerate(request.passengers):
+                if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
+                    raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+
+        # ── Minimum passengers check ───────────────────────────────────
         min_pax = getattr(parent_package, 'min_passengers', 1) or 1
-        total_passengers = adult_count + child_count
+        total_passengers = student_count if is_student_pkg else (adult_count + child_count)
         if total_passengers < min_pax:
             raise HTTPException(
                 status_code=400,
                 detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
             )
 
-        # Determine base pricing based on weekend
+        # ── Pricing ──────────────────────────────────────────────────
         is_weekend = request.travel_date.weekday() in (5, 6)
-        
-        base_adult_price = variant.adult_price
-        base_child_price = variant.child_price
-        
-        if is_weekend:
-            if variant.weekend_adult_price is not None:
-                base_adult_price = variant.weekend_adult_price
-            if variant.weekend_child_price is not None:
-                base_child_price = variant.weekend_child_price
 
-        # Calculate base subtotal using precise Decimal representation
-        eff_adult, eff_child = get_effective_package_prices(
-            base_adult_price, base_child_price, inventory.price_override
-        )
-        base_subtotal = Decimal(str(adult_count)) * eff_adult + Decimal(str(child_count)) * eff_child
-        
+        if is_student_pkg:
+            # Student pricing: one price per student head
+            base_student_price = getattr(variant, 'student_price', None) or Decimal("0.00")
+            if is_weekend and getattr(variant, 'weekend_student_price', None):
+                base_student_price = variant.weekend_student_price
+            if inventory.price_override is not None:
+                base_student_price = inventory.price_override
+            eff_student = Decimal(str(base_student_price))
+            eff_adult = eff_student  # used for SSE payload compatibility
+            eff_child = Decimal("0.00")
+            base_subtotal = Decimal(str(student_count)) * eff_student
+        else:
+            base_adult_price = variant.adult_price
+            base_child_price = variant.child_price
+            if is_weekend:
+                if variant.weekend_adult_price is not None:
+                    base_adult_price = variant.weekend_adult_price
+                if variant.weekend_child_price is not None:
+                    base_child_price = variant.weekend_child_price
+            eff_adult, eff_child = get_effective_package_prices(
+                base_adult_price, base_child_price, inventory.price_override
+            )
+            base_subtotal = Decimal(str(adult_count)) * eff_adult + Decimal(str(child_count)) * eff_child
+
         transport_subtotal = Decimal("0.00")
         transport_snapshot_items = []
 
@@ -279,7 +322,6 @@ async def checkout(
             effective_selections = [TransportSelection(option_id=request.transport_option_id, quantity=1)]
 
         if parent_package.has_transport and effective_selections:
-            # Load all selected transport options in one query
             selected_opt_ids = [s.option_id for s in effective_selections]
             t_opts_res = await db.execute(
                 select(PackageTransportOption).where(
@@ -295,46 +337,48 @@ async def checkout(
                     raise HTTPException(status_code=400, detail=f"Invalid transport option id: {sel.option_id}")
 
                 if t_opt.type == 'SHARED':
-                    # For SHARED: price per passenger, sel.quantity is ignored (always 1 selection)
-                    t_adult = t_opt.adult_price or Decimal("0.00")
-                    t_child = t_opt.child_price or Decimal("0.00")
-                    if is_weekend:
-                        if t_opt.weekend_adult_price is not None:
-                            t_adult = t_opt.weekend_adult_price
-                        if t_opt.weekend_child_price is not None:
-                            t_child = t_opt.weekend_child_price
-                    item_cost = Decimal(str(adult_count)) * t_adult + Decimal(str(child_count)) * t_child
-                    transport_subtotal += item_cost
-                    transport_snapshot_items.append({
-                        "option_id": t_opt.id,
-                        "title": t_opt.title,
-                        "type": "SHARED",
-                        "capacity": int(t_opt.capacity or 0),
-                        "quantity": 1,
-                        "adult_price": float(t_adult),
-                        "child_price": float(t_child),
-                        "item_total": float(item_cost)
-                    })
+                    if is_student_pkg:
+                        # Student SHARED: one price per student
+                        t_student = getattr(t_opt, 'student_price', None) or Decimal("0.00")
+                        if is_weekend and getattr(t_opt, 'weekend_student_price', None):
+                            t_student = t_opt.weekend_student_price
+                        item_cost = Decimal(str(student_count)) * t_student
+                        transport_subtotal += item_cost
+                        transport_snapshot_items.append({
+                            "option_id": t_opt.id, "title": t_opt.title, "type": "SHARED",
+                            "capacity": int(t_opt.capacity or 0), "quantity": 1,
+                            "student_price": float(t_student), "item_total": float(item_cost)
+                        })
+                    else:
+                        t_adult = t_opt.adult_price or Decimal("0.00")
+                        t_child = t_opt.child_price or Decimal("0.00")
+                        if is_weekend:
+                            if t_opt.weekend_adult_price is not None:
+                                t_adult = t_opt.weekend_adult_price
+                            if t_opt.weekend_child_price is not None:
+                                t_child = t_opt.weekend_child_price
+                        item_cost = Decimal(str(adult_count)) * t_adult + Decimal(str(child_count)) * t_child
+                        transport_subtotal += item_cost
+                        transport_snapshot_items.append({
+                            "option_id": t_opt.id, "title": t_opt.title, "type": "SHARED",
+                            "capacity": int(t_opt.capacity or 0), "quantity": 1,
+                            "adult_price": float(t_adult), "child_price": float(t_child), "item_total": float(item_cost)
+                        })
 
                 elif t_opt.type == 'SEPARATE_VEHICLE':
-                    # For SEPARATE_VEHICLE: price per vehicle, sel.quantity = number of vehicles
                     t_fixed = t_opt.fixed_price or Decimal("0.00")
                     if is_weekend and t_opt.weekend_fixed_price is not None:
                         t_fixed = t_opt.weekend_fixed_price
                     item_cost = Decimal(str(sel.quantity)) * t_fixed
                     transport_subtotal += item_cost
                     transport_snapshot_items.append({
-                        "option_id": t_opt.id,
-                        "title": t_opt.title,
-                        "type": "SEPARATE_VEHICLE",
-                        "capacity": int(t_opt.capacity or 0),
-                        "quantity": sel.quantity,
-                        "fixed_price": float(t_fixed),
-                        "item_total": float(item_cost)
+                        "option_id": t_opt.id, "title": t_opt.title, "type": "SEPARATE_VEHICLE",
+                        "capacity": int(t_opt.capacity or 0), "quantity": sel.quantity,
+                        "fixed_price": float(t_fixed), "item_total": float(item_cost)
                     })
 
-            # Validate capacity: total vehicle capacity must cover all passengers
-            total_pax = adult_count + child_count
+            # Validate separate vehicle capacity
+            total_pax = student_count if is_student_pkg else (adult_count + child_count)
             separate_capacity = sum(
                 s.quantity * (t_opts_map[s.option_id].capacity or 1)
                 for s in effective_selections
@@ -352,14 +396,29 @@ async def checkout(
 
         refreshment_subtotal = Decimal("0.00")
         if parent_package.has_refreshments and request.include_refreshments:
-            r_adult = parent_package.refreshment_adult_price or Decimal("0.00")
-            r_child = parent_package.refreshment_child_price or Decimal("0.00")
-            refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
-            
+            if is_student_pkg:
+                r_student = getattr(parent_package, 'refreshment_student_price', None) or \
+                            parent_package.refreshment_adult_price or Decimal("0.00")
+                refreshment_subtotal = Decimal(str(student_count)) * Decimal(str(r_student))
+            else:
+                r_adult = parent_package.refreshment_adult_price or Decimal("0.00")
+                r_child = parent_package.refreshment_child_price or Decimal("0.00")
+                refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
+
         subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
         commissionable_base = base_subtotal
-        
-        # Reserve inventory (increment reserved_count instead of booked_count)
+
+        # Store student metadata in pricing snapshot for invoice/ticket rendering
+        if is_student_pkg:
+            _student_snapshot = {
+                "is_student_package": True,
+                "student_count": student_count,
+                "student_price_per_head": float(eff_student) if is_student_pkg else 0.0,
+            }
+        else:
+            _student_snapshot = {"is_student_package": False}
+
+        # Reserve inventory
         inventory.reserved_count += request.quantity
         
     elif request.target_type == 'room':
@@ -580,6 +639,7 @@ async def checkout(
         "agent_discount": str(agent_discount),
         "agent_payable": str(agent_payable),
         "booking_mode": "QUICK" if request.quick_booking else "FULL",
+        **(_student_snapshot if '_student_snapshot' in locals() else {"is_student_package": False}),
     }
     # Store transport selections breakdown in snapshot for invoice/ticket rendering
     if request.target_type == 'package' and transport_snapshot_items:

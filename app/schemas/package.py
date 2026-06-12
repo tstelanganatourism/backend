@@ -16,6 +16,9 @@ class PackageVariantBase(AppBaseModel):
     child_price: Decimal
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    # Student package pricing
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     is_active: bool = True
 
 class PackageTransportOptionBase(AppBaseModel):
@@ -26,6 +29,9 @@ class PackageTransportOptionBase(AppBaseModel):
     child_price: Optional[Decimal] = None
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    # Student pricing for SHARED transport
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     fixed_price: Optional[Decimal] = None
     weekend_fixed_price: Optional[Decimal] = None
 
@@ -106,6 +112,9 @@ class PackageVariantInput(AppBaseModel):
     child_price: Decimal
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    # Student pricing
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     is_active: bool = True
 
 class PackageTransportOptionInput(AppBaseModel):
@@ -117,6 +126,9 @@ class PackageTransportOptionInput(AppBaseModel):
     child_price: Optional[Decimal] = None
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    # Student pricing for SHARED transport
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     fixed_price: Optional[Decimal] = None
     weekend_fixed_price: Optional[Decimal] = None
 
@@ -199,6 +211,9 @@ class PackageBase(AppBaseModel):
     has_refreshments: bool = False
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
+    # Student package
+    is_student_package: bool = False
+    refreshment_student_price: Optional[Decimal] = None
     is_featured: bool = False
     is_active: bool = True
     status: PublishStatus = PublishStatus.DRAFT
@@ -250,6 +265,9 @@ class PackageUpdate(AppBaseModel):
     has_refreshments: Optional[bool] = None
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
+    # Student package
+    is_student_package: Optional[bool] = None
+    refreshment_student_price: Optional[Decimal] = None
     is_featured: Optional[bool] = None
     is_active: Optional[bool] = None
     status: Optional[PublishStatus] = None

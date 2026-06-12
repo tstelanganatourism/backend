@@ -194,11 +194,17 @@ async def create_package(
     await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
     await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
     
-    # Compute starting_price
-    package.starting_price = min(
-        (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
-        default=0
-    )
+    # Compute starting_price — use student_price for student packages
+    if package.is_student_package:
+        package.starting_price = min(
+            (v.student_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'student_price', None) and v.student_price > 0),
+            default=0
+        )
+    else:
+        package.starting_price = min(
+            (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
+            default=0
+        )
     
     db.add(package)
     await db.commit()
@@ -328,11 +334,17 @@ async def update_package(
     if body.policies is not None:
         await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
         
-    # Recompute starting_price
-    package.starting_price = min(
-        (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
-        default=0
-    )
+    # Recompute starting_price — use student_price for student packages
+    if package.is_student_package:
+        package.starting_price = min(
+            (v.student_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'student_price', None) and v.student_price > 0),
+            default=0
+        )
+    else:
+        package.starting_price = min(
+            (v.adult_price for v in package.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'adult_price', 0) > 0),
+            default=0
+        )
         
     await db.commit()
     

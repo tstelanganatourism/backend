@@ -165,10 +165,24 @@ async def generate_package_inventory(
         from app.utils.sse import sse_manager
         from app.api.v1.public_packages import get_effective_package_prices
         
-        variant_res = await db.execute(select(PackageVariant).where(PackageVariant.id == body.variant_id))
+        from sqlalchemy.orm import joinedload
+        variant_res = await db.execute(
+            select(PackageVariant)
+            .options(joinedload(PackageVariant.package))
+            .where(PackageVariant.id == body.variant_id)
+        )
         variant = variant_res.scalar_one_or_none()
         if variant:
-            eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, None)
+            is_student = variant.package.is_student_package
+            if is_student:
+                eff_student = max(Decimal("0.00"), variant.student_price or Decimal("0.00"))
+                eff_adult = Decimal("0.00")
+                eff_child = Decimal("0.00")
+            else:
+                eff_student = None
+                eff_adult = max(Decimal("0.00"), variant.adult_price or Decimal("0.00"))
+                eff_child = max(Decimal("0.00"), variant.child_price or Decimal("0.00"))
+
             current_date = body.from_date
             while current_date <= body.to_date:
                 if current_date not in existing_dates:
@@ -183,6 +197,7 @@ async def generate_package_inventory(
                         "is_closed": False,
                         "effective_adult_price": float(eff_adult),
                         "effective_child_price": float(eff_child),
+                        "effective_student_price": float(eff_student) if eff_student is not None else None,
                         "variant_id": body.variant_id
                     }
                     await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
@@ -331,11 +346,26 @@ async def update_inventory_row(
     import time
     from app.core.timezone import get_ist_now
     from app.utils.sse import sse_manager
-    variant_res = await db.execute(select(PackageVariant).where(PackageVariant.id == variant_id))
+    from sqlalchemy.orm import joinedload
+    variant_res = await db.execute(
+        select(PackageVariant)
+        .options(joinedload(PackageVariant.package))
+        .where(PackageVariant.id == variant_id)
+    )
     variant = variant_res.scalar_one_or_none()
     if variant:
-        from app.api.v1.public_packages import get_effective_package_prices
-        eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, row.price_override)
+        is_student = variant.package.is_student_package
+        modifier = row.price_override if row.price_override is not None else Decimal("0.00")
+        from decimal import Decimal
+        if is_student:
+            eff_student = max(Decimal("0.00"), (variant.student_price or Decimal("0.00")) + modifier)
+            eff_adult = Decimal("0.00")
+            eff_child = Decimal("0.00")
+        else:
+            eff_student = None
+            eff_adult = max(Decimal("0.00"), (variant.adult_price or Decimal("0.00")) + modifier)
+            eff_child = max(Decimal("0.00"), (variant.child_price or Decimal("0.00")) + modifier)
+
         sse_payload = {
             "version": int(time.time() * 1000),
             "timestamp": get_ist_now().isoformat(),
@@ -347,6 +377,7 @@ async def update_inventory_row(
             "is_closed": row.is_closed,
             "effective_adult_price": float(eff_adult),
             "effective_child_price": float(eff_child),
+            "effective_student_price": float(eff_student) if eff_student is not None else None,
             "variant_id": variant_id
         }
         await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)

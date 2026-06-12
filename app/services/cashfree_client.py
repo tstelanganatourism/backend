@@ -88,7 +88,7 @@ class CashfreeService:
                 if resp.status_code not in (200, 201):
                     logger.error(f"Cashfree create_order failed: {resp.status_code} {resp.text}")
                     raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
+                        status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Cashfree gateway error: {resp.json().get('message', 'Order creation failed.')}",
                     )
                 data = resp.json()
@@ -102,7 +102,7 @@ class CashfreeService:
         except Exception as exc:
             logger.error(f"Cashfree create_order exception: {exc}")
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Failed to communicate with Cashfree payment gateway.",
             )
 

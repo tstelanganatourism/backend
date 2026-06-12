@@ -39,6 +39,12 @@ class CarouselSlide(BaseModel):
     package_type: Optional[str] = None
     starting_weekend_price: Optional[Decimal] = None
     child_price: Optional[Decimal] = None
+    # For students
+    is_student_package: bool = False
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
+    refreshment_student_price: Optional[Decimal] = None
+    has_refreshments: bool = False
 
 
 @router.get("/carousel", response_model=List[CarouselSlide], tags=["Public Discovery - Carousel"])
@@ -70,6 +76,9 @@ async def get_carousel_slides(
                 Package.duration,
                 Package.place,
                 Package.type,
+                Package.is_student_package,
+                Package.refreshment_student_price,
+                Package.has_refreshments,
             )
             .where(
                 Package.status == PublishStatus.PUBLISHED,
@@ -84,27 +93,38 @@ async def get_carousel_slides(
         for pkg in packages:
             # Strip HTML from description and truncate
             desc = pkg.description or ""
+            import html
             import re
+            desc = html.unescape(desc)
             desc = re.sub(r'<[^>]+>', '', desc).strip()
             desc = desc[:180] + "..." if len(desc) > 180 else desc
 
-            # Fetch variants to find the minimum child price
+            title = html.unescape(pkg.title or "")
+
+            # Fetch variants to find the minimum child/student price
             from app.models.package import PackageVariant
             var_result = await db.execute(
-                select(PackageVariant.child_price)
+                select(PackageVariant.child_price, PackageVariant.student_price, PackageVariant.weekend_student_price)
                 .where(
                     PackageVariant.package_id == pkg.id,
                     PackageVariant.is_active == True,
                     PackageVariant.deleted_at.is_(None),
                 )
             )
-            child_prices = [row[0] for row in var_result.all() if row[0] is not None]
+            variant_prices = var_result.all()
+            child_prices = [row[0] for row in variant_prices if row[0] is not None]
             min_child = min(child_prices) if child_prices else None
+
+            student_prices = [row[1] for row in variant_prices if row[1] is not None]
+            min_student = min(student_prices) if student_prices else None
+
+            wk_student_prices = [row[2] for row in variant_prices if row[2] is not None]
+            min_wk_student = min(wk_student_prices) if wk_student_prices else None
 
             slides.append(CarouselSlide(
                 type="package",
                 slug=pkg.slug,
-                title=pkg.title,
+                title=title,
                 description=desc or None,
                 cover_image_url=pkg.cover_image_url,
                 starting_price=pkg.starting_price,
@@ -113,6 +133,11 @@ async def get_carousel_slides(
                 place=pkg.place,
                 package_type=pkg.type.value if pkg.type else None,
                 child_price=min_child,
+                is_student_package=pkg.is_student_package,
+                student_price=min_student,
+                weekend_student_price=min_wk_student,
+                refreshment_student_price=pkg.refreshment_student_price,
+                has_refreshments=pkg.has_refreshments,
             ))
 
         # Fetch featured rooms (PUBLISHED + is_featured=True)
@@ -139,14 +164,18 @@ async def get_carousel_slides(
 
         for room in rooms:
             desc = room.description or ""
+            import html
             import re
+            desc = html.unescape(desc)
             desc = re.sub(r'<[^>]+>', '', desc).strip()
             desc = desc[:180] + "..." if len(desc) > 180 else desc
+
+            title = html.unescape(room.lodge_name or "")
 
             slides.append(CarouselSlide(
                 type="room",
                 slug=room.slug,
-                title=room.lodge_name,
+                title=title,
                 description=desc or None,
                 cover_image_url=room.cover_image_url,
                 starting_price=room.starting_price,

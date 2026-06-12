@@ -64,6 +64,8 @@ class PackageVariantPublicDTO(AppBaseModel):
     child_price: Decimal
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     transport_info: Optional[str] = None
 
 class PackageListDTO(AppBaseModel):
@@ -78,6 +80,7 @@ class PackageListDTO(AppBaseModel):
     generated_brochure_url: Optional[str] = None
     cover_image_url: Optional[str] = None
     is_featured: bool
+    is_student_package: bool = False
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
     transport_info: Optional[str] = None
@@ -117,6 +120,8 @@ class TransportOptionPublicDTO(AppBaseModel):
     child_price: Optional[Decimal] = None
     weekend_adult_price: Optional[Decimal] = None
     weekend_child_price: Optional[Decimal] = None
+    student_price: Optional[Decimal] = None
+    weekend_student_price: Optional[Decimal] = None
     fixed_price: Optional[Decimal] = None
     weekend_fixed_price: Optional[Decimal] = None
 
@@ -129,6 +134,7 @@ class PackageDetailDTO(PackageListDTO, SEOSchema):
     has_refreshments: bool = False
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
+    refreshment_student_price: Optional[Decimal] = None
     variants: List[PackageVariantPublicDTO] = Field(default_factory=list)
     gallery: List[GalleryImageDTO] = Field(default_factory=list)
     itinerary: List[PackageItineraryDayDTO] = Field(default_factory=list)
