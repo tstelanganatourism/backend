@@ -1,4 +1,5 @@
 import base64
+import time
 import httpx
 from loguru import logger
 from fastapi import HTTPException, status
@@ -27,10 +28,16 @@ class PhonePeService:
             self.is_mock = False
             logger.info(f"PhonePe Service initialized in {self.env} mode. Base URL: {self.base_url}")
 
+        self._cached_token = None
+        self._token_expires_at = 0.0
+
     async def _get_oauth_token(self) -> str:
         """
         Fetches a fresh access token using Client credentials.
         """
+        if self._cached_token and time.time() < self._token_expires_at - 60:
+            return self._cached_token
+
         token_payload = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
@@ -49,7 +56,11 @@ class PhonePeService:
             if response.status_code == 200:
                 token_data = response.json()
                 token = token_data.get("access_token")
+                expires_in = token_data.get("expires_in", 900)
                 if token:
+                    self._cached_token = token
+                    self._token_expires_at = time.time() + float(expires_in)
+                    logger.info(f"PhonePe OAuth token successfully cached. Expires in {expires_in} seconds.")
                     return token
             logger.error(f"Failed to fetch PhonePe OAuth token: {response.status_code} {response.text}")
             raise HTTPException(
