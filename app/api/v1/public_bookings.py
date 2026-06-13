@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from datetime import date, time, timedelta, datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional, List
@@ -112,6 +112,11 @@ async def checkout(
     from app.core.timezone import get_ist_now
     from app.utils.verhoeff import is_valid_aadhaar
     from app.core.config import settings
+    from app.models.enums import AccountStatus
+    
+    if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
+        raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
+
     
     # Derive adult, child, and student counts safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
@@ -234,6 +239,49 @@ async def checkout(
             raise HTTPException(status_code=400, detail="Package variant not found")
             
         parent_package = variant.package
+        
+        # ── Agent Quota Enforcement ──────────────────────────────────────────
+        is_agent = current_user is not None and current_user.role == UserRole.AGENT
+        if is_agent:
+            from app.models.user import AgentPackageQuota
+            quota_query = select(AgentPackageQuota).where(
+                AgentPackageQuota.agent_id == current_user.id,
+                AgentPackageQuota.package_id == parent_package.id
+            )
+            quota_res = await db.execute(quota_query)
+            quota = quota_res.scalar_one_or_none()
+
+            daily_limit = quota.daily_quota if quota else 10
+            allowed = quota.is_allowed if quota else True
+
+            if not allowed:
+                raise HTTPException(status_code=403, detail=f"Booking for the package '{parent_package.title}' is suspended for your account.")
+
+            # Calculate already booked passengers for this agent on this package for this travel date
+            booked_query = (
+                select(func.sum(Booking.adult_count + Booking.child_count + Booking.student_count))
+                .join(PackageVariant, PackageVariant.id == Booking.variant_id)
+                .where(
+                    Booking.agent_id == current_user.id,
+                    PackageVariant.package_id == parent_package.id,
+                    Booking.travel_date == request.travel_date,
+                    Booking.status.in_((BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID)),
+                    Booking.deleted_at.is_(None)
+                )
+            )
+            booked_res = await db.execute(booked_query)
+            already_booked = booked_res.scalar() or 0
+
+            requested_quantity = request.quantity
+            if already_booked + requested_quantity > daily_limit:
+                remaining = max(0, daily_limit - already_booked)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"You have exceeded your daily quota for '{parent_package.title}' on {request.travel_date}. "
+                           f"Daily Limit: {daily_limit}, Already Booked: {already_booked}, "
+                           f"Requested: {requested_quantity}, Remaining Allowance: {remaining} tickets."
+                )
+
         is_student_pkg = bool(getattr(parent_package, 'is_student_package', False))
 
         # ── Pax count validation ─────────────────────────────────────────────
@@ -1509,8 +1557,11 @@ async def process_balance_checkout(
     from app.services.phonepe_client import phonepe_service
     from app.services.cashfree_client import cashfree_service
     from app.models.payment import Payment
-    from app.models.enums import PaymentStatus
+    from app.models.enums import PaymentStatus, AccountStatus
     from app.core.config import settings
+
+    if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
+        raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
 
     # Fetch booking
     query = (

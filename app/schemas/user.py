@@ -2,7 +2,7 @@
 Auth request/response schemas + User profile schemas — Phase-3.
 """
 import re
-from typing import Optional
+from typing import Optional, Any
 from pydantic import EmailStr, Field, field_validator, ConfigDict
 from app.schemas.base import AppBaseModel, TimestampSchema
 from app.models.enums import UserRole, AccountStatus
@@ -54,7 +54,7 @@ class UserResponse(UserBase, TimestampSchema):
 class TouristSignupRequest(AppBaseModel):
     model_config = ConfigDict(extra="forbid")
     full_name: str = Field(..., min_length=2, max_length=100)
-    email: EmailStr
+    email: Optional[EmailStr] = None
     password: str = Field(..., min_length=8, max_length=128)
     phone_number: Optional[str] = Field(None, max_length=20)
 
@@ -70,9 +70,14 @@ class TouristSignupRequest(AppBaseModel):
             return v.strip() or None
         return None
 
+    def model_post_init(self, __context: Any) -> None:
+        if not self.email and not self.phone_number:
+            raise ValueError("Please provide at least an email address or phone number.")
+
 
 class TouristLoginRequest(AppBaseModel):
-    email: EmailStr
+    """Accepts email or phone number as login_id, plus password."""
+    login_id: str = Field(..., min_length=1, description="Email address or 10-digit phone number")
     password: str = Field(..., min_length=1)
 
 
@@ -124,6 +129,7 @@ class UserMeResponse(AppBaseModel):
 class ProfileUpdateRequest(AppBaseModel):
     model_config = ConfigDict(extra="forbid")
     full_name: Optional[str] = None
+    email: Optional[EmailStr] = None
     phone_number: Optional[str] = None
     avatar_url: Optional[str] = None
     gst_number: Optional[str] = None
@@ -155,10 +161,11 @@ class RefreshResponse(AppBaseModel):
 
 
 class ForgotPasswordRequest(AppBaseModel):
-    email: EmailStr
+    """Accepts email OR phone number (login_id) to look up the account."""
+    login_id: str = Field(..., min_length=1, description="Email address or 10-digit phone number")
 
 
 class ResetPasswordRequest(AppBaseModel):
-    email: EmailStr
+    login_id: str = Field(..., min_length=1, description="Email address or 10-digit phone number")
     otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
     new_password: str = Field(..., min_length=8, max_length=128)

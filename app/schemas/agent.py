@@ -132,3 +132,17 @@ class AgentPaginatedResponse(AppBaseModel):
     total: int
     page: int
     size: int
+
+
+class AgentQuotaResponse(AppBaseModel):
+    package_id: int
+    package_title: str
+    daily_quota: int
+    is_allowed: bool
+
+
+class AgentQuotaUpdate(AppBaseModel):
+    package_id: int
+    daily_quota: int = Field(default=10, ge=0)
+    is_allowed: bool = Field(default=True)
+

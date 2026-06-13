@@ -67,12 +67,6 @@ async def get_current_user_optional(
             headers={"WWW-Authenticate": "Bearer"},
         )
         
-    if user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been suspended.",
-        )
-        
     return user
 
 
@@ -104,12 +98,6 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account not found.",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Your account has been suspended. Please contact support.",
         )
 
     return user

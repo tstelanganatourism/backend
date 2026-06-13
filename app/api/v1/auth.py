@@ -50,6 +50,7 @@ from app.repositories.user_repository import (
     get_user_by_email,
     get_user_by_google_id,
     get_user_by_id,
+    get_user_by_phone,
     link_google_to_existing,
     update_last_login,
 )
@@ -441,12 +442,23 @@ async def tourist_signup(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new tourist account and return tokens immediately."""
-    existing = await get_user_by_email(db, body.email)
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists.",
-        )
+    # Email uniqueness check (only if email provided)
+    if body.email:
+        existing = await get_user_by_email(db, body.email)
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this email already exists.",
+            )
+
+    # Phone uniqueness check (only if phone provided)
+    if body.phone_number:
+        existing_phone = await get_user_by_phone(db, body.phone_number)
+        if existing_phone:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An account with this phone number already exists.",
+            )
 
     user = await create_tourist_user(
         db,
@@ -465,12 +477,21 @@ async def tourist_login(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Authenticate a tourist with email + password."""
-    user = await get_user_by_email(db, body.email)
+    """Authenticate a tourist with email or phone number + password."""
+    login_id = body.login_id.strip()
     invalid_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid email or password.",
+        detail="Invalid credentials.",
     )
+
+    # Auto-detect: if it looks like a 10-digit phone number, search by phone first
+    if login_id.isdigit() and len(login_id) == 10:
+        user = await get_user_by_phone(db, login_id)
+    else:
+        user = await get_user_by_email(db, login_id)
+        if not user and login_id.isdigit():
+            # fallback: try phone if digits-only but not exactly 10
+            user = await get_user_by_phone(db, login_id)
 
     if not user:
         raise invalid_exc
@@ -490,48 +511,68 @@ async def forgot_password(
     body: ForgotPasswordRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Initiate password reset flow by sending OTP to email."""
-    user = await get_user_by_email(db, body.email)
-    
-    # We return error if user not found for better UX (as requested by user)
+    """Initiate password reset flow. Looks up account by email or phone."""
+    login_id = body.login_id.strip()
+
+    # Resolve user by email or phone
+    if login_id.isdigit() and len(login_id) == 10:
+        user = await get_user_by_phone(db, login_id)
+    else:
+        user = await get_user_by_email(db, login_id)
+        if not user and login_id.isdigit():
+            user = await get_user_by_phone(db, login_id)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No account found with this email address."
+            detail="No account found with this email or phone number."
         )
-        
+
     if user.account_status == AccountStatus.BLOCKED:
         raise HTTPException(status_code=403, detail="Account is suspended.")
+
+    # If user has no email, we cannot send OTP — return special error code
+    if not user.email:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="no_email_on_account"
+        )
 
     # Generate and store OTP (10 min expiry)
     otp = generate_otp()
     await store_otp(user.id, otp, expire_seconds=600)
     if settings.ENVIRONMENT == "development":
         logger.info(f"Generated OTP {otp} for user {user.email}")
-    
+
     # Send email
     success = await _send_password_reset_otp_email(user.email, user.full_name, otp)
     if not success:
         logger.error(f"Failed to send password reset email to {user.email}")
-    
-    return {"message": "If an account exists, a reset code has been sent."}
+
+    return {"message": "If an account exists, a reset code has been sent.", "email": user.email}
 
 
 @router.post("/verify-reset-otp")
 async def verify_reset_otp(
-    body: ForgotPasswordRequest, # Reuse for email
-    otp: str, # This should probably be in a schema, but for brevity...
+    body: ForgotPasswordRequest,
+    otp: str,
     db: AsyncSession = Depends(get_db)
 ):
     """Verify if the reset OTP is valid without consuming it yet."""
-    user = await get_user_by_email(db, body.email)
+    login_id = body.login_id.strip()
+    if login_id.isdigit() and len(login_id) == 10:
+        user = await get_user_by_phone(db, login_id)
+    else:
+        user = await get_user_by_email(db, login_id)
+        if not user and login_id.isdigit():
+            user = await get_user_by_phone(db, login_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-        
+
     valid = await verify_otp_only(user.id, otp)
     if not valid:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
-        
+
     return {"message": "OTP is valid."}
 
 
@@ -541,17 +582,23 @@ async def reset_password(
     db: AsyncSession = Depends(get_db)
 ):
     """Verify OTP and update password."""
-    user = await get_user_by_email(db, body.email)
+    login_id = body.login_id.strip()
+    if login_id.isdigit() and len(login_id) == 10:
+        user = await get_user_by_phone(db, login_id)
+    else:
+        user = await get_user_by_email(db, login_id)
+        if not user and login_id.isdigit():
+            user = await get_user_by_phone(db, login_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-        
+
     valid = await verify_and_consume_otp(user.id, body.otp)
     if not valid:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
-        
+
     from app.repositories.user_repository import update_user_password
     await update_user_password(db, user, body.new_password)
-    
+
     return {"message": "Password updated successfully. Please login."}
 
 
@@ -896,6 +943,14 @@ async def update_me(
     import bleach
     if body.full_name is not None:
         current_user.full_name = bleach.clean(body.full_name, tags=[], strip=True).strip()
+    if body.email is not None:
+        # Only allow setting email if user doesn't already have one (phone-only accounts)
+        if not current_user.email:
+            existing = await get_user_by_email(db, str(body.email))
+            if existing and existing.id != current_user.id:
+                raise HTTPException(status_code=409, detail="This email is already used by another account.")
+            current_user.email = str(body.email)
+        # If user already has an email, silently ignore (can't change email)
     if body.phone_number is not None:
         current_user.phone_number = body.phone_number
     if body.avatar_url is not None:

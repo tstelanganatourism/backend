@@ -5,7 +5,7 @@ from app.models.enums import (
     PaymentStatus, PackageType, RegionType, CancellationStatus, PolicyType,
     PromotionType, PromotionTarget, PromotionBadge, PublishStatus,
 )
-from app.models.user import User
+from app.models.user import User, AgentPackageQuota
 from app.models.tag import Tag
 from app.models.room import (
     Room, RoomSlotInventory, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy, room_tags
@@ -29,7 +29,7 @@ __all__ = [
     "UserRole", "AccountStatus", "GenderType", "BookingSource", "BookingStatus",
     "PaymentStatus", "PackageType", "RegionType", "CancellationStatus", "PolicyType",
     "PromotionType", "PromotionTarget", "PromotionBadge", "PublishStatus",
-    "User", "Tag", "Room", "RoomSlotInventory", "RoomGalleryImage", "RoomHighlight", "RoomFAQ", "RoomPolicy", "room_tags",
+    "User", "AgentPackageQuota", "Tag", "Room", "RoomSlotInventory", "RoomGalleryImage", "RoomHighlight", "RoomFAQ", "RoomPolicy", "room_tags",
     "Package", "PackageVariant", "PackageVariantInventory", "package_tags",
     "PackageGalleryImage", "PackageItineraryDay", "PackageHighlight",
     "PackageInclusion", "PackageExclusion", "PackageBoardingPoint",

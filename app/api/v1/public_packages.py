@@ -10,7 +10,10 @@ from app.core.timezone import ist_date_today
 from app.db.session import get_db
 from app.models.package import Package, PackageVariant, PackageVariantInventory, package_tags
 from app.models.tag import Tag
-from app.models.enums import PackageType, RegionType, PublishStatus
+from app.models.enums import PackageType, RegionType, PublishStatus, BookingStatus, UserRole
+from app.models.booking import Booking
+from app.models.user import User
+from app.middleware.auth import get_current_user_optional
 from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO, TransportOptionPublicDTO
 from app.schemas.inventory import PublicDateAvailability, PublicPackageAvailabilityResponse
 from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
@@ -377,6 +380,7 @@ async def get_package_availability(
     response: Response,
     month: str = Query(..., description="Month in YYYY-MM format, e.g. 2026-06"),
     db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Public availability endpoint for a package's detail page.
@@ -388,19 +392,22 @@ async def get_package_availability(
     - Dates with is_closed=True are returned with status='CLOSED'.
     - Dates with available_seats=0 are returned with status='SOLD_OUT'.
     - Dates with no inventory row are returned with status='NO_INVENTORY'.
+    - Personalised daily quotas and suspension controls are applied if an agent is logged in.
     """
-    set_no_store_headers(response)
     set_no_store_headers(response)
     from app.core.timezone import get_ist_now
     now_ist = get_ist_now()
     today = now_ist.date()
     is_after_6am = now_ist.hour >= 6
 
-    # Check Redis cache first
-    from app.services.redis_client import get_cached_availability
-    cached = await get_cached_availability(slug, month)
-    if cached is not None:
-        return cached
+    is_agent = current_user is not None and current_user.role == UserRole.AGENT
+
+    # Check Redis cache first (only for guests/non-agents)
+    if not is_agent:
+        from app.services.redis_client import get_cached_availability
+        cached = await get_cached_availability(slug, month)
+        if cached is not None:
+            return cached
 
     # Validate month format
     try:
@@ -432,9 +439,45 @@ async def get_package_availability(
         res_data = PublicPackageAvailabilityResponse(
             package_id=pkg.id, slug=pkg.slug, month=month, dates=[]
         )
-        from app.services.redis_client import set_cached_availability
-        await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+        if not is_agent:
+            from app.services.redis_client import set_cached_availability
+            await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
         return res_data
+
+    # Load agent quota details if applicable
+    agent_quota = None
+    booked_map = {}
+    if is_agent:
+        from app.models.user import AgentPackageQuota
+        quota_q = select(AgentPackageQuota).where(
+            AgentPackageQuota.agent_id == current_user.id,
+            AgentPackageQuota.package_id == pkg.id
+        )
+        agent_quota = (await db.execute(quota_q)).scalar_one_or_none()
+
+        # Query already booked passengers for this agent on this package for the dates
+        booked_q = (
+            select(
+                Booking.travel_date,
+                func.sum(Booking.adult_count + Booking.child_count + Booking.student_count).label("booked_sum")
+            )
+            .join(PackageVariant, PackageVariant.id == Booking.variant_id)
+            .where(
+                Booking.agent_id == current_user.id,
+                PackageVariant.package_id == pkg.id,
+                Booking.travel_date >= from_date,
+                Booking.travel_date <= to_date,
+                Booking.status.in_((BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID)),
+                Booking.deleted_at.is_(None)
+            )
+            .group_by(Booking.travel_date)
+        )
+        booked_res = await db.execute(booked_q)
+        for row in booked_res.all():
+            booked_map[row.travel_date] = int(row.booked_sum or 0)
+
+    daily_limit = agent_quota.daily_quota if agent_quota else 10
+    allowed = agent_quota.is_allowed if agent_quota else True
 
     variant_ids = [v.id for v in active_variants]
     variant_map = {v.id: v for v in active_variants}
@@ -508,7 +551,15 @@ async def get_package_availability(
                         status="NO_INVENTORY",
                     )
                 )
-            elif inv.is_closed:
+            elif inv.is_closed or (is_agent and not allowed):
+                avail_seats = max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count))
+                if is_agent:
+                    if not allowed:
+                        avail_seats = 0
+                    else:
+                        already_booked = booked_map.get(current, 0)
+                        remaining = max(0, daily_limit - already_booked)
+                        avail_seats = min(avail_seats, remaining)
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -520,13 +571,21 @@ async def get_package_availability(
                         effective_child_price=eff_child,
                         student_price=base_student,
                         effective_student_price=eff_student,
-                        available_seats=max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count)),
+                        available_seats=avail_seats,
                         is_closed=True,
                         status="CLOSED",
                     )
                 )
             else:
                 avail_seats = max(0, inv.total_capacity - (inv.booked_count + inv.reserved_count))
+                if is_agent:
+                    if not allowed:
+                        avail_seats = 0
+                    else:
+                        already_booked = booked_map.get(current, 0)
+                        remaining = max(0, daily_limit - already_booked)
+                        avail_seats = min(avail_seats, remaining)
+                
                 slot_status = "OPEN" if avail_seats > 0 else "SOLD_OUT"
                 availability.append(
                     PublicDateAvailability(
@@ -553,8 +612,9 @@ async def get_package_availability(
         month=month,
         dates=availability,
     )
-    from app.services.redis_client import set_cached_availability
-    await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+    if not is_agent:
+        from app.services.redis_client import set_cached_availability
+        await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
     return res_data
 
 

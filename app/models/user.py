@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Enum as SQLEnum, DateTime, Boolean, Numeric, Text
+from sqlalchemy import Column, String, Enum as SQLEnum, DateTime, Boolean, Numeric, Text, Integer, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel
 from app.models.enums import UserRole, AccountStatus
@@ -31,4 +31,23 @@ class User(BaseModel):
 
     # Relationships
     agent_bookings = relationship("Booking", foreign_keys="Booking.agent_id", back_populates="agent", lazy="dynamic")
+    package_quotas = relationship("AgentPackageQuota", back_populates="agent", cascade="all, delete-orphan")
+
+
+class AgentPackageQuota(BaseModel):
+    __tablename__ = "agent_package_quotas"
+
+    agent_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    package_id = Column(Integer, ForeignKey("packages.id", ondelete="CASCADE"), nullable=False, index=True)
+    daily_quota = Column(Integer, nullable=False, default=10, server_default="10")
+    is_allowed = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    # Relationships
+    agent = relationship("User", back_populates="package_quotas")
+    package = relationship("Package")
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "package_id", name="uq_agent_package_quota"),
+    )
+
 

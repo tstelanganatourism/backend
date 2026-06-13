@@ -29,6 +29,14 @@ async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
     return result.scalar_one_or_none()
 
 
+async def get_user_by_phone(db: AsyncSession, phone_number: str) -> Optional[User]:
+    """Fetch a user by phone number. Returns None if not found."""
+    result = await db.execute(
+        select(User).where(User.phone_number == phone_number, User.deleted_at.is_(None))
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
     """Fetch a user by primary key. Returns None if not found."""
     result = await db.execute(
@@ -49,11 +57,12 @@ async def create_tourist_user(
     db: AsyncSession,
     *,
     full_name: str,
-    email: str,
+    email: Optional[str] = None,
     password: str,
     phone_number: Optional[str] = None,
 ) -> User:
-    """Create a new tourist account. Hashes password before storage."""
+    """Create a new tourist account. Hashes password before storage.
+    Either email or phone_number must be provided."""
     user = User(
         full_name=_sanitize_name(full_name),
         email=email,
