@@ -327,6 +327,10 @@ async def delete_user(
 
     user_obj.deleted_at = get_ist_now()
     user_obj.is_active = False
+    if user_obj.email:
+        user_obj.email = f"{user_obj.email}.deleted.{int(get_ist_now().timestamp())}"
+    if user_obj.phone_number:
+        user_obj.phone_number = f"{user_obj.phone_number}.deleted.{int(get_ist_now().timestamp())}"
     await db.commit()
 
     await log_action(

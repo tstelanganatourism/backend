@@ -280,6 +280,10 @@ async def delete_agent(
 
     agent.deleted_at = get_ist_now()
     agent.is_active = False
+    if agent.email:
+        agent.email = f"{agent.email}.deleted.{int(get_ist_now().timestamp())}"
+    if agent.phone_number:
+        agent.phone_number = f"{agent.phone_number}.deleted.{int(get_ist_now().timestamp())}"
     await db.commit()
 
     await log_action(
