@@ -63,6 +63,13 @@ class TouristSignupRequest(AppBaseModel):
     def validate_full_name(cls, v: str) -> str:
         return _validate_human_name(v)
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def strip_email(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip() or None
+        return None
+
     @field_validator("phone_number", mode="before")
     @classmethod
     def strip_phone(cls, v: Optional[str]) -> Optional[str]:
@@ -141,6 +148,13 @@ class ProfileUpdateRequest(AppBaseModel):
         if v is None:
             return v
         return _validate_human_name(v)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def strip_email(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            return v.strip() or None
+        return None
 
 
 class TokenResponse(AppBaseModel):
