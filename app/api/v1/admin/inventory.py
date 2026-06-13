@@ -14,6 +14,7 @@ Routes:
   DELETE /api/v1/admin/inventory/packages/{variant_id}/{date}
 """
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -356,7 +357,6 @@ async def update_inventory_row(
     if variant:
         is_student = variant.package.is_student_package
         modifier = row.price_override if row.price_override is not None else Decimal("0.00")
-        from decimal import Decimal
         if is_student:
             eff_student = max(Decimal("0.00"), (variant.student_price or Decimal("0.00")) + modifier)
             eff_adult = Decimal("0.00")
