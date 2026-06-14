@@ -280,6 +280,7 @@ async def delete_agent(
 
     agent.deleted_at = get_ist_now()
     agent.is_active = False
+    agent.google_id = None
     if agent.email:
         agent.email = f"{agent.email}.deleted.{int(get_ist_now().timestamp())}"
     if agent.phone_number:

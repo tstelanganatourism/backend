@@ -591,6 +591,18 @@ async def checkout(
                 day_price = variant.weekend_price
             else:
                 day_price = variant.weekday_price
+            
+            # Hook for special ₹1 user testing
+            if current_user and (
+                current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+                current_user.phone_number == "8887773331"
+            ):
+                # Query room to check its lodge name
+                room_res = await db.execute(select(Room).where(Room.id == variant.room_id))
+                room_obj = room_res.scalar_one_or_none()
+                if room_obj and "vashista" in room_obj.lodge_name.lower() and "bhadrachalam" in room_obj.lodge_name.lower():
+                    day_price = Decimal("1.00")
+                    
             subtotal_amount += Decimal(str(required_rooms)) * day_price
         commissionable_base = subtotal_amount
 

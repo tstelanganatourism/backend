@@ -327,6 +327,7 @@ async def delete_user(
 
     user_obj.deleted_at = get_ist_now()
     user_obj.is_active = False
+    user_obj.google_id = None
     if user_obj.email:
         user_obj.email = f"{user_obj.email}.deleted.{int(get_ist_now().timestamp())}"
     if user_obj.phone_number:
