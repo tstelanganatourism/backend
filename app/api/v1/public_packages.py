@@ -206,13 +206,20 @@ async def get_packages(
 async def get_package_detail(
     slug: str,
     response: Response,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Public Package Detail API.
     Returns full details for a specific package, including all content sections.
     """
-    cache_key = f"packages:detail:{slug}"
+    user_suffix = ""
+    if current_user and (
+        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+        current_user.phone_number == "8887773331"
+    ):
+        user_suffix = ":special_user"
+    cache_key = f"packages:detail:{slug}{user_suffix}"
     set_public_cache_headers(response)
 
     async def load_package_detail() -> PackageDetailDTO:
@@ -271,7 +278,16 @@ async def get_package_detail(
         pkg_policies = results[8]
         pkg_transport_options = results[9]
             
-        if pkg.is_student_package:
+        is_promo_user = False
+        if current_user and (
+            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+            current_user.phone_number == "8887773331"
+        ):
+            is_promo_user = True
+
+        if is_promo_user:
+            starting_price = Decimal("1.00")
+        elif pkg.is_student_package:
             starting_price = min((v.student_price for v in pkg_variants if v.student_price is not None), default=None)
         else:
             starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
@@ -328,12 +344,12 @@ async def get_package_detail(
                 PackageVariantPublicDTO(
                     id=v.id,
                     title=v.title,
-                    adult_price=v.adult_price or Decimal("0.00"),
-                    child_price=v.child_price or Decimal("0.00"),
-                    weekend_adult_price=v.weekend_adult_price,
-                    weekend_child_price=v.weekend_child_price,
-                    student_price=v.student_price,
-                    weekend_student_price=v.weekend_student_price,
+                    adult_price=Decimal("1.00") if is_promo_user else (v.adult_price or Decimal("0.00")),
+                    child_price=Decimal("1.00") if is_promo_user else (v.child_price or Decimal("0.00")),
+                    weekend_adult_price=Decimal("1.00") if is_promo_user else v.weekend_adult_price,
+                    weekend_child_price=Decimal("1.00") if is_promo_user else v.weekend_child_price,
+                    student_price=Decimal("1.00") if is_promo_user else v.student_price,
+                    weekend_student_price=Decimal("1.00") if is_promo_user else v.weekend_student_price,
                     transport_info=None
                 ) for v in pkg_variants
             ],
@@ -533,6 +549,20 @@ async def get_package_availability(
                 eff_student = None
                 eff_adult = max(Decimal("0.00"), (base_adult or Decimal("0.00")) + modifier)
                 eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
+                
+            # Hook for special ₹1 user testing
+            if current_user and (
+                current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+                current_user.phone_number == "8887773331"
+            ):
+                if is_student:
+                    base_student = Decimal("1.00")
+                    eff_student = Decimal("1.00")
+                else:
+                    base_adult = Decimal("1.00")
+                    base_child = Decimal("1.00")
+                    eff_adult = Decimal("1.00")
+                    eff_child = Decimal("1.00")
 
             if inv is None:
                 availability.append(

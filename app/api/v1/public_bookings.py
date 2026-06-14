@@ -454,6 +454,14 @@ async def checkout(
                 refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
 
         subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
+        
+        # Hook for special ₹1 user testing
+        if current_user and (
+            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+            current_user.phone_number == "8887773331"
+        ):
+            subtotal_amount = Decimal("1.00")
+            
         commissionable_base = base_subtotal
 
         # Store student metadata in pricing snapshot for invoice/ticket rendering
