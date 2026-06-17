@@ -159,7 +159,7 @@ async def get_room_detail(
     user_suffix = ""
     if current_user and (
         current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8887773331"
+        current_user.phone_number == "8886154275"
     ):
         user_suffix = ":special_user"
     cache_key = f"rooms:detail:{slug}{user_suffix}"
@@ -211,7 +211,7 @@ async def get_room_detail(
         is_promo_user = False
         if current_user and (
             current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8887773331"
+            current_user.phone_number == "8886154275"
         ):
             if r.lodge_name and "vashista" in r.lodge_name.lower() and "bhadrachalam" in r.lodge_name.lower():
                 is_promo_user = True

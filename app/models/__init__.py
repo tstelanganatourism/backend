@@ -16,7 +16,7 @@ from app.models.package import (
     PackageInclusion, PackageExclusion, PackageBoardingPoint,
     PackageFAQ, PackagePolicy
 )
-from app.models.booking import Booking, BookingStayDate, BookingPassenger, CancellationRequest
+from app.models.booking import Booking, BookingStayDate, BookingPassenger, CancellationRequest, PostponeRequest
 from app.models.payment import Payment
 from app.models.add_on import AddOn
 from app.models.promotion import Promotion
@@ -34,6 +34,6 @@ __all__ = [
     "PackageGalleryImage", "PackageItineraryDay", "PackageHighlight",
     "PackageInclusion", "PackageExclusion", "PackageBoardingPoint",
     "PackageFAQ", "PackagePolicy",
-    "Booking", "BookingStayDate", "BookingPassenger", "CancellationRequest", "Payment", "AddOn",
+    "Booking", "BookingStayDate", "BookingPassenger", "CancellationRequest", "PostponeRequest", "Payment", "AddOn",
     "Promotion", "Coupon", "SystemSettings", "AuditLog"
 ]

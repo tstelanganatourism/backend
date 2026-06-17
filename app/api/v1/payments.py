@@ -20,6 +20,77 @@ from app.services.cashfree_client import cashfree_service
 from app.core.security import AadharCryptography, AadharHashing
 from app.core.timezone import get_ist_now
 
+async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> list:
+    """
+    Releases locked inventory for a single BookingDraft and returns SSE payloads.
+    """
+    sse_payloads = []
+    logger.info(f"Releasing inventory for draft {draft.draft_id} ({draft.target_type})")
+    
+    try:
+        if draft.target_type == 'package':
+            inv_query = select(PackageVariantInventory).where(
+                PackageVariantInventory.variant_id == draft.variant_id,
+                PackageVariantInventory.date == draft.travel_date
+            ).with_for_update()
+            inv_res = await db.execute(inv_query)
+            inventory = inv_res.scalar_one_or_none()
+            if inventory:
+                inventory.reserved_count = max(0, inventory.reserved_count - draft.quantity)
+                await db.flush()
+                
+                from sqlalchemy.orm import joinedload
+                from app.models.package import PackageVariant
+                v_res = await db.execute(select(PackageVariant).options(joinedload(PackageVariant.package)).where(PackageVariant.id == draft.variant_id))
+                variant = v_res.scalar_one_or_none()
+                if variant:
+                    from app.utils.sse import build_package_sse_payload
+                    sse_payloads.append(build_package_sse_payload(variant, inventory, draft.travel_date))
+
+        elif draft.target_type == 'room':
+            payload = draft.checkout_payload or {}
+            from datetime import date, timedelta, time
+            
+            travel_date_str = payload.get('travel_date') or str(draft.travel_date)
+            arrival = date.fromisoformat(travel_date_str)
+            departure_str = payload.get('departure_date')
+            departure = date.fromisoformat(departure_str) if departure_str else (arrival + timedelta(days=1))
+            
+            current = arrival
+            stay_dates = []
+            while current < departure:
+                stay_dates.append(current)
+                current += timedelta(days=1)
+                
+            slot_start = time.fromisoformat(payload['slot_start']) if payload.get('slot_start') else None
+            slot_end = time.fromisoformat(payload['slot_end']) if payload.get('slot_end') else None
+
+            from app.models.room import RoomVariant
+            room_var_id = draft.room_variant_id or payload.get('room_variant_id')
+            if room_var_id:
+                room_var = await db.execute(select(RoomVariant).where(RoomVariant.id == room_var_id))
+                rv = room_var.scalar_one_or_none()
+                if rv:
+                    from app.services.room_calculation import calculate_required_rooms
+                    required_rooms = calculate_required_rooms(draft.quantity, rv.capacity_per_room)
+
+                    for stay_date in stay_dates:
+                        inv_query = select(RoomSlotInventory).where(
+                            RoomSlotInventory.room_variant_id == room_var_id,
+                            RoomSlotInventory.date == stay_date,
+                            RoomSlotInventory.slot_start == slot_start,
+                            RoomSlotInventory.slot_end == slot_end
+                        ).with_for_update()
+                        inv_res = await db.execute(inv_query)
+                        room_inv = inv_res.scalar_one_or_none()
+                        if room_inv:
+                            room_inv.reserved_rooms = max(0, room_inv.reserved_rooms - required_rooms)
+                            
+    except Exception as e:
+        logger.error(f"Failed to release draft inventory for {draft.draft_id}: {e}")
+        
+    return sse_payloads
+
 router = APIRouter()
 
 
@@ -59,27 +130,13 @@ async def _finalize_draft(
 
             await db.flush()
             if sse_payloads is not None:
-                import time
-                from app.core.timezone import get_ist_now
+                from sqlalchemy.orm import joinedload
                 from app.models.package import PackageVariant
-                v_res = await db.execute(select(PackageVariant).where(PackageVariant.id == draft.variant_id))
+                v_res = await db.execute(select(PackageVariant).options(joinedload(PackageVariant.package)).where(PackageVariant.id == draft.variant_id))
                 variant = v_res.scalar_one_or_none()
                 if variant:
-                    from app.api.v1.public_packages import get_effective_package_prices
-                    eff_adult, eff_child = get_effective_package_prices(variant.adult_price, variant.child_price, inventory.price_override)
-                    sse_payloads.append({
-                        "version": int(time.time() * 1000),
-                        "timestamp": get_ist_now().isoformat(),
-                        "package_id": variant.package_id,
-                        "travel_date": str(draft.travel_date),
-                        "available": inventory.total_capacity - (inventory.booked_count + inventory.reserved_count),
-                        "reserved": inventory.reserved_count,
-                        "booked": inventory.booked_count,
-                        "is_closed": inventory.is_closed,
-                        "effective_adult_price": float(eff_adult),
-                        "effective_child_price": float(eff_child),
-                        "variant_id": draft.variant_id
-                    })
+                    from app.utils.sse import build_package_sse_payload
+                    sse_payloads.append(build_package_sse_payload(variant, inventory, draft.travel_date))
 
     elif draft.target_type == 'room':
         payload = draft.checkout_payload
@@ -262,10 +319,25 @@ async def _finalize_draft(
     if background_tasks:
         background_tasks.add_task(_enqueue_documents_task_safe, booking.id, booking.public_id, booking.status == BookingStatus.FULLY_PAID)
 
-    # 8. Delete Draft
+    # 8. Enqueue confirmation SMS via arq (Zero-DB background task)
+    # get_booking_sms_payload runs NOW while db is still open — no new connection.
+    # dispatch_sms_payload is enqueued to arq/Redis — retried if MSG91 is down.
+    try:
+        await db.flush()
+        from app.services.sms_service import get_booking_sms_payload
+        from app.worker import get_arq_pool
+        sms_payload = await get_booking_sms_payload(booking.id, db)
+        if sms_payload:
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+    except Exception as _sms_err:
+        logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
+
+    # 9. Delete Draft
     await db.delete(draft)
     await db.flush()
     return booking.public_id
+
 
 
 # ─── PhonePe: Verify Status (polling after redirect) ─────────────────────────
@@ -291,7 +363,6 @@ async def verify_status(
         res = await db.execute(draft_query)
         draft = res.scalar_one_or_none()
         if draft:
-            from app.workers.draft_cleanup import release_draft_inventory
             sse_payloads = await release_draft_inventory(draft, db)
             await db.delete(draft)
             await db.commit()
@@ -345,6 +416,17 @@ async def verify_status(
 
                 from app.utils.ledger import recompute_booking_ledger
                 booking = await recompute_booking_ledger(booking.id, db)
+
+                # Enqueue SMS via arq (Zero-DB, retried if MSG91 is down)
+                try:
+                    from app.services.sms_service import get_booking_sms_payload
+                    from app.worker import get_arq_pool
+                    sms_payload = await get_booking_sms_payload(booking.id, db)
+                    if sms_payload:
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                except Exception as _sms_err:
+                    logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 
             async def _enqueue_bal_task(b_id: int, is_fully_paid: bool):
                 try:
@@ -405,7 +487,6 @@ async def verify_cashfree_status(
         res = await db.execute(draft_query)
         draft = res.scalar_one_or_none()
         if draft:
-            from app.workers.draft_cleanup import release_draft_inventory
             sse_payloads = await release_draft_inventory(draft, db)
             await db.delete(draft)
             await db.commit()
@@ -448,6 +529,17 @@ async def verify_cashfree_status(
                 payment.pg_payment_id = payment_id
                 from app.utils.ledger import recompute_booking_ledger
                 booking = await recompute_booking_ledger(booking.id, db)
+
+                # Enqueue SMS via arq (Zero-DB, retried if MSG91 is down)
+                try:
+                    from app.services.sms_service import get_booking_sms_payload
+                    from app.worker import get_arq_pool
+                    sms_payload = await get_booking_sms_payload(booking.id, db)
+                    if sms_payload:
+                        arq_pool = await get_arq_pool()
+                        await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                except Exception as _sms_err:
+                    logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 
             async def _enqueue_cashfree_bal(b_id: int, is_fully_paid: bool):
                 try:
@@ -602,7 +694,6 @@ async def phonepe_webhook(
             res = await db.execute(draft_query)
             draft = res.scalar_one_or_none()
             if draft:
-                from app.workers.draft_cleanup import release_draft_inventory
                 sse_payloads = await release_draft_inventory(draft, db)
                 await db.delete(draft)
                 await db.commit()
@@ -731,7 +822,6 @@ async def cashfree_webhook(
             res = await db.execute(draft_query)
             draft = res.scalar_one_or_none()
             if draft:
-                from app.workers.draft_cleanup import release_draft_inventory
                 sse_payloads = await release_draft_inventory(draft, db)
                 await db.delete(draft)
                 await db.commit()

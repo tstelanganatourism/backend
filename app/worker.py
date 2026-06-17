@@ -4,6 +4,7 @@ from arq import create_pool, cron
 from arq.connections import RedisSettings
 from app.core.config import settings
 from app.services.pdf_generator import generate_package_brochure_task, process_post_booking_documents_task
+from app.services.sms_service import dispatch_sms_payload
 from app.workers.daily_cutoff import perform_daily_cutoff
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ async def shutdown(ctx):
     logger.info("Database connection pool disposed gracefully.")
 
 class WorkerSettings:
-    functions = [generate_package_brochure_task, process_post_booking_documents_task]
+    functions = [generate_package_brochure_task, process_post_booking_documents_task, dispatch_sms_payload]
     cron_jobs = [
         cron(perform_daily_cutoff, second=0, run_at_startup=True),
     ]

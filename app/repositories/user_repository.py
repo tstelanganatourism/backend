@@ -127,3 +127,28 @@ async def update_user_password(db: AsyncSession, user: User, new_password: str) 
     db.add(user)
     await db.commit()
     await db.refresh(user)
+
+
+async def get_or_create_tourist_by_phone(db: AsyncSession, phone: str) -> User:
+    """
+    Find a tourist by phone number, or create a new minimal account.
+    Used by the phone OTP login flow — no password required.
+    """
+    user = await get_user_by_phone(db, phone)
+    if user:
+        return user
+
+    last4 = phone[-4:] if len(phone) >= 4 else phone
+    new_user = User(
+        full_name=f"Guest {last4}",
+        phone_number=phone,
+        email=None,
+        password_hash=None,
+        role=UserRole.USER,
+        account_status=AccountStatus.ACTIVE,
+        is_active=True,
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return new_user

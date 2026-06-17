@@ -10,6 +10,9 @@ from datetime import timedelta
 from typing import Optional
 
 import redis.asyncio as aioredis
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError, TimeoutError
 from app.core.config import settings
 
 
@@ -22,6 +25,7 @@ def get_redis() -> aioredis.Redis:
     """Return the process-level Redis client, creating it on first call."""
     global _redis_client
     if _redis_client is None:
+        retry_strategy = Retry(ExponentialBackoff(cap=10, base=1), 3)
         _redis_client = aioredis.from_url(
             settings.REDIS_URL,
             encoding="utf-8",
@@ -30,6 +34,9 @@ def get_redis() -> aioredis.Redis:
             socket_timeout=3.0,
             max_connections=10,
             health_check_interval=10,
+            retry_on_timeout=True,
+            retry=retry_strategy,
+            retry_on_error=[ConnectionError, TimeoutError, ConnectionResetError]
         )
     return _redis_client
 
@@ -39,12 +46,16 @@ def get_redis_raw() -> aioredis.Redis:
     """Return the process-level Redis client for raw bytes (no string decoding)."""
     global _redis_client_raw
     if _redis_client_raw is None:
+        retry_strategy = Retry(ExponentialBackoff(cap=10, base=1), 3)
         _redis_client_raw = aioredis.from_url(
             settings.REDIS_URL,
             socket_connect_timeout=3.0,
             socket_timeout=3.0,
             max_connections=10,
             health_check_interval=10,
+            retry_on_timeout=True,
+            retry=retry_strategy,
+            retry_on_error=[ConnectionError, TimeoutError, ConnectionResetError]
         )
     return _redis_client_raw
 
@@ -160,3 +171,81 @@ async def invalidate_cached_availability(slug: str) -> None:
     except Exception:
         pass
 
+
+# ─── SMS OTP (Phone-based, for tourist login) ────────────────────────────────
+# Keys:
+#   sms_otp:{phone}           — the OTP value, TTL=300s (5 min)
+#   sms_otp_cooldown:{phone}  — resend cooldown lock, TTL=60s
+#   sms_otp_attempts:{phone}  — attempt counter, TTL=600s (10 min window)
+
+SMS_OTP_TTL = 300           # 5 minutes
+SMS_OTP_COOLDOWN_TTL = 60   # 60 seconds between resends
+SMS_OTP_MAX_ATTEMPTS = 3    # max sends per 10-min window
+SMS_OTP_LOCKOUT_TTL = 600   # 10-minute lockout window
+
+
+async def store_sms_otp(phone: str, otp: str) -> None:
+    """Store an SMS OTP for the given phone number. TTL = 5 minutes."""
+    client = get_redis()
+    await client.setex(f"sms_otp:{phone}", SMS_OTP_TTL, otp)
+
+
+async def verify_and_consume_sms_otp(phone: str, submitted_otp: str) -> bool:
+    """
+    Verify the SMS OTP for a phone number and delete it on success (single-use).
+    Returns True if valid, False otherwise.
+    """
+    client = get_redis()
+    key = f"sms_otp:{phone}"
+    stored = await client.get(key)
+    if stored is None or stored != submitted_otp:
+        return False
+    await client.delete(key)
+    return True
+
+
+async def check_sms_otp_rate_limit(phone: str) -> dict:
+    """
+    Check if a phone number is allowed to request a new OTP.
+    Returns a dict with:
+      allowed: bool
+      cooldown_seconds: int (0 if not in cooldown)
+      attempts_remaining: int
+      locked: bool
+    """
+    client = get_redis()
+    cooldown_key = f"sms_otp_cooldown:{phone}"
+    attempts_key = f"sms_otp_attempts:{phone}"
+
+    attempts_str = await client.get(attempts_key)
+    attempts = int(attempts_str) if attempts_str else 0
+
+    if attempts >= SMS_OTP_MAX_ATTEMPTS:
+        ttl = await client.ttl(attempts_key)
+        return {"allowed": False, "cooldown_seconds": max(0, ttl), "attempts_remaining": 0, "locked": True}
+
+    cooldown_ttl = await client.ttl(cooldown_key)
+    in_cooldown = cooldown_ttl > 0
+
+    if in_cooldown:
+        return {"allowed": False, "cooldown_seconds": cooldown_ttl, "attempts_remaining": SMS_OTP_MAX_ATTEMPTS - attempts, "locked": False}
+
+    return {"allowed": True, "cooldown_seconds": 0, "attempts_remaining": SMS_OTP_MAX_ATTEMPTS - attempts, "locked": False}
+
+
+async def record_sms_otp_send(phone: str) -> None:
+    """
+    Record that an OTP was sent to this phone.
+    Increments the attempt counter and sets the 60s cooldown.
+    """
+    client = get_redis()
+    attempts_key = f"sms_otp_attempts:{phone}"
+    cooldown_key = f"sms_otp_cooldown:{phone}"
+
+    # Increment attempt counter; set TTL only on first increment
+    current = await client.incr(attempts_key)
+    if current == 1:
+        await client.expire(attempts_key, SMS_OTP_LOCKOUT_TTL)
+
+    # Set cooldown lock
+    await client.setex(cooldown_key, SMS_OTP_COOLDOWN_TTL, "1")

@@ -161,11 +161,7 @@ async def generate_package_inventory(
 
     # Broadcast SSE for newly created inventory dates
     if created > 0:
-        import time
-        from app.core.timezone import get_ist_now
-        from app.utils.sse import sse_manager
-        from app.api.v1.public_packages import get_effective_package_prices
-        
+        from app.utils.sse import sse_manager, build_package_sse_payload
         from sqlalchemy.orm import joinedload
         variant_res = await db.execute(
             select(PackageVariant)
@@ -174,33 +170,11 @@ async def generate_package_inventory(
         )
         variant = variant_res.scalar_one_or_none()
         if variant:
-            is_student = variant.package.is_student_package
-            if is_student:
-                eff_student = max(Decimal("0.00"), variant.student_price or Decimal("0.00"))
-                eff_adult = Decimal("0.00")
-                eff_child = Decimal("0.00")
-            else:
-                eff_student = None
-                eff_adult = max(Decimal("0.00"), variant.adult_price or Decimal("0.00"))
-                eff_child = max(Decimal("0.00"), variant.child_price or Decimal("0.00"))
-
             current_date = body.from_date
             while current_date <= body.to_date:
                 if current_date not in existing_dates:
-                    sse_payload = {
-                        "version": int(time.time() * 1000),
-                        "timestamp": get_ist_now().isoformat(),
-                        "package_id": variant.package_id,
-                        "travel_date": str(current_date),
-                        "available": body.total_capacity,
-                        "reserved": 0,
-                        "booked": 0,
-                        "is_closed": False,
-                        "effective_adult_price": float(eff_adult),
-                        "effective_child_price": float(eff_child),
-                        "effective_student_price": float(eff_student) if eff_student is not None else None,
-                        "variant_id": body.variant_id
-                    }
+                    sse_payload = build_package_sse_payload(variant, None, current_date)
+                    sse_payload["available"] = body.total_capacity
                     await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
                 current_date += timedelta(days=1)
 
@@ -344,9 +318,7 @@ async def update_inventory_row(
     await db.refresh(row)
     
     # Broadcast SSE for Admin Inventory Edit
-    import time
-    from app.core.timezone import get_ist_now
-    from app.utils.sse import sse_manager
+    from app.utils.sse import sse_manager, build_package_sse_payload
     from sqlalchemy.orm import joinedload
     variant_res = await db.execute(
         select(PackageVariant)
@@ -355,31 +327,7 @@ async def update_inventory_row(
     )
     variant = variant_res.scalar_one_or_none()
     if variant:
-        is_student = variant.package.is_student_package
-        modifier = row.price_override if row.price_override is not None else Decimal("0.00")
-        if is_student:
-            eff_student = max(Decimal("0.00"), (variant.student_price or Decimal("0.00")) + modifier)
-            eff_adult = Decimal("0.00")
-            eff_child = Decimal("0.00")
-        else:
-            eff_student = None
-            eff_adult = max(Decimal("0.00"), (variant.adult_price or Decimal("0.00")) + modifier)
-            eff_child = max(Decimal("0.00"), (variant.child_price or Decimal("0.00")) + modifier)
-
-        sse_payload = {
-            "version": int(time.time() * 1000),
-            "timestamp": get_ist_now().isoformat(),
-            "package_id": variant.package_id,
-            "travel_date": str(inv_date),
-            "available": row.total_capacity - (row.booked_count + row.reserved_count),
-            "reserved": row.reserved_count,
-            "booked": row.booked_count,
-            "is_closed": row.is_closed,
-            "effective_adult_price": float(eff_adult),
-            "effective_child_price": float(eff_child),
-            "effective_student_price": float(eff_student) if eff_student is not None else None,
-            "variant_id": variant_id
-        }
+        sse_payload = build_package_sse_payload(variant, row, inv_date)
         await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
 
     await log_action(
@@ -445,23 +393,14 @@ async def delete_inventory_row(
     await db.commit()
     
     # Broadcast SSE for Admin Inventory Delete
-    variant_res = await db.execute(select(PackageVariant).where(PackageVariant.id == variant_id))
+    from sqlalchemy.orm import joinedload
+    variant_res = await db.execute(select(PackageVariant).options(joinedload(PackageVariant.package)).where(PackageVariant.id == variant_id))
     variant = variant_res.scalar_one_or_none()
     if variant:
-        import time
-        from app.core.timezone import get_ist_now
-        from app.utils.sse import sse_manager
-        sse_payload = {
-            "version": int(time.time() * 1000),
-            "timestamp": get_ist_now().isoformat(),
-            "package_id": variant.package_id,
-            "travel_date": str(inv_date),
-            "available": 0,
-            "reserved": 0,
-            "booked": 0,
-            "is_closed": True,
-            "variant_id": variant_id
-        }
+        from app.utils.sse import sse_manager, build_package_sse_payload
+        sse_payload = build_package_sse_payload(variant, None, inv_date)
+        sse_payload["available"] = 0
+        sse_payload["is_closed"] = True
         await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
 
     clear_cache_prefix(f"inventory:packages:{variant_id}")

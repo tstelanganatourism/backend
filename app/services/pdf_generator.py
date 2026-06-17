@@ -131,7 +131,7 @@ async def generate_package_brochure_task(ctx, package_id: int):
             await db.commit()
             raise e # Raise to let ARQ handle retries if applicable
 
-async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None):
+async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None, is_postponement: bool = False):
     """
     Background task to send booking confirmation email.
     PDF generation is client-side — the email contains links to the beautiful
@@ -207,12 +207,13 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
 
         # 5. Prepare and Send Email
         if not recipients:
-            # Send admin notification even if customer has no email (walk-in/guest/admin direct)
-            try:
-                from app.services.admin_notification import send_admin_booking_notification
-                await send_admin_booking_notification(booking, db=db)
-            except Exception as e:
-                logger.error(f"Failed to dispatch admin notification for recipient-less booking: {e}")
+            if not is_postponement:
+                # Send admin notification even if customer has no email (walk-in/guest/admin direct)
+                try:
+                    from app.services.admin_notification import send_admin_booking_notification
+                    await send_admin_booking_notification(booking, db=db)
+                except Exception as e:
+                    logger.error(f"Failed to dispatch admin notification for recipient-less booking: {e}")
 
             # Skip customer email but log the skip
             log_entry = EmailLog(
@@ -229,8 +230,8 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
 
         # Build premium, email-client-safe HTML content.
         office_phone = "+91 95420 69573"
-        office_address = "Telangana Boat Tourism, near SBI ATM, SREE SEETHA RAMA TEMPLE PARKING, DR-NO-4-1-78/1, kalyana mandapam road, opp. sbi atm, Bhadrachalam, Telangana 507111"
-        office_maps_url = "https://maps.app.goo.gl/6YDfViEq3RLuvNN36?g_st=awb"
+        office_address = "DR NO:4-1-78/1, KALYANA MANDAPAM ROAD OPP SBI ATM, BHADRACHALAM, BHADRADRI KOTHAGUDEM (DIST), TELANGANA-507111"
+        office_maps_url = "https://maps.app.goo.gl/ZZynQYDrgaDAipDz6?g_st=awb"
         # Recipient name is handled per-recipient in _generate_html
         safe_booking_id = escape(booking.public_id)
         safe_ticket_url = escape(ticket_url, quote=True)
@@ -427,7 +428,19 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                         </tr>
         """
 
-        if is_fully_paid:
+        if is_postponement:
+            email_type = "POSTPONEMENT"
+            subject = "Booking Rescheduled - TS Tours"
+            message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> has been successfully rescheduled to {booking.travel_date.isoformat()}. Your updated official ticket is ready below."
+            financial_details = f"""
+                        <tr>
+                            <td style="padding:16px 20px; border-bottom:1px solid #dbe6ea;">
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">Booking status</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:#05845f; font-size:17px; line-height:25px; font-weight:800;">Rescheduled</div>
+                            </td>
+                        </tr>
+            """.rstrip()
+        elif is_fully_paid:
             email_type = "FULL_PAYMENT"
             subject = "Booking Confirmed - TS Tours"
             if is_room_booking:
@@ -506,11 +519,12 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             )
             db.add(log_entry)
 
-        # Send admin notification — reuse same session
-        try:
-            await send_admin_booking_notification(booking, db=db)
-        except Exception as e:
-            logger.error(f"Failed to dispatch admin notification: {e}")
+        # Send admin notification — reuse same session (Skip if postponement)
+        if not is_postponement:
+            try:
+                await send_admin_booking_notification(booking, db=db)
+            except Exception as e:
+                logger.error(f"Failed to dispatch admin notification: {e}")
 
         await db.commit()
         logger.info(f"process_post_booking_documents_task completed for booking {booking_id}")

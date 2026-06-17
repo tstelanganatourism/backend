@@ -72,9 +72,11 @@ class PublicDateAvailability(AppBaseModel):
     variant_title: str
     adult_price: Decimal
     child_price: Decimal
+    student_price: Optional[Decimal] = None
     # Effective prices (price_override if set, else variant base price)
     effective_adult_price: Decimal
     effective_child_price: Decimal
+    effective_student_price: Optional[Decimal] = None
     available_seats: int
     is_closed: bool
     # Derived status for easy frontend consumption

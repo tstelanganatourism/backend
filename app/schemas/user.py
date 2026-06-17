@@ -183,3 +183,24 @@ class ResetPasswordRequest(AppBaseModel):
     login_id: str = Field(..., min_length=1, description="Email address or 10-digit phone number")
     otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
     new_password: str = Field(..., min_length=8, max_length=128)
+
+
+# ─── Phone OTP (Tourist Login) ───────────────────────────────────────────────
+
+class PhoneOTPSendRequest(AppBaseModel):
+    """Request to send an OTP to a phone number for tourist login."""
+    phone: str = Field(..., min_length=10, max_length=10, pattern=r"^\d{10}$",
+                       description="10-digit mobile number")
+
+
+class PhoneOTPVerifyRequest(AppBaseModel):
+    """Request to verify an OTP and log in."""
+    phone: str = Field(..., min_length=10, max_length=10, pattern=r"^\d{10}$")
+    otp: str = Field(..., min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class PhoneOTPSendResponse(AppBaseModel):
+    """Returned after successfully sending (or rate-limiting) an OTP."""
+    message: str
+    cooldown_seconds: int = 60
+    attempts_remaining: int

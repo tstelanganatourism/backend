@@ -60,23 +60,31 @@ async def send_admin_booking_notification(
 
     # ── 3. Passenger roster HTML ──────────────────────────────────────────────
     passenger_rows = ""
+    is_student_pkg = (booking.student_count or 0) > 0
+    age_or_class_header = "Class" if is_student_pkg else "Age"
+    
     if booking.passengers:
         real_passengers = []
         quick_adults = 0
         quick_children = 0
+        quick_students = 0
         
         for p in booking.passengers:
             is_quick_guest = not p.is_primary and (
                 (pricing.get("booking_mode") == "QUICK") or
-                ("quick ticket" in p.full_name.lower()) or
-                ("guest adult" in p.full_name.lower()) or
-                ("guest child" in p.full_name.lower())
+                (p.full_name and "quick ticket" in p.full_name.lower()) or
+                (p.full_name and "guest adult" in p.full_name.lower()) or
+                (p.full_name and "guest child" in p.full_name.lower()) or
+                (p.full_name and "guest student" in p.full_name.lower())
             )
             if is_quick_guest:
-                if p.age and p.age < 11:
-                    quick_children += 1
+                if is_student_pkg:
+                    quick_students += 1
                 else:
-                    quick_adults += 1
+                    if p.age is not None and p.age < 11:
+                        quick_children += 1
+                    else:
+                        quick_adults += 1
             else:
                 real_passengers.append(p)
                 
@@ -90,6 +98,7 @@ async def send_admin_booking_notification(
                 'text-transform:uppercase;letter-spacing:.5px;">PRIMARY</span>'
                 if p.is_primary else ""
             )
+            age_or_class_val = p.student_class or "—" if is_student_pkg else f"{p.age} yrs"
             passenger_rows += f"""
             <tr>
               <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#1e293b;">
@@ -100,11 +109,26 @@ async def send_admin_booking_notification(
                   </tr>
                 </table>
               </td>
-              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#475569;text-align:center;">{p.age} yrs</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#475569;text-align:center;">{age_or_class_val}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#475569;text-align:center;">{gender}</td>
             </tr>"""
             row_idx += 1
             
+        if quick_students > 0:
+            passenger_rows += f"""
+            <tr>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#64748b;font-style:italic;">
+                <table cellpadding="0" cellspacing="0" border="0" style="margin:0;padding:0;">
+                  <tr>
+                    <td style="width:22px;height:22px;background:#e2e8f0;color:#64748b;text-align:center;vertical-align:middle;border-radius:50%;font-size:10px;font-weight:700;">QT</td>
+                    <td style="padding-left:8px;vertical-align:middle;"><strong>Not Provided (Student) x {quick_students}</strong></td>
+                  </tr>
+                </table>
+              </td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#94a3b8;text-align:center;">—</td>
+            </tr>"""
+
         if quick_adults > 0:
             passenger_rows += f"""
             <tr>
@@ -147,7 +171,14 @@ async def send_admin_booking_notification(
 
     adult_count = booking.adult_count or 0
     child_count = booking.child_count or 0
-    total_guests = adult_count + child_count
+    student_count = booking.student_count or 0
+    
+    if is_student_pkg:
+        total_guests = student_count
+        guests_breakdown_html = f"{student_count} total <span style=\"color:#64748b;font-weight:400;\">({student_count} student{'s' if student_count != 1 else ''})</span>"
+    else:
+        total_guests = adult_count + child_count
+        guests_breakdown_html = f"{total_guests} total <span style=\"color:#64748b;font-weight:400;\">({adult_count} adult{'s' if adult_count != 1 else ''}, {child_count} child{'ren' if child_count != 1 else ''})</span>"
 
     # ── 5. Financial line items ───────────────────────────────────────────────
     subtotal_base   = Decimal(str(pricing.get("subtotal_amount", "0.00")))
@@ -495,10 +526,7 @@ async def send_admin_booking_notification(
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Guests</td>
                 <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;">
-                  {total_guests} total
-                  <span style="color:#64748b;font-weight:400;">
-                    ({adult_count} adult{'s' if adult_count != 1 else ''}, {child_count} child{'ren' if child_count != 1 else ''})
-                  </span>
+                  {guests_breakdown_html}
                 </td>
               </tr>
               <tr>
@@ -523,7 +551,7 @@ async def send_admin_booking_notification(
                   <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
                       text-align:left;text-transform:uppercase;letter-spacing:.5px;">Name</th>
                   <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
-                      text-align:center;text-transform:uppercase;letter-spacing:.5px;">Age</th>
+                      text-align:center;text-transform:uppercase;letter-spacing:.5px;">{age_or_class_header}</th>
                   <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
                       text-align:center;text-transform:uppercase;letter-spacing:.5px;">Gender</th>
                 </tr>

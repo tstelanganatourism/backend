@@ -68,6 +68,9 @@ from app.schemas.user import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
     ProfileUpdateRequest,
+    PhoneOTPSendRequest,
+    PhoneOTPVerifyRequest,
+    PhoneOTPSendResponse,
 )
 from app.services.redis_client import (
     blacklist_token,
@@ -75,6 +78,10 @@ from app.services.redis_client import (
     store_otp,
     verify_and_consume_otp,
     verify_otp_only,
+    store_sms_otp,
+    verify_and_consume_sms_otp,
+    check_sms_otp_rate_limit,
+    record_sms_otp_send,
 )
 
 router = APIRouter()
@@ -432,6 +439,89 @@ async def admin_resend_otp(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PHONE OTP LOGIN (Tourist only — agent/admin pages are separate and untouched)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/otp/send", response_model=PhoneOTPSendResponse)
+async def phone_otp_send(
+    body: PhoneOTPSendRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send a 6-digit SMS OTP to a phone number for tourist login.
+    Rate limits: 60s cooldown, max 3 sends per 10 minutes.
+    Works for all roles — finds existing user or will create tourist on /otp/verify.
+    """
+    from app.services.sms_service import send_otp_sms
+
+    rate = await check_sms_otp_rate_limit(body.phone)
+    if not rate["allowed"]:
+        if rate["locked"]:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Too many attempts. Please wait {rate['cooldown_seconds']} seconds before trying again.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Please wait {rate['cooldown_seconds']} seconds before requesting a new OTP.",
+        )
+
+    # Check if account is blocked (only if user exists)
+    existing_user = await get_user_by_phone(db, body.phone)
+    if existing_user and existing_user.account_status == AccountStatus.BLOCKED:
+        raise HTTPException(status_code=403, detail="Your account has been suspended.")
+
+    otp = generate_otp()
+    await store_sms_otp(body.phone, otp)
+    await record_sms_otp_send(body.phone)
+
+    # Send SMS (fire-and-forget — don’t fail the request if SMS provider is slow)
+    try:
+        await send_otp_sms(body.phone, otp)
+    except Exception as e:
+        logger.error(f"OTP SMS send error for {body.phone}: {e}")
+
+    if settings.ENVIRONMENT == "development":
+        logger.info(f"===== DEV OTP for {body.phone}: {otp} =====")
+
+    new_rate = await check_sms_otp_rate_limit(body.phone)
+    return PhoneOTPSendResponse(
+        message="OTP sent successfully. Valid for 5 minutes.",
+        cooldown_seconds=60,
+        attempts_remaining=new_rate["attempts_remaining"],
+    )
+
+
+@router.post("/otp/verify", response_model=TokenResponse)
+async def phone_otp_verify(
+    body: PhoneOTPVerifyRequest,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verify the SMS OTP and log in. Auto-creates tourist account if phone is new.
+    Returns JWT tokens and role so frontend can redirect correctly.
+    """
+    from app.repositories.user_repository import get_or_create_tourist_by_phone
+
+    valid = await verify_and_consume_sms_otp(body.phone, body.otp)
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired OTP. Please request a new one.",
+        )
+
+    user = await get_or_create_tourist_by_phone(db, body.phone)
+
+    if user.account_status == AccountStatus.BLOCKED:
+        raise HTTPException(status_code=403, detail="Your account has been suspended.")
+
+    is_admin = user.role == UserRole.ADMIN
+    await update_last_login(db, user)
+    return _build_token_response(user, response, admin=is_admin)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TOURIST ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -442,33 +532,10 @@ async def tourist_signup(
     db: AsyncSession = Depends(get_db),
 ):
     """Register a new tourist account and return tokens immediately."""
-    # Email uniqueness check (only if email provided)
-    if body.email:
-        existing = await get_user_by_email(db, body.email)
-        if existing:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="An account with this email already exists.",
-            )
-
-    # Phone uniqueness check (only if phone provided)
-    if body.phone_number:
-        existing_phone = await get_user_by_phone(db, body.phone_number)
-        if existing_phone:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="An account with this phone number already exists.",
-            )
-
-    user = await create_tourist_user(
-        db,
-        full_name=body.full_name,
-        email=body.email,
-        password=body.password,
-        phone_number=body.phone_number,
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Password registration is disabled for tourists. Please register and verify using Phone OTP."
     )
-
-    return _build_token_response(user, response)
 
 
 @router.post("/tourist/login", response_model=TokenResponse)
@@ -478,32 +545,10 @@ async def tourist_login(
     db: AsyncSession = Depends(get_db),
 ):
     """Authenticate a tourist with email or phone number + password."""
-    login_id = body.login_id.strip()
-    invalid_exc = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid credentials.",
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Password authentication is disabled for tourists. Please log in using Phone OTP."
     )
-
-    # Auto-detect: if it looks like a 10-digit phone number, search by phone first
-    if login_id.isdigit() and len(login_id) == 10:
-        user = await get_user_by_phone(db, login_id)
-    else:
-        user = await get_user_by_email(db, login_id)
-        if not user and login_id.isdigit():
-            # fallback: try phone if digits-only but not exactly 10
-            user = await get_user_by_phone(db, login_id)
-
-    if not user:
-        raise invalid_exc
-    if user.role != UserRole.USER:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Use the correct login portal for your role.")
-    if not user.password_hash or not verify_password(body.password, user.password_hash):
-        raise invalid_exc
-    if user.account_status == AccountStatus.BLOCKED:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account has been suspended.")
-
-    await update_last_login(db, user)
-    return _build_token_response(user, response)
 
 
 @router.post("/forgot-password")
@@ -608,25 +653,11 @@ async def reset_password(
 
 @router.get("/google/url")
 async def google_auth_url(redirect_uri: Optional[str] = None, state: Optional[str] = None):
-    """Return the Google OAuth authorization URL for the frontend to redirect to."""
-    if not settings.GOOGLE_CLIENT_ID:
-        raise HTTPException(status_code=503, detail="Google OAuth is not configured.")
-
-    uri = redirect_uri or settings.GOOGLE_REDIRECT_URI
-    scope = "openid email profile"
-    url = (
-        "https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={settings.GOOGLE_CLIENT_ID}"
-        f"&redirect_uri={uri}"
-        f"&response_type=code"
-        f"&scope={scope}"
-        f"&access_type=offline"
-        f"&prompt=consent"
+    """Disabled: Google OAuth is disabled."""
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Google authentication is disabled. Please log in using Phone OTP."
     )
-    if state:
-        from urllib.parse import quote
-        url += f"&state={quote(state)}"
-    return {"url": url}
 
 
 @router.post("/google/callback", response_model=TokenResponse)
@@ -635,67 +666,11 @@ async def google_callback(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Exchange Google authorization code for tokens. Creates account if first sign-in."""
-    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
-        raise HTTPException(status_code=503, detail="Google OAuth is not configured.")
-
-    redirect_uri = body.redirect_uri or settings.GOOGLE_REDIRECT_URI
-
-    # Step 1: Exchange auth code for Google access token
-    async with httpx.AsyncClient() as client:
-        token_resp = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code": body.code,
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-            },
-            timeout=15.0,
-        )
-
-    if token_resp.status_code != 200:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to exchange Google authorization code.")
-
-    token_data = token_resp.json()
-    google_access_token = token_data.get("access_token")
-
-    # Step 2: Fetch Google user info
-    async with httpx.AsyncClient() as client:
-        userinfo_resp = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {google_access_token}"},
-            timeout=10.0,
-        )
-
-    if userinfo_resp.status_code != 200:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to fetch user info from Google.")
-
-    google_user = userinfo_resp.json()
-    google_id: str = google_user.get("id")
-    email: str = google_user.get("email", "")
-    full_name: str = google_user.get("name", email.split("@")[0])
-
-    if not google_id or not email:
-        raise HTTPException(status_code=400, detail="Incomplete user info from Google.")
-
-    # Step 3: Find or create user
-    user = await get_user_by_google_id(db, google_id)
-    if not user:
-        user = await get_user_by_email(db, email)
-        if user:
-            # Email matches existing account — link Google ID
-            user = await link_google_to_existing(db, user, google_id)
-        else:
-            # Brand new Google user
-            user = await create_google_user(db, full_name=full_name, email=email, google_id=google_id)
-
-    if user.account_status == AccountStatus.BLOCKED:
-        raise HTTPException(status_code=403, detail="Your account has been suspended.")
-
-    await update_last_login(db, user)
-    return _build_token_response(user, response)
+    """Disabled: Google OAuth is disabled."""
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Google authentication is disabled. Please log in using Phone OTP."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -952,7 +927,18 @@ async def update_me(
             current_user.email = str(body.email)
         # If user already has an email, silently ignore (can't change email)
     if body.phone_number is not None:
-        current_user.phone_number = body.phone_number
+        if body.phone_number:
+            import re
+            cleaned_phone = re.sub(r"\D", "", body.phone_number)
+            if len(cleaned_phone) != 10:
+                raise HTTPException(status_code=400, detail="Invalid phone number. Must be a 10-digit mobile number.")
+            
+            existing = await get_user_by_phone(db, cleaned_phone)
+            if existing and existing.id != current_user.id:
+                raise HTTPException(status_code=409, detail="This phone number is already registered with another account.")
+            current_user.phone_number = cleaned_phone
+        else:
+            current_user.phone_number = None
     if body.avatar_url is not None:
         current_user.avatar_url = body.avatar_url
     if body.gst_number is not None:

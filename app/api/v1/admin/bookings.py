@@ -6,6 +6,7 @@ from typing import Optional, List
 from decimal import Decimal
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from datetime import date, datetime
 
 from app.db.session import get_db
 from app.middleware.auth import require_admin
@@ -142,6 +143,7 @@ async def list_admin_bookings(
         base_query.add_columns(func.count(Booking.id).over().label('total_count'))
         .options(selectinload(Booking.passengers))
         .options(selectinload(Booking.stay_dates))
+        .options(selectinload(Booking.postpone_requests))
         .order_by(Booking.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -247,6 +249,8 @@ async def list_admin_bookings(
             "source": b.source.value if hasattr(b.source, "value") else str(b.source),
             "status": b.status.value if hasattr(b.status, "value") else str(b.status),
             "travel_date": b.travel_date.isoformat(),
+            "is_rescheduled": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "APPROVED" for r in b.postpone_requests),
+            "has_pending_postpone": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "PENDING" for r in b.postpone_requests),
             "room_checkin": room_checkin,
             "room_checkout": room_checkout,
             "room_checkout_date": room_checkout_date,
@@ -254,6 +258,7 @@ async def list_admin_bookings(
             "package_type": package_type,
             "adult_count": b.adult_count,
             "child_count": b.child_count,
+            "student_count": b.student_count,
             # Admin pricing - expose agent_commission and agent_payable
             "subtotal_amount": float(b.subtotal_amount),
             "coupon_discount": float(b.coupon_discount),
@@ -457,7 +462,7 @@ async def admin_create_booking(
 
         package_variant_id_val = variant.id
 
-        # Admin bypass: fetch inventory if it exists — but never block on missing/closed/full
+        # Fetch inventory - auto-create with capacity = booked seats if missing (no extra seats)
         inv_query = select(PackageVariantInventory).where(
             PackageVariantInventory.variant_id == request.variant_id,
             PackageVariantInventory.date == travel_date
@@ -469,7 +474,7 @@ async def admin_create_booking(
             inv = PackageVariantInventory(
                 variant_id=request.variant_id,
                 date=travel_date,
-                total_capacity=0,
+                total_capacity=total_passengers,
                 booked_count=0,
                 reserved_count=0,
                 is_closed=False,
@@ -549,8 +554,10 @@ async def admin_create_booking(
                 subtotal_amount += ref_cost
                 refreshment_subtotal = ref_cost
         
-        # Admin direct bookings do not occupy package inventory, so we do not increment booked_count here.
-        pass
+        # Admin direct bookings occupy package inventory, increment booked_count
+        if inv.booked_count + total_passengers > inv.total_capacity:
+            inv.total_capacity = inv.booked_count + inv.reserved_count + total_passengers
+        inv.booked_count += total_passengers
 
     elif request.target_type == 'room':
         if not request.room_variant_id:
@@ -581,7 +588,7 @@ async def admin_create_booking(
         slot_start_t = time.fromisoformat(request.slot_start) if request.slot_start else room_obj.slot_start
         slot_end_t = time.fromisoformat(request.slot_end) if request.slot_end else room_obj.slot_end
 
-        # Admin bypass: fetch each stay date's inventory — auto-create if missing, never block
+        # Fetch each stay date's inventory — auto-create with capacity = booked rooms if missing (no extra rooms)
         for sd in stay_dates:
             inv_query = select(RoomSlotInventory).where(
                 RoomSlotInventory.room_variant_id == request.room_variant_id,
@@ -593,7 +600,6 @@ async def admin_create_booking(
             room_inv = inv_res.scalar_one_or_none()
 
             if room_inv is None:
-                # Auto-create a slot inventory row on the fly
                 room_inv = RoomSlotInventory(
                     room_variant_id=request.room_variant_id,
                     date=sd,
@@ -606,7 +612,6 @@ async def admin_create_booking(
                 )
                 db.add(room_inv)
 
-            # Admin always goes through — expand total_rooms if needed to keep data consistent
             if room_inv.booked_rooms + required_rooms > room_inv.total_rooms:
                 room_inv.total_rooms = room_inv.booked_rooms + room_inv.reserved_rooms + required_rooms
 
@@ -777,6 +782,33 @@ async def admin_create_booking(
         for sd in stay_dates:
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
+    # Extract phone and name for SMS before commit
+    sms_phone = None
+    sms_cust_name = "Customer"
+    lead_p = next((p for p in request.passengers if p.is_primary), None)
+    if not lead_p and request.passengers:
+        lead_p = request.passengers[0]
+    if lead_p:
+        sms_phone = lead_p.phone
+        sms_cust_name = lead_p.full_name
+    if not sms_phone and request.user_id:
+        user_res = await db.execute(select(User).where(User.id == request.user_id))
+        assigned_user = user_res.scalar_one_or_none()
+        if assigned_user:
+            sms_phone = assigned_user.phone_number
+            if not sms_cust_name or sms_cust_name == "Customer":
+                sms_cust_name = assigned_user.full_name
+
+    sms_package_title = None
+    if request.target_type == 'package' and 'variant' in locals() and variant:
+        sms_package_title = variant.package.title
+        
+    sms_lodge_name = None
+    sms_room_name = None
+    if request.target_type == 'room' and 'room_obj' in locals() and room_obj:
+        sms_lodge_name = room_obj.lodge_name
+        sms_room_name = rv.variant_name
+
     await db.commit()
 
     # Immediately invalidate L1+L2 cache so availability is reflected
@@ -798,6 +830,22 @@ async def admin_create_booking(
     except Exception as e:
         from loguru import logger
         logger.error(f"Failed to queue post-booking documents task for admin booking: {e}")
+
+    # Enqueue confirmation SMS via arq (Zero-DB background task)
+    # get_booking_sms_payload queries the DB NOW while the session is open.
+    # dispatch_sms_payload is stored in Redis and only sends the HTTP request.
+    try:
+        from app.services.sms_service import get_booking_sms_payload
+        from app.worker import get_arq_pool
+        sms_payload = await get_booking_sms_payload(booking.id, db)
+        if sms_payload:
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+            from loguru import logger
+            logger.info(f"Enqueued confirmation SMS for admin direct booking {booking.public_id}")
+    except Exception as _sms_err:
+        from loguru import logger
+        logger.warning(f"Could not enqueue confirmation SMS for admin booking {booking.public_id}: {_sms_err}")
 
     return {
         "status": "success",
@@ -950,7 +998,15 @@ async def admin_cancel_booking(
     if booking.room_variant_id:
         cancellation_fee = booking.total_amount
     else:
-        cancellation_fee = (booking.total_amount * Decimal("0.35")).quantize(Decimal("0.01"))
+        from app.core.timezone import get_ist_now
+        request_date = cancellation_req.requested_at.date() if (cancellation_req and cancellation_req.requested_at) else get_ist_now().date()
+        days_left = (booking.travel_date - request_date).days
+        if days_left >= 7:
+            cancellation_fee = (booking.total_amount * Decimal("0.35")).quantize(Decimal("0.01"))
+        elif days_left >= 4:
+            cancellation_fee = (booking.total_amount * Decimal("0.50")).quantize(Decimal("0.01"))
+        else:
+            cancellation_fee = booking.total_amount
         
     # refund_amount = paid_amount - cancellation_fee (refund remains manual)
     paid_amount = Decimal(str(booking.paid_amount or 0.00))
@@ -968,10 +1024,9 @@ async def admin_cancel_booking(
         inv_res = await db.execute(inv_stmt)
         inv = inv_res.scalar_one_or_none()
         if inv:
-            if booking.source != BookingSource.ADMIN_DIRECT:
-                quantity = booking.student_count if booking.student_count else (booking.adult_count + booking.child_count)
-                inv.booked_count = max(0, inv.booked_count - quantity)
-                logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
+            quantity = booking.student_count if booking.student_count else (booking.adult_count + booking.child_count)
+            inv.booked_count = max(0, inv.booked_count - quantity)
+            logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
             await db.flush()
             import time
             from app.core.timezone import get_ist_now
@@ -1282,6 +1337,18 @@ async def _do_record_cash_payment(
         from loguru import logger
         logger.warning(f"Failed to enqueue PDF tasks for admin cash payment: {arq_err}")
 
+    # 9. Enqueue confirmation SMS via arq (Zero-DB background task)
+    try:
+        from app.services.sms_service import get_booking_sms_payload
+        from app.worker import get_arq_pool
+        sms_payload = await get_booking_sms_payload(booking.id, db)
+        if sms_payload:
+            arq_pool = await get_arq_pool()
+            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+    except Exception as _sms_err:
+        from loguru import logger
+        logger.warning(f"Could not enqueue confirmation SMS for admin cash payment on {booking.public_id}: {_sms_err}")
+
     return {
         "status": "success",
         "message": f"Payment of ₹{float(record_amount):,.2f} recorded for booking {booking.public_id}.",
@@ -1526,3 +1593,321 @@ async def get_transport_planning(
         "end_date": end_dt.isoformat(),
         "date_groups": date_groups,
     }
+
+
+# --- Reschedule / Postpone Endpoints ---
+
+class AdminProcessPostponePayload(BaseModel):
+    status: str # APPROVED, REJECTED
+    admin_notes: Optional[str] = None
+    confirmed_new_date: Optional[date] = None # Admin can override or confirm requested date
+
+@router.get("/postpone-requests")
+async def list_postpone_requests(
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Lists all pending and processed postponement requests.
+    """
+    from app.models.booking import PostponeRequest, Booking
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+    
+    stmt = (
+        select(PostponeRequest)
+        .options(selectinload(PostponeRequest.booking).selectinload(Booking.passengers))
+        .order_by(PostponeRequest.requested_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    
+    result = await db.execute(stmt)
+    requests = result.scalars().all()
+    
+    items = []
+    for r in requests:
+        booking = r.booking
+        if not booking:
+            continue
+        lead_passenger = next((p.full_name for p in booking.passengers if p.is_primary), None) or (booking.passengers[0].full_name if booking.passengers else "Guest")
+        
+        items.append({
+            "id": r.id,
+            "booking_id": booking.id,
+            "booking_public_id": booking.public_id,
+            "customer_name": lead_passenger,
+            "travel_date": booking.travel_date.isoformat(),
+            "total_amount": float(booking.total_amount),
+            "paid_amount": float(booking.paid_amount),
+            "reason": r.reason,
+            "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+            "booking_status": booking.status.value if hasattr(booking.status, "value") else str(booking.status),
+            "requested_new_date": r.requested_new_date.isoformat() if r.requested_new_date else None,
+            "requested_at": r.requested_at.isoformat(),
+            "processed_at": r.processed_at.isoformat() if r.processed_at else None,
+            "admin_notes": r.admin_notes
+        })
+        
+    return items
+
+@router.patch("/postpone/{id}")
+async def admin_process_postpone(
+    id: int,
+    payload: AdminProcessPostponePayload,
+    current_admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Process postponement request: Approve or Reject.
+    """
+    from app.models.booking import PostponeRequest, Booking
+    from app.models.enums import CancellationStatus
+    from datetime import date, timedelta
+    
+    postpone_stmt = select(PostponeRequest).where(PostponeRequest.id == id).with_for_update()
+    postpone_res = await db.execute(postpone_stmt)
+    postpone_req = postpone_res.scalar_one_or_none()
+    if not postpone_req:
+        raise HTTPException(status_code=404, detail="Postponement request not found")
+        
+    target_status = payload.status.upper()
+    if target_status not in ["APPROVED", "REJECTED"]:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be APPROVED or REJECTED.")
+        
+    if postpone_req.status != "PENDING":
+        raise HTTPException(status_code=400, detail="This postponement request has already been processed.")
+        
+    booking_stmt = select(Booking).where(Booking.id == postpone_req.booking_id).with_for_update()
+    booking_res = await db.execute(booking_stmt)
+    booking = booking_res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Associated booking not found")
+        
+    if target_status == "REJECTED":
+        postpone_req.status = "REJECTED"
+        postpone_req.processed_at = func.now()
+        postpone_req.processed_by = current_admin.id
+        postpone_req.admin_notes = payload.admin_notes
+        await db.commit()
+        return {"status": "success", "message": "Postponement request has been rejected."}
+        
+    # Process APPROVED
+    new_date = payload.confirmed_new_date or postpone_req.requested_new_date
+    if not new_date:
+        raise HTTPException(status_code=400, detail="New travel date is required to approve postponement.")
+        
+    # Run the common date rescheduling logic
+    await _reschedule_booking_date(booking, new_date, db)
+    
+    postpone_req.status = CancellationStatus.APPROVED
+    postpone_req.processed_at = func.now()
+    postpone_req.processed_by = current_admin.id
+    postpone_req.admin_notes = payload.admin_notes
+    postpone_req.requested_new_date = new_date
+    
+    await db.commit()
+    
+    # Invalidate cache
+    from app.utils.cache import clear_cache_prefix
+    if booking.variant_id:
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
+    elif booking.room_variant_id:
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+        
+    return {"status": "success", "message": f"Booking postponed to {new_date.isoformat()} successfully."}
+
+class AdminChangeDatePayload(BaseModel):
+    new_travel_date: date
+    admin_notes: Optional[str] = None
+
+@router.patch("/{id}/change-date")
+async def admin_change_booking_date(
+    id: int,
+    payload: AdminChangeDatePayload,
+    current_admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Directly change the travel date of a booking, updating inventory accordingly.
+    """
+    from app.models.booking import Booking
+    
+    booking_stmt = select(Booking).where(Booking.id == id).with_for_update()
+    booking_res = await db.execute(booking_stmt)
+    booking = booking_res.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+        
+    await _reschedule_booking_date(booking, payload.new_travel_date, db)
+    
+    # Create approved postponement request record for history
+    from app.models.booking import PostponeRequest
+    from app.models.enums import CancellationStatus
+    
+    postpone_req = PostponeRequest(
+        booking_id=booking.id,
+        reason=payload.admin_notes or "Direct reschedule by admin",
+        status=CancellationStatus.APPROVED,
+        requested_new_date=payload.new_travel_date,
+        requested_at=func.now(),
+        processed_at=func.now(),
+        processed_by=current_admin.id,
+        admin_notes=payload.admin_notes or "Direct reschedule by admin",
+    )
+    db.add(postpone_req)
+    
+    await db.commit()
+    
+    # Invalidate cache
+    from app.utils.cache import clear_cache_prefix
+    if booking.variant_id:
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
+    elif booking.room_variant_id:
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+        
+    return {"status": "success", "message": f"Booking travel date successfully updated to {payload.new_travel_date.isoformat()}."}
+
+async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSession):
+    from app.models.booking import BookingStayDate
+    from app.models.package import PackageVariantInventory
+    from app.models.room import RoomSlotInventory, RoomVariant, Room
+    from app.models.enums import BookingSource
+    from app.services.room_calculation import calculate_required_rooms
+    from datetime import date, timedelta, time
+    from sqlalchemy import delete
+    from loguru import logger
+    
+    # Check if package variant
+    if booking.variant_id:
+        # Release old seats
+        old_inv = await db.scalar(
+            select(PackageVariantInventory)
+            .where(PackageVariantInventory.variant_id == booking.variant_id, PackageVariantInventory.date == booking.travel_date)
+            .with_for_update()
+        )
+        if old_inv:
+            quantity = booking.student_count if booking.student_count else (booking.adult_count + booking.child_count)
+            old_inv.booked_count = max(0, old_inv.booked_count - quantity)
+                
+        # Occupy new seats - auto-create with capacity = rescheduled seats if missing (no extra seats)
+        new_inv = await db.scalar(
+            select(PackageVariantInventory)
+            .where(PackageVariantInventory.variant_id == booking.variant_id, PackageVariantInventory.date == new_date)
+            .with_for_update()
+        )
+        if not new_inv:
+            new_inv = PackageVariantInventory(
+                variant_id=booking.variant_id,
+                date=new_date,
+                total_capacity=quantity,
+                booked_count=0,
+                reserved_count=0,
+                is_closed=False,
+            )
+            db.add(new_inv)
+            await db.flush()
+            
+        quantity = booking.student_count if booking.student_count else (booking.adult_count + booking.child_count)
+        if new_inv.booked_count + quantity > new_inv.total_capacity:
+            new_inv.total_capacity = new_inv.booked_count + new_inv.reserved_count + quantity
+        new_inv.booked_count += quantity
+            
+    # Check if room variant
+    elif booking.room_variant_id:
+        # Fetch old stay dates
+        dates_res = await db.execute(
+            select(BookingStayDate.date).where(BookingStayDate.booking_id == booking.id)
+        )
+        old_stay_dates = [row[0] for row in dates_res.all()]
+        nights = len(old_stay_dates) if old_stay_dates else 1
+        
+        # Determine room details
+        rv_res = await db.execute(
+            select(RoomVariant, Room.slot_start, Room.slot_end)
+            .join(Room, Room.id == RoomVariant.room_id)
+            .where(RoomVariant.id == booking.room_variant_id)
+        )
+        rv_row = rv_res.first()
+        if rv_row:
+            rv, default_slot_start, default_slot_end = rv_row
+            pricing = booking.pricing_snapshot or {}
+            slot_start_str = pricing.get("slot_start")
+            slot_end_str = pricing.get("slot_end")
+            slot_start = time.fromisoformat(slot_start_str) if slot_start_str else default_slot_start
+            slot_end = time.fromisoformat(slot_end_str) if slot_end_str else default_slot_end
+            
+            total_qty = booking.adult_count + booking.child_count
+            required_rooms = calculate_required_rooms(total_qty, rv.capacity_per_room)
+            
+            # Release old
+            for sd in old_stay_dates:
+                old_inv = await db.scalar(
+                    select(RoomSlotInventory).where(
+                        RoomSlotInventory.room_variant_id == booking.room_variant_id,
+                        RoomSlotInventory.date == sd,
+                        RoomSlotInventory.slot_start == slot_start,
+                        RoomSlotInventory.slot_end == slot_end
+                    ).with_for_update()
+                )
+                if old_inv:
+                    old_inv.booked_rooms = max(0, old_inv.booked_rooms - required_rooms)
+                    
+            # Occupy new - auto-create with capacity = rescheduled rooms if missing (no extra rooms)
+            new_stay_dates = [new_date + timedelta(days=i) for i in range(nights)]
+            for nsd in new_stay_dates:
+                new_inv = await db.scalar(
+                    select(RoomSlotInventory).where(
+                        RoomSlotInventory.room_variant_id == booking.room_variant_id,
+                        RoomSlotInventory.date == nsd,
+                        RoomSlotInventory.slot_start == slot_start,
+                        RoomSlotInventory.slot_end == slot_end
+                    ).with_for_update()
+                )
+                if not new_inv:
+                    new_inv = RoomSlotInventory(
+                        room_variant_id=booking.room_variant_id,
+                        date=nsd,
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                        total_rooms=required_rooms,
+                        booked_rooms=0,
+                        reserved_rooms=0,
+                        is_closed=False,
+                    )
+                    db.add(new_inv)
+                    await db.flush()
+                    
+                if new_inv.booked_rooms + required_rooms > new_inv.total_rooms:
+                    new_inv.total_rooms = new_inv.booked_rooms + new_inv.reserved_rooms + required_rooms
+                    
+                new_inv.booked_rooms += required_rooms
+                
+            # Update BookingStayDate records
+            await db.execute(
+                delete(BookingStayDate).where(BookingStayDate.booking_id == booking.id)
+            )
+            for nsd in new_stay_dates:
+                db.add(BookingStayDate(booking_id=booking.id, date=nsd))
+                
+    # Update travel date
+    booking.travel_date = new_date
+    db.add(booking)
+    await db.flush()
+    
+    # Trigger ticket/invoice regeneration asynchronously
+    try:
+        from app.worker import get_arq_pool
+        arq_pool = await get_arq_pool()
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True, True)
+    except Exception as e:
+        logger.error(f"Failed to queue post-booking documents task: {e}")

@@ -40,7 +40,12 @@ async def stream_package(package_id: str, request: Request):
         finally:
             sse_manager.remove_client("package", package_id, queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
 
 @router.get("/rooms/{room_id}")
 async def stream_room(room_id: str, request: Request):
@@ -68,4 +73,9 @@ async def stream_room(room_id: str, request: Request):
         finally:
             sse_manager.remove_client("room", room_id, queue)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)

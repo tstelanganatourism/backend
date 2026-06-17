@@ -408,3 +408,94 @@ async def toggle_user_status(
         created_at=user_obj.created_at,
         total_bookings=total_bookings
     )
+
+
+class AdminUserUpdatePayload(BaseModel):
+    full_name: Optional[str] = Field(None, min_length=2, max_length=100)
+    email: Optional[str] = Field(None, max_length=150)
+    phone_number: Optional[str] = Field(None, pattern=r"^[0-9]{10}$")
+
+
+@router.patch("/{user_id}", response_model=AdminUserResponse)
+async def update_user_profile(
+    user_id: int,
+    body: AdminUserUpdatePayload,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """Admin updates tourist user's details (full name, email, phone number)."""
+    result = await db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.role == UserRole.USER,
+            User.deleted_at.is_(None)
+        )
+    )
+    user_obj = result.scalar_one_or_none()
+    if not user_obj:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found."
+        )
+
+    if body.full_name is not None:
+        user_obj.full_name = body.full_name.strip()
+    
+    if body.email is not None:
+        email_clean = body.email.strip().lower()
+        if email_clean:
+            # Check unique email
+            email_res = await db.execute(
+                select(User).where(User.email == email_clean, User.id != user_id, User.deleted_at.is_(None))
+            )
+            if email_res.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Email is already used by another account.")
+            user_obj.email = email_clean
+        else:
+            user_obj.email = None
+
+    if body.phone_number is not None:
+        phone_clean = body.phone_number.strip()
+        if phone_clean:
+            # Check unique phone
+            phone_res = await db.execute(
+                select(User).where(User.phone_number == phone_clean, User.id != user_id, User.deleted_at.is_(None))
+            )
+            if phone_res.scalar_one_or_none():
+                raise HTTPException(status_code=400, detail="Phone number is already used by another account.")
+            user_obj.phone_number = phone_clean
+        else:
+            user_obj.phone_number = None
+
+    await db.commit()
+    await db.refresh(user_obj)
+
+    # Query total bookings for mapping response
+    bookings_count_res = await db.execute(
+        select(func.count(Booking.id))
+        .where(Booking.user_id == user_id, Booking.deleted_at.is_(None))
+    )
+    total_bookings = bookings_count_res.scalar_one()
+
+    await log_action(
+        db=db,
+        user_id=current_admin.id,
+        action="ADMIN_UPDATE_USER_PROFILE",
+        entity_type="User",
+        entity_id=str(user_obj.id),
+        details={"full_name": user_obj.full_name, "email": user_obj.email, "phone_number": user_obj.phone_number},
+    )
+    await db.commit()
+
+    return AdminUserResponse(
+        id=user_obj.id,
+        full_name=user_obj.full_name,
+        email=user_obj.email,
+        phone_number=user_obj.phone_number,
+        role=user_obj.role.value if hasattr(user_obj.role, 'value') else str(user_obj.role),
+        account_status=user_obj.account_status.value if hasattr(user_obj.account_status, 'value') else str(user_obj.account_status),
+        is_active=user_obj.is_active,
+        avatar_url=user_obj.avatar_url,
+        created_at=user_obj.created_at,
+        total_bookings=total_bookings
+    )

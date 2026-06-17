@@ -52,3 +52,7 @@ tests/
 playwright.config.ts
 playwright-report/
 test-results/
+
+# Temp Dumps & Guides
+api_dump.json
+guide.txt

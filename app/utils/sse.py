@@ -55,4 +55,55 @@ class SSEManager:
             except asyncio.QueueFull:
                 pass
 
+def build_package_sse_payload(variant, inventory_row, travel_date):
+    import time
+    from app.core.timezone import get_ist_now
+    from decimal import Decimal
+    
+    is_weekend = travel_date.weekday() in (5, 6)
+    is_student = False
+    if hasattr(variant, 'package') and variant.package:
+        is_student = variant.package.is_student_package
+
+    modifier = Decimal("0.00")
+    total_capacity = 0
+    booked_count = 0
+    reserved_count = 0
+    is_closed = True
+
+    if inventory_row:
+        modifier = inventory_row.price_override if inventory_row.price_override is not None else Decimal("0.00")
+        total_capacity = inventory_row.total_capacity
+        booked_count = inventory_row.booked_count
+        reserved_count = getattr(inventory_row, 'reserved_count', 0)
+        is_closed = inventory_row.is_closed
+
+    if is_student:
+        b_student = variant.weekend_student_price if is_weekend and getattr(variant, 'weekend_student_price', None) is not None else getattr(variant, 'student_price', Decimal("0.00"))
+        b_adult = Decimal("0.00")
+        b_child = Decimal("0.00")
+    else:
+        b_student = None
+        b_adult = variant.weekend_adult_price if is_weekend and getattr(variant, 'weekend_adult_price', None) is not None else getattr(variant, 'adult_price', Decimal("0.00"))
+        b_child = variant.weekend_child_price if is_weekend and getattr(variant, 'weekend_child_price', None) is not None else getattr(variant, 'child_price', Decimal("0.00"))
+
+    eff_student = float(max(Decimal("0.00"), (b_student or Decimal("0.00")) + modifier)) if b_student is not None else None
+    eff_adult = float(max(Decimal("0.00"), (b_adult or Decimal("0.00")) + modifier))
+    eff_child = float(max(Decimal("0.00"), (b_child or Decimal("0.00")) + modifier))
+
+    return {
+        "version": int(time.time() * 1000),
+        "timestamp": get_ist_now().isoformat(),
+        "package_id": variant.package_id,
+        "travel_date": str(travel_date),
+        "available": max(0, total_capacity - (booked_count + reserved_count)),
+        "reserved": reserved_count,
+        "booked": booked_count,
+        "is_closed": is_closed,
+        "effective_adult_price": eff_adult,
+        "effective_child_price": eff_child,
+        "effective_student_price": eff_student,
+        "variant_id": variant.id
+    }
+
 sse_manager = SSEManager()

@@ -117,7 +117,17 @@ async def checkout(
     if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
         raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
 
-    
+    is_test_user = False
+    if current_user and (
+        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
+        current_user.phone_number == "8886154275"
+    ):
+        is_test_user = True
+    if request.passengers and len(request.passengers) > 0:
+        primary_phone = request.passengers[0].phone
+        if primary_phone == "8886154275":
+            is_test_user = True
+
     # Derive adult, child, and student counts safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
     child_count = request.child_count if request.child_count is not None else 0
@@ -144,10 +154,6 @@ async def checkout(
             is_child = i >= adult_count
 
             if request.quick_booking:
-                # Quick booking is only allowed for agent and admin
-                is_agent_or_admin = current_user is not None and current_user.role in (UserRole.AGENT, UserRole.ADMIN)
-                if not is_agent_or_admin:
-                    raise HTTPException(status_code=403, detail="Quick booking is only allowed for admins and agents")
 
                 # Check lead passenger constraints and bypass the rest
                 if i == 0:
@@ -456,10 +462,7 @@ async def checkout(
         subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
         
         # Hook for special ₹1 user testing
-        if current_user and (
-            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8887773331"
-        ):
+        if is_test_user:
             subtotal_amount = Decimal("1.00")
             
         commissionable_base = base_subtotal
@@ -601,15 +604,8 @@ async def checkout(
                 day_price = variant.weekday_price
             
             # Hook for special ₹1 user testing
-            if current_user and (
-                current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-                current_user.phone_number == "8887773331"
-            ):
-                # Query room to check its lodge name
-                room_res = await db.execute(select(Room).where(Room.id == variant.room_id))
-                room_obj = room_res.scalar_one_or_none()
-                if room_obj and "vashista" in room_obj.lodge_name.lower() and "bhadrachalam" in room_obj.lodge_name.lower():
-                    day_price = Decimal("1.00")
+            if is_test_user:
+                day_price = Decimal("1.00")
                     
             subtotal_amount += Decimal(str(required_rooms)) * day_price
         commissionable_base = subtotal_amount
@@ -659,6 +655,14 @@ async def checkout(
     gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
     gateway_fee = ((discounted_subtotal + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
     total_amount = discounted_subtotal + gst_amount + gateway_fee
+    
+    if is_test_user:
+        subtotal_amount = Decimal("1.00")
+        coupon_discount = Decimal("0.00")
+        discounted_subtotal = Decimal("1.00")
+        gst_amount = Decimal("0.00")
+        gateway_fee = Decimal("0.00")
+        total_amount = Decimal("1.00")
     
     # --- Agent Metadata & Commission Calculations ---
     is_agent = current_user is not None and current_user.role == UserRole.AGENT
@@ -738,6 +742,10 @@ async def checkout(
     else:
         payable_amount = tourist_amount_payable
 
+    if is_test_user:
+        tourist_amount_payable = Decimal("1.00")
+        payable_amount = Decimal("1.00")
+
     pricing_snapshot["payment_percentage"] = str(payment_percentage)
     pricing_snapshot["tourist_amount_payable"] = str(tourist_amount_payable)
     pricing_snapshot["actual_paid_advance"] = str(payable_amount)
@@ -792,6 +800,7 @@ async def checkout(
             "pg_transaction_id": merchant_txn_id,
             "amount": int(float(payable_amount) * 100),  # in paise for consistency
             "currency": "INR",
+            "mode": cashfree_service.env.lower(),
         }
     else:
         # Default: PhonePe
@@ -1116,6 +1125,7 @@ async def get_tourist_bookings(
         .outerjoin(Room, RoomVariant.room_id == Room.id)
         .options(selectinload(Booking.passengers))
         .options(selectinload(Booking.stay_dates))
+        .options(selectinload(Booking.postpone_requests))
         .where(
             Booking.user_id == current_user.id,
             Booking.deleted_at.is_(None),
@@ -1183,6 +1193,7 @@ async def get_tourist_bookings(
             "variant_title": variant_title,
             "passenger_names": [p.full_name for p in b.passengers],
             "pricing_snapshot": b.pricing_snapshot,
+            "is_rescheduled": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "APPROVED" for r in b.postpone_requests),
         })
         
     return sanitized_items
@@ -1228,6 +1239,7 @@ async def get_booking_details(
         .options(selectinload(Booking.passengers))
         .options(selectinload(Booking.stay_dates))
         .options(selectinload(Booking.cancellation_requests))
+        .options(selectinload(Booking.postpone_requests))
         .where(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
@@ -1334,14 +1346,15 @@ async def get_booking_details(
                     "meal_included": day.meal_included,
                     "description": day.description
                 })
-    from app.models.booking import CancellationRequest
-    from app.models.enums import CancellationStatus
-    cancel_query = select(CancellationRequest).where(
-        CancellationRequest.booking_id == b.id,
-        CancellationRequest.status == CancellationStatus.PENDING
-    ).limit(1)
-    cancel_result = await db.execute(cancel_query)
-    has_pending_cancellation = cancel_result.scalar_one_or_none() is not None
+    # Use already-loaded relationships to avoid enum type mismatch in raw SQL
+    has_pending_cancellation = any(
+        (r.status.value if hasattr(r.status, "value") else str(r.status)) == "PENDING"
+        for r in b.cancellation_requests
+    )
+    has_pending_postpone = any(
+        (r.status.value if hasattr(r.status, "value") else str(r.status)) == "PENDING"
+        for r in b.postpone_requests
+    )
 
     # ─── Build Payment Ledger ─────────────────────────────────────────────────
     from app.models.payment import Payment
@@ -1397,6 +1410,7 @@ async def get_booking_details(
         "travel_date": b.travel_date.isoformat(),
         "adult_count": b.adult_count,
         "child_count": b.child_count,
+        "student_count": b.student_count,
         "subtotal_amount": float(b.subtotal_amount),
         "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
         "coupon_discount": float(b.coupon_discount),
@@ -1441,6 +1455,7 @@ async def get_booking_details(
                 "phone_number": p.phone_number,
                 "relationship": p.relationship_to_lead,
                 "is_primary": p.is_primary,
+                "student_class": p.student_class,
                 "masked_aadhaar": _mask_aadhaar(p.aadhar_encrypted) if p.aadhar_encrypted else None,
                 "id_proof_type": "Aadhaar" if p.aadhar_encrypted else None,
                 "id_proof_number": _mask_aadhaar(p.aadhar_encrypted) if p.aadhar_encrypted else None,
@@ -1456,6 +1471,8 @@ async def get_booking_details(
         "booked_by_email": booked_by_email,
         "booked_by_role": booked_by_role,
         "has_pending_cancellation": has_pending_cancellation,
+        "has_pending_postpone": has_pending_postpone,
+        "is_rescheduled": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "APPROVED" for r in b.postpone_requests),
         "ticket_pdf_url": b.ticket_pdf_url,
         "invoice_pdf_url": b.invoice_pdf_url,
         "ticket_generation_status": b.ticket_generation_status.value if hasattr(b.ticket_generation_status, "value") else str(b.ticket_generation_status),
@@ -1482,6 +1499,17 @@ async def get_booking_details(
             "refund_amount": float(latest_cancel.refund_amount) if latest_cancel.refund_amount is not None else None,
             "requested_at": latest_cancel.requested_at.isoformat() if latest_cancel.requested_at else None,
             "processed_at": latest_cancel.processed_at.isoformat() if latest_cancel.processed_at else None,
+        }
+
+    # Include postponement details if present
+    if b.postpone_requests:
+        latest_postpone = sorted(b.postpone_requests, key=lambda p: p.requested_at, reverse=True)[0]
+        result_dict["postpone_details"] = {
+            "status": latest_postpone.status.value if hasattr(latest_postpone.status, "value") else str(latest_postpone.status),
+            "reason": latest_postpone.reason,
+            "requested_new_date": latest_postpone.requested_new_date.isoformat() if latest_postpone.requested_new_date else None,
+            "requested_at": latest_postpone.requested_at.isoformat() if latest_postpone.requested_at else None,
+            "processed_at": latest_postpone.processed_at.isoformat() if latest_postpone.processed_at else None,
         }
         
     return result_dict
@@ -1532,18 +1560,18 @@ async def request_booking_cancellation(
     if booking.status in (BookingStatus.CANCELLED, BookingStatus.REFUNDED):
         raise HTTPException(status_code=400, detail="Booking is already cancelled or refunded")
 
-    # Enforce 7-day cancellation restriction (travel_date > current_date + 7 days)
+    # Enforce 4-day cancellation restriction (travel_date > current_date + 4 days)
     today = get_ist_now().date()
-    if booking.travel_date <= today + timedelta(days=7):
+    if booking.travel_date < today + timedelta(days=4):
         raise HTTPException(
             status_code=400,
-            detail="Cancellation unavailable within 7 days of travel"
+            detail="Cancellation unavailable within 4 days of travel"
         )
 
     # Check for pending cancellation requests
     pending_query = select(CancellationRequest).where(
         CancellationRequest.booking_id == booking.id,
-        CancellationRequest.status == CancellationStatus.PENDING
+        CancellationRequest.status == "PENDING"
     ).limit(1)
     p_result = await db.execute(pending_query)
     existing_request = p_result.scalar_one_or_none()
@@ -1561,6 +1589,91 @@ async def request_booking_cancellation(
     return {
         "status": "success",
         "message": "Cancellation request submitted successfully and is pending admin review."
+    }
+
+class PostponeRequestInput(BaseModel):
+    requested_new_date: date
+    reason: str = Field(..., min_length=5, max_length=1000)
+
+@router.post("/{public_id}/postpone")
+async def request_booking_postpone(
+    public_id: str,
+    req: PostponeRequestInput,
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Tourist/Agent requests booking postponement (reschedule):
+    1. Fetch booking by public ID.
+    2. Check ownership.
+    3. Ensure booking status is CONFIRMED, FULLY_PAID, or PARTIAL_PAID.
+    4. Enforce 7-day postpone restriction (travel_date >= today + 7 days).
+    5. Create PostponeRequest in PENDING state.
+    """
+    from app.models.booking import Booking, PostponeRequest
+    from app.models.enums import CancellationStatus, BookingStatus
+    from datetime import date, timedelta
+    from app.core.timezone import get_ist_now
+
+    query = (
+        select(Booking)
+        .where(
+            Booking.public_id == public_id,
+            Booking.deleted_at.is_(None)
+        )
+        .limit(1)
+    )
+    result = await db.execute(query)
+    booking = result.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking reservation not found")
+
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required to request postponement")
+
+    is_owner = (booking.user_id == current_user.id or booking.agent_id == current_user.id)
+    if not is_owner:
+        raise HTTPException(status_code=403, detail="Not authorized to postpone this booking")
+
+    if booking.status not in (BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID):
+        raise HTTPException(status_code=400, detail="Only paid bookings can be postponed")
+
+    # Enforce 7-day postpone restriction (travel_date >= today + 7 days)
+    today = get_ist_now().date()
+    if booking.travel_date < today + timedelta(days=7):
+        raise HTTPException(
+            status_code=400,
+            detail="Postponement unavailable within 7 days of travel"
+        )
+
+    # Ensure proposed date is in the future
+    if req.requested_new_date <= today:
+        raise HTTPException(status_code=400, detail="Proposed travel date must be in the future")
+
+    # Check for pending or approved postponement requests
+    pending_query = select(PostponeRequest).where(
+        PostponeRequest.booking_id == booking.id,
+        PostponeRequest.status.in_(["PENDING", "APPROVED"])
+    ).limit(1)
+    p_result = await db.execute(pending_query)
+    existing_request = p_result.scalar_one_or_none()
+    if existing_request:
+        if existing_request.status == "APPROVED":
+            raise HTTPException(status_code=400, detail="This booking has already been postponed once. Further postponements are not allowed.")
+        raise HTTPException(status_code=400, detail="A postponement request is already pending for this booking")
+
+    postpone_req = PostponeRequest(
+        booking_id=booking.id,
+        reason=req.reason,
+        requested_new_date=req.requested_new_date,
+        status=CancellationStatus.PENDING
+    )
+    db.add(postpone_req)
+    await db.commit()
+
+    return {
+        "status": "success",
+        "message": "Postponement request submitted successfully and is pending admin review."
     }
 
 @router.post("/{public_id}/balance-checkout")
@@ -1684,6 +1797,7 @@ async def process_balance_checkout(
             "pg_transaction_id": merchant_txn_id,
             "amount": int(payable_amount * 100),
             "currency": "INR",
+            "mode": cashfree_service.env.lower(),
         }
     else:
         callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"

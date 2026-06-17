@@ -1,7 +1,11 @@
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
@@ -68,6 +72,15 @@ class Settings(BaseSettings):
 
     # Sentry
     SENTRY_DSN: Optional[str] = None
+    
+    # MSG91 SMS Configuration
+    MSG91_AUTH_KEY: Optional[str] = None
+    MSG91_OTP_TEMPLATE_ID: str = "6a30e5920770a4e4380eabf2"
+    MSG91_ROOM_CONFIRM_TEMPLATE_ID: str = "6a30e6485b3a7bcbed0723b2"
+    MSG91_ROOM_REMINDER_TEMPLATE_ID: str = "6a30e6b14dbba838d40e87f3"
+    MSG91_CONFIRMATION_FULL_TEMPLATE_ID: str = "6a30e7286af9ab609f05e032"
+    MSG91_CONFIRMATION_PARTIAL_TEMPLATE_ID: str = "6a30e78573fa5bd0530bb953"
+    MSG91_TRAVEL_REMINDER_TEMPLATE_ID: str = "6a30e7e746fbb45b8b0fb2c2"
     
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
 

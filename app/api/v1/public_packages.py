@@ -58,7 +58,7 @@ async def get_packages(
     user_suffix = ""
     if current_user and (
         current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8887773331"
+        current_user.phone_number == "8886154275"
     ):
         user_suffix = ":special_user"
     cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}{user_suffix}"
@@ -142,7 +142,7 @@ async def get_packages(
         is_promo_user = False
         if current_user and (
             current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8887773331"
+            current_user.phone_number == "8886154275"
         ):
             is_promo_user = True
 
@@ -230,7 +230,7 @@ async def get_package_detail(
     user_suffix = ""
     if current_user and (
         current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8887773331"
+        current_user.phone_number == "8886154275"
     ):
         user_suffix = ":special_user"
     cache_key = f"packages:detail:{slug}{user_suffix}"
@@ -295,7 +295,7 @@ async def get_package_detail(
         is_promo_user = False
         if current_user and (
             current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8887773331"
+            current_user.phone_number == "8886154275"
         ):
             is_promo_user = True
 
@@ -567,7 +567,7 @@ async def get_package_availability(
             # Hook for special ₹1 user testing
             if current_user and (
                 current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-                current_user.phone_number == "8887773331"
+                current_user.phone_number == "8886154275"
             ):
                 if is_student:
                     base_student = Decimal("1.00")

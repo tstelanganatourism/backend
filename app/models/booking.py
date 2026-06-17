@@ -59,6 +59,7 @@ class Booking(BaseModel):
     stay_dates = relationship("BookingStayDate", back_populates="booking", cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="booking", cascade="all, delete-orphan")
     cancellation_requests = relationship("CancellationRequest", back_populates="booking", cascade="all, delete-orphan")
+    postpone_requests = relationship("PostponeRequest", back_populates="booking", cascade="all, delete-orphan")
     agent = relationship("User", foreign_keys=[agent_id], back_populates="agent_bookings")
     customer = relationship("User", foreign_keys=[user_id])
     package_variant = relationship("PackageVariant", foreign_keys=[variant_id])
@@ -112,6 +113,21 @@ class CancellationRequest(BaseModel):
     refund_amount = Column(Numeric(12, 2), nullable=True)
 
     booking = relationship("Booking", back_populates="cancellation_requests")
+
+class PostponeRequest(BaseModel):
+    __tablename__ = "postpone_requests"
+
+    booking_id = Column(ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True)
+    reason = Column(String, nullable=False)
+    status = Column(SQLEnum(CancellationStatus, name="postponestatus"), default=CancellationStatus.PENDING, server_default="PENDING", nullable=False)
+    requested_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    processed_at = Column(DateTime(timezone=True), nullable=True)
+    processed_by = Column(ForeignKey("users.id"), nullable=True)
+    admin_notes = Column(String, nullable=True)
+    
+    requested_new_date = Column(Date, nullable=False)
+
+    booking = relationship("Booking", back_populates="postpone_requests")
 
 class BookingDraft(BaseModel):
     """
