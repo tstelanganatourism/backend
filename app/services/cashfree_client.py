@@ -22,8 +22,8 @@ class CashfreeService:
         else:
             self.base_url = "https://sandbox.cashfree.com/pg"
 
-        if not self.app_id or not self.secret_key:
-            logger.warning("Cashfree credentials not configured. Running in MOCK mode.")
+        if not self.app_id or not self.secret_key or self.env == "MOCK":
+            logger.warning(f"Cashfree credentials not configured or env is {self.env}. Running in MOCK mode.")
             self._mock = True
         else:
             self._mock = False

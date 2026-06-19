@@ -419,11 +419,24 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         </html>
         """
 
+        # ── COMMISSION GUARD: Always show public (tourist) prices in email ────
+        # The tourist's email must show:
+        #   - Amount Paid  = booking.total_amount - booking.remaining_balance
+        #   - Balance      = booking.remaining_balance
+        # The agent commission is a private internal rebate — NEVER shown to tourist.
+        # The booking.total_amount is the TOURIST's full price (before any agent discount).
+        # The booking.paid_amount is what the agent actually transferred, which is lower.
+        # We do NOT scale anything — we just derive public amounts from the raw booking fields.
+        from decimal import Decimal as _Decimal
+        _raw_total = _Decimal(str(booking.total_amount))
+        _public_remaining = _Decimal(str(booking.remaining_balance))
+        _public_paid = _raw_total - _public_remaining
+
         amount_paid_row = f"""
                         <tr>
                             <td style="padding:16px 20px; border-bottom:1px solid #dbe6ea;">
                                 <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">Amount paid</div>
-                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:17px; line-height:25px; font-weight:800;">Rs. {float(booking.paid_amount):.2f}</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:17px; line-height:25px; font-weight:800;">Rs. {float(_public_paid):.2f}</div>
                             </td>
                         </tr>
         """
@@ -468,7 +481,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                         <tr>
                             <td style="padding:16px 20px;">
                                 <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">Balance remaining</div>
-                                <div style="font-family:Arial, Helvetica, sans-serif; color:#c2410c; font-size:17px; line-height:25px; font-weight:800;">Rs. {float(booking.remaining_balance):.2f}</div>
+                                <div style="font-family:Arial, Helvetica, sans-serif; color:#c2410c; font-size:17px; line-height:25px; font-weight:800;">Rs. {float(_public_remaining):.2f}</div>
                             </td>
                         </tr>
             """.rstrip()

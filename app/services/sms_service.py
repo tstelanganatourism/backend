@@ -327,8 +327,16 @@ async def get_booking_sms_payload(
             else str(booking.travel_date)
         )
         is_partial = booking.status != BookingStatus.FULLY_PAID
-        paid_str = f"{float(booking.paid_amount):.2f}"
-        total_str = f"{float(booking.total_amount):.2f}"
+
+        # ── COMMISSION GUARD: Always show public (tourist) prices in SMS ──────
+        # booking.paid_amount and booking.total_amount are already scaled/saved
+        # as tourist-facing public amounts in the database.
+        from decimal import Decimal
+        public_paid = Decimal(str(booking.paid_amount))
+        public_total = Decimal(str(booking.total_amount))
+
+        paid_str = f"{float(public_paid):.2f}"
+        total_str = f"{float(public_total):.2f}"
 
         # ── 4a. Package booking ───────────────────────────────────────────────
         if booking.variant_id:

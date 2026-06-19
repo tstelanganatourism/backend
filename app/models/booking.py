@@ -126,6 +126,7 @@ class PostponeRequest(BaseModel):
     admin_notes = Column(String, nullable=True)
     
     requested_new_date = Column(Date, nullable=False)
+    original_travel_date = Column(Date, nullable=True)
 
     booking = relationship("Booking", back_populates="postpone_requests")
 

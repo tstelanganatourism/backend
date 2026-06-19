@@ -29,6 +29,45 @@ async def send_admin_booking_notification(
     real agent commission/net payable, real captured payment amount from the
     payment ledger, document links (Ticket / Invoice / Form), and passenger list.
     """
+    from sqlalchemy import inspect
+    from sqlalchemy.orm.attributes import set_committed_value
+    
+    # Safely load passengers relationship without triggering lazy load exceptions
+    try:
+        insp = inspect(booking)
+        if insp and "passengers" in insp.unloaded:
+            if db:
+                from app.models.booking import BookingPassenger
+                res_passengers = await db.execute(select(BookingPassenger).where(BookingPassenger.booking_id == booking.id))
+                passengers = res_passengers.scalars().all()
+                set_committed_value(booking, "passengers", passengers)
+            else:
+                set_committed_value(booking, "passengers", [])
+    except Exception as passenger_load_err:
+        logger.warning(f"Could not inspect or load passengers asynchronously: {passenger_load_err}")
+        try:
+            set_committed_value(booking, "passengers", [])
+        except Exception:
+            pass
+
+    # Safely load payments relationship without triggering lazy load exceptions
+    try:
+        insp = inspect(booking)
+        if insp and "payments" in insp.unloaded:
+            if db:
+                from app.models.payment import Payment
+                res_payments = await db.execute(select(Payment).where(Payment.booking_id == booking.id))
+                payments = res_payments.scalars().all()
+                set_committed_value(booking, "payments", payments)
+            else:
+                set_committed_value(booking, "payments", [])
+    except Exception as payment_load_err:
+        logger.warning(f"Could not inspect or load payments asynchronously: {payment_load_err}")
+        try:
+            set_committed_value(booking, "payments", [])
+        except Exception:
+            pass
+
     admin_email = "tsboattourismservices@gmail.com"
     subject = f"🆕 New Booking — {booking.public_id}"
 

@@ -522,6 +522,23 @@ async def update_agent_quota(
     await db.commit()
     await db.refresh(quota)
 
+    # Broadcast real-time quota update to the specific package channel
+    from app.utils.sse import sse_manager
+    import time
+    
+    await sse_manager.broadcast_event(
+        "package", 
+        str(payload.package_id),
+        "QUOTA_UPDATE", 
+        {
+            "version": int(time.time() * 1000),
+            "agent_id": id,
+            "package_id": payload.package_id,
+            "daily_quota": quota.daily_quota,
+            "is_allowed": quota.is_allowed
+        }
+    )
+
     return AgentQuotaResponse(
         package_id=quota.package_id,
         package_title=package.title,

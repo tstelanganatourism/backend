@@ -1699,6 +1699,7 @@ async def admin_process_postpone(
         raise HTTPException(status_code=400, detail="New travel date is required to approve postponement.")
         
     # Run the common date rescheduling logic
+    postpone_req.original_travel_date = booking.travel_date
     await _reschedule_booking_date(booking, new_date, db)
     
     postpone_req.status = CancellationStatus.APPROVED
@@ -1744,6 +1745,7 @@ async def admin_change_booking_date(
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
         
+    old_travel_date = booking.travel_date
     await _reschedule_booking_date(booking, payload.new_travel_date, db)
     
     # Create approved postponement request record for history
@@ -1755,6 +1757,7 @@ async def admin_change_booking_date(
         reason=payload.admin_notes or "Direct reschedule by admin",
         status=CancellationStatus.APPROVED,
         requested_new_date=payload.new_travel_date,
+        original_travel_date=old_travel_date,
         requested_at=func.now(),
         processed_at=func.now(),
         processed_by=current_admin.id,

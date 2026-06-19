@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import date, time, timedelta, datetime, timezone
@@ -117,16 +117,7 @@ async def checkout(
     if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
         raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
 
-    is_test_user = False
-    if current_user and (
-        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8886154275"
-    ):
-        is_test_user = True
-    if request.passengers and len(request.passengers) > 0:
-        primary_phone = request.passengers[0].phone
-        if primary_phone == "8886154275":
-            is_test_user = True
+    # Development hook removed to prevent invoice math corruption.
 
     # Derive adult, child, and student counts safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
@@ -461,9 +452,7 @@ async def checkout(
 
         subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
         
-        # Hook for special ₹1 user testing
-        if is_test_user:
-            subtotal_amount = Decimal("1.00")
+        # Hook removed.
             
         commissionable_base = base_subtotal
 
@@ -603,10 +592,7 @@ async def checkout(
             else:
                 day_price = variant.weekday_price
             
-            # Hook for special ₹1 user testing
-            if is_test_user:
-                day_price = Decimal("1.00")
-                    
+        # Hook removed.
             subtotal_amount += Decimal(str(required_rooms)) * day_price
         commissionable_base = subtotal_amount
 
@@ -656,13 +642,7 @@ async def checkout(
     gateway_fee = ((discounted_subtotal + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
     total_amount = discounted_subtotal + gst_amount + gateway_fee
     
-    if is_test_user:
-        subtotal_amount = Decimal("1.00")
-        coupon_discount = Decimal("0.00")
-        discounted_subtotal = Decimal("1.00")
-        gst_amount = Decimal("0.00")
-        gateway_fee = Decimal("0.00")
-        total_amount = Decimal("1.00")
+    # Overrides removed to fix invoice generation.
     
     # --- Agent Metadata & Commission Calculations ---
     is_agent = current_user is not None and current_user.role == UserRole.AGENT
@@ -742,9 +722,7 @@ async def checkout(
     else:
         payable_amount = tourist_amount_payable
 
-    if is_test_user:
-        tourist_amount_payable = Decimal("1.00")
-        payable_amount = Decimal("1.00")
+    # Overrides removed.
 
     pricing_snapshot["payment_percentage"] = str(payment_percentage)
     pricing_snapshot["tourist_amount_payable"] = str(tourist_amount_payable)
@@ -1167,6 +1145,9 @@ async def get_tourist_bookings(
         else:
             package_departure_time = row[7].strftime('%I:%M %p') if row[7] else None
 
+        _b_public_paid = b.paid_amount
+        _b_public_remaining = b.remaining_balance
+
         sanitized_items.append({
             "target_type": target_type,
             "room_checkin": room_checkin,
@@ -1184,8 +1165,8 @@ async def get_tourist_bookings(
             "coupon_applied": b.coupon_applied,
             "gst_amount": float(b.gst_amount),
             "gateway_fee": float(b.gateway_fee),
-            "paid_amount": float(b.paid_amount),
-            "remaining_balance": float(b.remaining_balance),
+            "paid_amount": float(_b_public_paid),
+            "remaining_balance": float(_b_public_remaining),
             "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
             "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
             "created_at": b.created_at.isoformat() if b.created_at else None,
@@ -1221,6 +1202,8 @@ async def get_live_booking_count(db: AsyncSession = Depends(get_db)):
 @router.get("/{public_id}")
 async def get_booking_details(
     public_id: str,
+    response: Response,
+    secret: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional),
 ):
@@ -1229,6 +1212,9 @@ async def get_booking_details(
     Commission fields are ONLY included when the authenticated user owns the booking as an agent or is an admin.
     Public users and tourists never receive agent_commission or agent_payable.
     """
+    from app.utils.cache import set_no_store_headers
+    set_no_store_headers(response)
+    
     from app.models.room import Room, RoomVariant
     query = (
         select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address, Room.id, Package.type)
@@ -1240,6 +1226,9 @@ async def get_booking_details(
         .options(selectinload(Booking.stay_dates))
         .options(selectinload(Booking.cancellation_requests))
         .options(selectinload(Booking.postpone_requests))
+        .options(selectinload(Booking.agent))
+        .options(selectinload(Booking.customer))
+        .options(selectinload(Booking.package_variant))
         .where(
             Booking.public_id == public_id,
             Booking.deleted_at.is_(None)
@@ -1291,10 +1280,10 @@ async def get_booking_details(
     agent_id = None
     agent_name = None
     agent_phone = None
+    agent_gst = None
+    agent_company = None
     if b.agent_id:
-        agent_query = select(User).where(User.id == b.agent_id).limit(1)
-        a_result = await db.execute(agent_query)
-        agent = a_result.scalar_one_or_none()
+        agent = b.agent
         if agent:
             agent_id = agent.id
             agent_name = agent.full_name
@@ -1309,9 +1298,7 @@ async def get_booking_details(
     booked_by_email = None
     booked_by_role = None
     if b.user_id:
-        user_query = select(User).where(User.id == b.user_id).limit(1)
-        u_result = await db.execute(user_query)
-        booked_user = u_result.scalar_one_or_none()
+        booked_user = b.customer
         if booked_user:
             booked_by_name = booked_user.full_name
             booked_by_email = booked_user.email
@@ -1321,9 +1308,7 @@ async def get_booking_details(
     itinerary = []
     if b.variant_id:
         from app.models.package import PackageBoardingPoint, PackageItineraryDay
-        var_stmt = select(PackageVariant).where(PackageVariant.id == b.variant_id)
-        var_res = await db.execute(var_stmt)
-        variant = var_res.scalar_one_or_none()
+        variant = b.package_variant
         if variant:
             bp_stmt = select(PackageBoardingPoint).where(
                 PackageBoardingPoint.package_id == variant.package_id,
@@ -1366,6 +1351,40 @@ async def get_booking_details(
     p_result = await db.execute(payment_ledger_stmt)
     raw_payments = p_result.scalars().all()
 
+    # ─── Commission Gate: Only for owning agent or admin ─────────────────────
+    import hmac
+    import hashlib
+    from app.core.config import settings
+
+    is_agent_owner = (
+        current_user is not None
+        and current_user.role == UserRole.AGENT
+        and b.agent_id == current_user.id
+    )
+    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+    
+    is_valid_secret = False
+    if secret:
+        secret_key = settings.SECRET_KEY or 'tsaptourismpapikondalubadhrachalam'
+        expected = hmac.new(
+            secret_key.encode('utf-8'),
+            public_id.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        if hmac.compare_digest(secret, expected):
+            is_valid_secret = True
+            
+    show_commission = is_agent_owner or is_admin or is_valid_secret
+    use_agent_payment_view = show_commission and b.agent_id is not None
+
+    # Calculate scale ratio for public view of agent bookings to prevent leaks
+    scale_ratio = Decimal("1.0")
+    is_agent = b.agent_id is not None and b.agent_commission is not None and b.agent_commission > 0
+    if is_agent and not show_commission:
+        agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission)))
+        if agent_payable > 0:
+            scale_ratio = Decimal(str(b.total_amount)) / agent_payable
+
     payment_ledger = []
     for p in raw_payments:
         collected_by_label = p.collected_by_label
@@ -1378,9 +1397,13 @@ async def get_booking_details(
                 collected_by_label = "Cashfree"
             else:
                 collected_by_label = "Admin (Cash)"
+
+        raw_amt = Decimal(str(p.amount))
+        scaled_amt = (raw_amt * scale_ratio).quantize(Decimal("0.01"))
+
         payment_ledger.append({
             "id": p.id,
-            "amount": float(p.amount),
+            "amount": float(scaled_amt),
             "payment_method": p.payment_method,
             "status": p.status.value if hasattr(p.status, "value") else str(p.status),
             "collected_by_type": p.collected_by_type,
@@ -1388,16 +1411,6 @@ async def get_booking_details(
             "payment_reference_id": p.payment_reference_id,
             "created_at": p.created_at.isoformat() if p.created_at else None,
         })
-
-    # ─── Commission Gate: Only for owning agent or admin ─────────────────────
-    is_agent_owner = (
-        current_user is not None
-        and current_user.role == UserRole.AGENT
-        and b.agent_id == current_user.id
-    )
-    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
-    show_commission = is_agent_owner or is_admin
-    use_agent_payment_view = show_commission and b.agent_id is not None
 
     agent_paid = sum(Decimal(str(p.amount)) for p in raw_payments if p.status == PaymentStatus.CAPTURED)
     agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
@@ -1484,6 +1497,15 @@ async def get_booking_details(
             if show_commission
             else None
         ),
+        "invoice_secret": (
+            hmac.new(
+                (settings.SECRET_KEY or 'tsaptourismpapikondalubadhrachalam').encode('utf-8'),
+                b.public_id.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            if show_commission
+            else None
+        ),
         # Immutable payment history — always returned
         "payment_ledger": payment_ledger,
         "pricing_snapshot": b.pricing_snapshot,
@@ -1508,6 +1530,7 @@ async def get_booking_details(
             "status": latest_postpone.status.value if hasattr(latest_postpone.status, "value") else str(latest_postpone.status),
             "reason": latest_postpone.reason,
             "requested_new_date": latest_postpone.requested_new_date.isoformat() if latest_postpone.requested_new_date else None,
+            "original_travel_date": latest_postpone.original_travel_date.isoformat() if latest_postpone.original_travel_date else None,
             "requested_at": latest_postpone.requested_at.isoformat() if latest_postpone.requested_at else None,
             "processed_at": latest_postpone.processed_at.isoformat() if latest_postpone.processed_at else None,
         }
@@ -1666,6 +1689,7 @@ async def request_booking_postpone(
         booking_id=booking.id,
         reason=req.reason,
         requested_new_date=req.requested_new_date,
+        original_travel_date=booking.travel_date,
         status=CancellationStatus.PENDING
     )
     db.add(postpone_req)
