@@ -1638,7 +1638,7 @@ async def list_postpone_requests(
             "booking_id": booking.id,
             "booking_public_id": booking.public_id,
             "customer_name": lead_passenger,
-            "travel_date": booking.travel_date.isoformat(),
+            "travel_date": r.original_travel_date.isoformat() if r.original_travel_date else booking.travel_date.isoformat(),
             "total_amount": float(booking.total_amount),
             "paid_amount": float(booking.paid_amount),
             "reason": r.reason,
