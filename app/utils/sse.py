@@ -107,3 +107,51 @@ def build_package_sse_payload(variant, inventory_row, travel_date):
     }
 
 sse_manager = SSEManager()
+
+
+async def broadcast_transport_update(db, transport_option_id: int, travel_date):
+    from sqlalchemy import select
+    from app.models.package import PackageTransportOption, PackageTransportInventory
+    import time
+    from app.core.timezone import get_ist_now
+    
+    # Fetch option
+    opt = await db.scalar(
+        select(PackageTransportOption).where(PackageTransportOption.id == transport_option_id)
+    )
+    if not opt:
+        return
+        
+    inv_row = await db.scalar(
+        select(PackageTransportInventory).where(
+            PackageTransportInventory.transport_option_id == transport_option_id,
+            PackageTransportInventory.date == travel_date,
+            PackageTransportInventory.deleted_at.is_(None)
+        )
+    )
+    
+    t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
+    is_shared = t_type_str != 'SEPARATE_VEHICLE'
+    
+    if inv_row:
+        total_capacity = (inv_row.available_count * (opt.capacity or 1)) if is_shared else inv_row.available_count
+        remaining = max(0, total_capacity - inv_row.booked_count)
+        is_closed = inv_row.is_closed
+        price_override = inv_row.price_override
+    else:
+        remaining = 0
+        is_closed = True
+        price_override = None
+        
+    sse_payload = {
+        "version": int(time.time() * 1000),
+        "timestamp": get_ist_now().isoformat(),
+        "package_id": opt.package_id,
+        "travel_date": str(travel_date),
+        "option_id": transport_option_id,
+        "remaining": remaining,
+        "is_closed": is_closed,
+        "price_override": float(price_override) if price_override is not None else None
+    }
+    await sse_manager.broadcast_event("package", str(opt.package_id), "TRANSPORT_UPDATE", sse_payload)
+

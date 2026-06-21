@@ -46,6 +46,49 @@ async def release_draft_inventory(draft: BookingDraft, db: AsyncSession) -> list
                 if variant:
                     from app.utils.sse import build_package_sse_payload
                     sse_payloads.append(build_package_sse_payload(variant, inventory, draft.travel_date))
+                    
+            # Release transport inventory
+            payload = draft.checkout_payload or {}
+            effective_selections = payload.get("transport_selections") or []
+            if not effective_selections and payload.get("transport_option_id"):
+                effective_selections = [{"option_id": payload.get("transport_option_id"), "quantity": 1}]
+                
+            if effective_selections:
+                from app.models.package import PackageTransportInventory, PackageTransportOption
+                from app.utils.sse import broadcast_transport_update
+                
+                selected_opt_ids = [s.get("option_id") if isinstance(s, dict) else s.option_id for s in effective_selections]
+                t_opts_res = await db.execute(select(PackageTransportOption).where(PackageTransportOption.id.in_(selected_opt_ids)))
+                t_opts_map = {t.id: t for t in t_opts_res.scalars().all()}
+                
+                for sel in effective_selections:
+                    sel_id = sel.get("option_id") if isinstance(sel, dict) else sel.option_id
+                    sel_qty = sel.get("quantity") if isinstance(sel, dict) else sel.quantity
+                    t_opt = t_opts_map.get(sel_id)
+                    if not t_opt:
+                        continue
+                        
+                    inv_row = await db.scalar(
+                        select(PackageTransportInventory).where(
+                            PackageTransportInventory.transport_option_id == sel_id,
+                            PackageTransportInventory.date == draft.travel_date,
+                            PackageTransportInventory.deleted_at.is_(None)
+                        ).with_for_update()
+                    )
+                    if inv_row:
+                        t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                        if t_type_str == 'SEPARATE_VEHICLE':
+                            inv_row.booked_count = max(0, inv_row.booked_count - sel_qty)
+                        else:
+                            is_student_pkg = payload.get("student_count") is not None and payload.get("student_count") > 0
+                            adult_count = payload.get("adult_count") or draft.quantity
+                            child_count = payload.get("child_count") or 0
+                            student_count = payload.get("student_count") or 0
+                            seats_needed = student_count if is_student_pkg else (adult_count + child_count)
+                            inv_row.booked_count = max(0, inv_row.booked_count - seats_needed)
+                        
+                        await db.flush()
+                        await broadcast_transport_update(db, sel_id, draft.travel_date)
 
         elif draft.target_type == 'room':
             payload = draft.checkout_payload or {}

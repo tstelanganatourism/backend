@@ -896,3 +896,579 @@ async def delete_room_inventory_row(
 
 
     return None
+
+
+# ─── Transport Inventory Routes ────────────────────────────────────────────────
+
+from app.models.package import PackageTransportOption, PackageTransportInventory
+from app.schemas.inventory import (
+    TransportInventoryGenerateRequest,
+    TransportInventoryGenerateResponse,
+    TransportInventoryUpdateRequest,
+    TransportInventoryRow,
+)
+
+
+@router.post("/transport/generate", response_model=TransportInventoryGenerateResponse)
+async def generate_transport_inventory(
+    payload: TransportInventoryGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Bulk-generate transport inventory rows for every transport option on a package
+    for a given date range.
+    Skips dates that already have a row.
+    """
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=400, detail="from_date must be <= to_date")
+    if (payload.to_date - payload.from_date).days > 365:
+        raise HTTPException(status_code=400, detail="Date range cannot exceed 365 days")
+
+    # Fetch all transport options for this package
+    opts_res = await db.execute(
+        select(PackageTransportOption).where(
+            PackageTransportOption.package_id == payload.package_id,
+            PackageTransportOption.deleted_at.is_(None),
+        )
+    )
+    opts = opts_res.scalars().all()
+    if not opts:
+        raise HTTPException(status_code=404, detail="No transport options found for this package")
+
+    # Fetch all existing slots in one query to avoid N+1
+    existing_res = await db.execute(
+        select(PackageTransportInventory.transport_option_id, PackageTransportInventory.date).where(
+            PackageTransportInventory.transport_option_id.in_([o.id for o in opts]),
+            PackageTransportInventory.date >= payload.from_date,
+            PackageTransportInventory.date <= payload.to_date,
+            PackageTransportInventory.deleted_at.is_(None),
+        )
+    )
+    existing_set = set(existing_res.fetchall())
+
+    created = 0
+    skipped = 0
+    total_days = (payload.to_date - payload.from_date).days + 1
+    created_slots = []
+
+    for opt in opts:
+        # Determine count: use caller-supplied count or fallback to option capacity
+        opt_count = 1
+        if payload.option_counts and str(opt.id) in payload.option_counts:
+            opt_count = int(payload.option_counts[str(opt.id)])
+        else:
+            opt_count = int(opt.capacity or 1)
+
+        for day_offset in range(total_days):
+            d = payload.from_date + timedelta(days=day_offset)
+            
+            # Check if row already exists
+            if (opt.id, d) in existing_set:
+                skipped += 1
+                continue
+
+            row = PackageTransportInventory(
+                transport_option_id=opt.id,
+                date=d,
+                available_count=opt_count,
+                booked_count=0,
+                is_closed=False,
+            )
+            db.add(row)
+            created += 1
+            created_slots.append((opt.id, d))
+
+    await db.commit()
+    
+    # Broadcast SSE for generated slots
+    from app.utils.sse import broadcast_transport_update
+    for opt_id, slot_date in created_slots:
+        await broadcast_transport_update(db, opt_id, slot_date)
+    
+    # Cache invalidation for transport generation
+    from app.models.package import Package
+    from app.services.redis_client import invalidate_cached_availability
+    from app.utils.cache import trigger_frontend_revalidation
+    import asyncio
+    
+    pkg = await db.scalar(select(Package).where(Package.id == payload.package_id))
+    if pkg:
+        asyncio.create_task(invalidate_cached_availability(pkg.slug))
+        trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+
+    return TransportInventoryGenerateResponse(
+        created=created,
+        skipped=skipped,
+        message=f"Generated {created} rows, skipped {skipped} existing rows.",
+    )
+
+
+@router.get("/transport/{package_id}/calendar")
+async def get_transport_inventory_calendar(
+    package_id: int,
+    month: str = Query(..., description="YYYY-MM"),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Returns all transport inventory rows for a package's transport options
+    in the given month. Groups by date → [option_rows].
+    """
+    try:
+        year, mon = map(int, month.split("-"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+
+    from_date = date(year, mon, 1)
+    import calendar as cal_mod
+    last_day = cal_mod.monthrange(year, mon)[1]
+    to_date = date(year, mon, last_day)
+
+    # All transport options for this package
+    opts_res = await db.execute(
+        select(PackageTransportOption).where(
+            PackageTransportOption.package_id == package_id,
+            PackageTransportOption.deleted_at.is_(None),
+        )
+    )
+    opts = opts_res.scalars().all()
+    if not opts:
+        return {"options": [], "dates": {}}
+
+    opt_map = {o.id: o for o in opts}
+    opt_ids = [o.id for o in opts]
+
+    # Fetch inventory rows
+    rows_res = await db.execute(
+        select(PackageTransportInventory).where(
+            PackageTransportInventory.transport_option_id.in_(opt_ids),
+            PackageTransportInventory.date >= from_date,
+            PackageTransportInventory.date <= to_date,
+            PackageTransportInventory.deleted_at.is_(None),
+        ).order_by(PackageTransportInventory.date, PackageTransportInventory.transport_option_id)
+    )
+    rows = rows_res.scalars().all()
+
+    # Build date-keyed response
+    dates: dict = {}
+    for row in rows:
+        d_str = row.date.isoformat()
+        if d_str not in dates:
+            dates[d_str] = []
+        opt = opt_map.get(row.transport_option_id)
+        if opt:
+            dates[d_str].append(TransportInventoryRow.from_orm_with_option(row, opt).model_dump())
+
+    options_out = [
+        {
+            "id": o.id,
+            "title": o.title,
+            "type": o.type.value if hasattr(o.type, "value") else str(o.type),
+            "capacity": o.capacity,
+        }
+        for o in opts
+    ]
+
+    return {"options": options_out, "dates": dates}
+
+
+@router.patch("/transport/slots/{slot_id}", response_model=TransportInventoryRow)
+async def update_transport_inventory_slot(
+    slot_id: int,
+    payload: TransportInventoryUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Update a single transport inventory slot's count / closed flag / price override."""
+    row = await db.scalar(
+        select(PackageTransportInventory).where(
+            PackageTransportInventory.id == slot_id,
+            PackageTransportInventory.deleted_at.is_(None),
+        ).with_for_update()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Transport inventory slot not found")
+
+    opt = await db.scalar(
+        select(PackageTransportOption).where(PackageTransportOption.id == row.transport_option_id)
+    )
+    if not opt:
+        raise HTTPException(status_code=404, detail="Transport option not found")
+
+    t_type = opt.type.value if hasattr(opt.type, "value") else str(opt.type)
+    is_shared = t_type != "SEPARATE_VEHICLE"
+
+    if payload.capacity is not None:
+        opt.capacity = payload.capacity
+
+    if payload.available_count is not None or payload.capacity is not None:
+        new_avail = payload.available_count if payload.available_count is not None else row.available_count
+        new_cap = opt.capacity or 1
+        
+        total_capacity_new = (new_avail * new_cap) if is_shared else new_avail
+        if total_capacity_new < row.booked_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot set available_count ({new_avail}) and capacity ({new_cap}) as it results in {total_capacity_new} seats/vehicles, which is below already booked ({row.booked_count})",
+            )
+        
+        if payload.available_count is not None:
+            row.available_count = payload.available_count
+
+    if payload.is_closed is not None:
+        row.is_closed = payload.is_closed
+
+    if payload.price_override is not None:
+        row.price_override = payload.price_override if payload.price_override > 0 else None
+
+    await db.commit()
+    await db.refresh(row)
+    
+    from app.utils.sse import broadcast_transport_update
+    await broadcast_transport_update(db, row.transport_option_id, row.date)
+    
+    from app.models.package import Package
+    from app.services.redis_client import invalidate_cached_availability
+    from app.utils.cache import trigger_frontend_revalidation
+    import asyncio
+    if opt:
+        pkg = await db.scalar(select(Package).where(Package.id == opt.package_id))
+        if pkg:
+            asyncio.create_task(invalidate_cached_availability(pkg.slug))
+            trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+            
+    return TransportInventoryRow.from_orm_with_option(row, opt)
+
+
+@router.post("/transport/slots", response_model=TransportInventoryRow)
+async def create_transport_inventory_slot(
+    transport_option_id: int,
+    slot_date: date,
+    available_count: int = 1,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Create a single transport inventory slot for a specific option + date."""
+    # Validate option exists
+    opt = await db.scalar(
+        select(PackageTransportOption).where(
+            PackageTransportOption.id == transport_option_id,
+            PackageTransportOption.deleted_at.is_(None),
+        )
+    )
+    if not opt:
+        raise HTTPException(status_code=404, detail="Transport option not found")
+
+    # Check for duplicate
+    existing = await db.scalar(
+        select(PackageTransportInventory).where(
+            PackageTransportInventory.transport_option_id == transport_option_id,
+            PackageTransportInventory.date == slot_date,
+            PackageTransportInventory.deleted_at.is_(None),
+        )
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Slot already exists for this option and date")
+
+    row = PackageTransportInventory(
+        transport_option_id=transport_option_id,
+        date=slot_date,
+        available_count=available_count,
+        booked_count=0,
+        is_closed=False,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    
+    from app.utils.sse import broadcast_transport_update
+    await broadcast_transport_update(db, row.transport_option_id, row.date)
+    
+    from app.models.package import Package
+    from app.services.redis_client import invalidate_cached_availability
+    from app.utils.cache import trigger_frontend_revalidation
+    import asyncio
+    pkg = await db.scalar(select(Package).where(Package.id == opt.package_id))
+    if pkg:
+        asyncio.create_task(invalidate_cached_availability(pkg.slug))
+        trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+        
+    return TransportInventoryRow.from_orm_with_option(row, opt)
+
+
+@router.delete("/transport/slots/{slot_id}", status_code=204)
+async def delete_transport_inventory_slot(
+    slot_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Delete (soft-delete) a transport inventory slot. This blocks that transport option for the date."""
+    from sqlalchemy import func
+    row = await db.scalar(
+        select(PackageTransportInventory).where(
+            PackageTransportInventory.id == slot_id,
+            PackageTransportInventory.deleted_at.is_(None),
+        ).with_for_update()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Transport inventory slot not found")
+
+    if row.booked_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete slot: {row.booked_count} already booked. Close it instead.",
+        )
+
+    option_id = row.transport_option_id
+    slot_date = row.date
+    row.deleted_at = func.now()
+    await db.commit()
+    
+    from app.utils.sse import broadcast_transport_update
+    await broadcast_transport_update(db, option_id, slot_date)
+    
+    opt = await db.scalar(
+        select(PackageTransportOption).where(PackageTransportOption.id == row.transport_option_id)
+    )
+    if opt:
+        from app.models.package import Package
+        from app.services.redis_client import invalidate_cached_availability
+        from app.utils.cache import trigger_frontend_revalidation
+        import asyncio
+        pkg = await db.scalar(select(Package).where(Package.id == opt.package_id))
+        if pkg:
+            asyncio.create_task(invalidate_cached_availability(pkg.slug))
+            trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+            
+    return None
+
+# ─── Bulk Action Endpoints ───────────────────────────────────────────────────
+
+from app.schemas.inventory import (
+    InventoryBulkActionRequest,
+    RoomInventoryBulkActionRequest,
+    TransportInventoryBulkActionRequest,
+    BulkActionType,
+)
+
+@router.post("/packages/bulk")
+async def bulk_action_package_inventory(
+    payload: InventoryBulkActionRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=400, detail="from_date must be <= to_date")
+        
+    query = select(PackageVariantInventory).where(
+        PackageVariantInventory.variant_id == payload.variant_id,
+        PackageVariantInventory.date >= payload.from_date,
+        PackageVariantInventory.date <= payload.to_date,
+        PackageVariantInventory.deleted_at.is_(None),
+    )
+    res = await db.execute(query)
+    rows = res.scalars().all()
+    
+    if not rows:
+        return {"updated": 0, "message": "No inventory found in the given date range."}
+        
+    updated = 0
+    import datetime
+    
+    for row in rows:
+        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_capacity is not None:
+            if row.total_capacity == payload.total_capacity:
+                continue
+            row.total_capacity = payload.total_capacity
+            updated += 1
+        elif payload.action == BulkActionType.OPEN:
+            if not row.is_closed:
+                continue
+            row.is_closed = False
+            updated += 1
+        elif payload.action == BulkActionType.CLOSE:
+            if row.is_closed:
+                continue
+            row.is_closed = True
+            updated += 1
+        elif payload.action == BulkActionType.DELETE:
+            if row.deleted_at is not None:
+                continue
+            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            updated += 1
+            
+    if updated == 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="No slots were modified. They are already in the requested state."
+        )
+            
+    await db.commit()
+    await _clear_package_cache_for_variant(db, payload.variant_id)
+        
+    action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
+    return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
+
+
+@router.post("/rooms/bulk")
+async def bulk_action_room_inventory(
+    payload: RoomInventoryBulkActionRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=400, detail="from_date must be <= to_date")
+        
+    query = select(RoomSlotInventory).where(
+        RoomSlotInventory.room_variant_id == payload.room_variant_id,
+        RoomSlotInventory.date >= payload.from_date,
+        RoomSlotInventory.date <= payload.to_date,
+        RoomSlotInventory.deleted_at.is_(None),
+    )
+    res = await db.execute(query)
+    rows = res.scalars().all()
+    
+    if not rows:
+        return {"updated": 0, "message": "No inventory found in the given date range."}
+        
+    updated = 0
+    import datetime
+    
+    for row in rows:
+        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_rooms is not None:
+            if row.total_rooms == payload.total_rooms:
+                continue
+            row.total_rooms = payload.total_rooms
+            updated += 1
+        elif payload.action == BulkActionType.OPEN:
+            if not row.is_closed:
+                continue
+            row.is_closed = False
+            updated += 1
+        elif payload.action == BulkActionType.CLOSE:
+            if row.is_closed:
+                continue
+            row.is_closed = True
+            updated += 1
+        elif payload.action == BulkActionType.DELETE:
+            if row.deleted_at is not None:
+                continue
+            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            updated += 1
+            
+    if updated == 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="No slots were modified. They are already in the requested state."
+        )
+            
+    await db.commit()
+    
+    # Clear Redis caches
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix(f"inventory:rooms:{payload.room_variant_id}")
+    clear_cache_prefix("rooms:")
+    
+    from app.models.room import RoomVariant, Room
+    from app.services.redis_client import invalidate_cached_availability
+    from app.utils.cache import trigger_frontend_revalidation
+    import asyncio
+    
+    room_result = await db.execute(
+        select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+            RoomVariant.id == payload.room_variant_id
+        )
+    )
+    room_info = room_result.first()
+    if room_info:
+        slug, room_id = room_info
+        clear_cache_prefix(f"rooms:detail:{slug}")
+        asyncio.create_task(invalidate_cached_availability(slug))
+        trigger_frontend_revalidation(tags=[f"room-{slug}"])
+
+    action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
+    return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
+
+
+@router.post("/transport/bulk")
+async def bulk_action_transport_inventory(
+    payload: TransportInventoryBulkActionRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=400, detail="from_date must be <= to_date")
+        
+    # Get all transport options for package
+    opts_res = await db.execute(
+        select(PackageTransportOption).where(
+            PackageTransportOption.package_id == payload.package_id,
+            PackageTransportOption.deleted_at.is_(None)
+        )
+    )
+    opts = opts_res.scalars().all()
+    if not opts:
+        return {"updated": 0, "message": "No transport options found for package."}
+        
+    opt_ids = [o.id for o in opts]
+    
+    query = select(PackageTransportInventory).where(
+        PackageTransportInventory.transport_option_id.in_(opt_ids),
+        PackageTransportInventory.date >= payload.from_date,
+        PackageTransportInventory.date <= payload.to_date,
+        PackageTransportInventory.deleted_at.is_(None),
+    )
+    res = await db.execute(query)
+    rows = res.scalars().all()
+    
+    if not rows:
+        return {"updated": 0, "message": "No transport inventory found in the given date range."}
+        
+    updated = 0
+    import datetime
+    
+    for row in rows:
+        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.option_counts:
+            # Only update if a count was provided for this option
+            if str(row.transport_option_id) in payload.option_counts:
+                new_capacity = int(payload.option_counts[str(row.transport_option_id)])
+                if row.available_count == new_capacity:
+                    continue
+                row.available_count = new_capacity
+                updated += 1
+        elif payload.action == BulkActionType.OPEN:
+            if not row.is_closed:
+                continue
+            row.is_closed = False
+            updated += 1
+        elif payload.action == BulkActionType.CLOSE:
+            if row.is_closed:
+                continue
+            row.is_closed = True
+            updated += 1
+        elif payload.action == BulkActionType.DELETE:
+            if row.deleted_at is not None:
+                continue
+            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            updated += 1
+            
+    if updated == 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="No slots were modified. They are already in the requested state."
+        )
+            
+    await db.commit()
+    
+    import asyncio
+    from app.services.redis_client import invalidate_cached_availability
+    from app.utils.cache import trigger_frontend_revalidation
+    
+    pkg = await db.scalar(select(Package).where(Package.id == payload.package_id))
+    if pkg:
+        asyncio.create_task(invalidate_cached_availability(pkg.slug))
+        trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+        
+    action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
+    return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}

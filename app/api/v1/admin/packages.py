@@ -209,23 +209,8 @@ async def create_package(
     db.add(package)
     await db.commit()
     
-    # Reload package with all child relations loaded
-    query = (
-        select(Package)
-        .where(Package.id == package.id)
-        .options(
-            selectinload(Package.variants),
-            selectinload(Package.transport_options),
-            selectinload(Package.gallery),
-            selectinload(Package.itinerary),
-            selectinload(Package.highlights),
-            selectinload(Package.inclusions),
-            selectinload(Package.exclusions),
-            selectinload(Package.boarding_points),
-            selectinload(Package.faqs),
-            selectinload(Package.policies)
-        )
-    )
+    # Reload package scalar attributes
+    query = select(Package).where(Package.id == package.id)
     result = await db.execute(query)
     package = result.scalar_one()
     
@@ -361,18 +346,17 @@ async def update_package(
     )
     await db.commit()
     
-    # Broadcast SSE for Admin Package Edit if status is INACTIVE
-    if package.status == "INACTIVE":
-        import time
-        from app.core.timezone import get_ist_now
-        from app.utils.sse import sse_manager
-        sse_payload = {
-            "version": int(time.time() * 1000),
-            "timestamp": get_ist_now().isoformat(),
-            "package_id": package.id,
-            "status": "INACTIVE"
-        }
-        await sse_manager.broadcast_event("package", str(package.id), "ENTITY_STATUS_UPDATE", sse_payload)
+    # Broadcast SSE for Admin Package Edit
+    import time
+    from app.core.timezone import get_ist_now
+    from app.utils.sse import sse_manager
+    sse_payload = {
+        "version": int(time.time() * 1000),
+        "timestamp": get_ist_now().isoformat(),
+        "package_id": package.id,
+        "status": package.status
+    }
+    await sse_manager.broadcast_event("package", str(package.id), "ENTITY_STATUS_UPDATE", sse_payload)
         
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{old_slug}")
@@ -381,23 +365,8 @@ async def update_package(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}", f"package:{old_slug}"])
     
-    # Reload package with all relationships loaded to prevent MissingGreenlet errors during serialization
-    refresh_query = (
-        select(Package)
-        .where(Package.id == package.id)
-        .options(
-            selectinload(Package.variants),
-            selectinload(Package.transport_options),
-            selectinload(Package.gallery),
-            selectinload(Package.itinerary),
-            selectinload(Package.highlights),
-            selectinload(Package.inclusions),
-            selectinload(Package.exclusions),
-            selectinload(Package.boarding_points),
-            selectinload(Package.faqs),
-            selectinload(Package.policies)
-        )
-    )
+    # Reload package scalar attributes to refresh expired fields like updated_at
+    refresh_query = select(Package).where(Package.id == package.id)
     refresh_result = await db.execute(refresh_query)
     package = refresh_result.scalar_one()
     
@@ -520,6 +489,12 @@ async def publish_package(
     if len(active_variants) == 0:
         errors.append("At least one active transport/fare variant is required.")
     
+    # Rule 4b: At least one active transport option when has_transport is True
+    if package.has_transport:
+        active_transport = [t for t in package.transport_options if t.deleted_at is None]
+        if len(active_transport) == 0:
+            errors.append("At least one transport option is required when 'Has Transport Options' is enabled.")
+    
     # Rule 5: At least one policy
     active_policies = [p for p in package.policies if p.deleted_at is None]
     if len(active_policies) == 0:
@@ -587,8 +562,9 @@ async def publish_package(
             logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
             background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
-    # Re-query the package with eager loads to prevent expired attributes during Pydantic serialization
-    refresh_result = await db.execute(query)
+    # Re-query the package scalar attributes to prevent expired attributes during Pydantic serialization
+    refresh_query = select(Package).where(Package.id == package.id)
+    refresh_result = await db.execute(refresh_query)
     return refresh_result.scalar_one()
 
 @router.get("/{package_id}/brochure-validation")

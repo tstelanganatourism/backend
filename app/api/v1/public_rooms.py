@@ -331,6 +331,7 @@ async def get_room_availability(
                 RoomSlotInventory.room_variant_id.in_(variant_ids),
                 RoomSlotInventory.date >= from_date,
                 RoomSlotInventory.date <= to_date,
+                RoomSlotInventory.deleted_at.is_(None),
             )
         ).order_by(RoomSlotInventory.date.asc(), RoomSlotInventory.room_variant_id.asc())
     )

@@ -194,4 +194,45 @@ class PackageTransportOption(BaseModel):
     weekend_fixed_price = Column(Numeric(10, 2), nullable=True)
 
     package = relationship("Package", back_populates="transport_options")
+    inventory = relationship(
+        "PackageTransportInventory",
+        back_populates="transport_option",
+        cascade="all, delete-orphan",
+    )
 
+
+class PackageTransportInventory(BaseModel):
+    """
+    Per-date inventory for each PackageTransportOption.
+    SEPARATE_VEHICLE: available_count = number of vehicles admin has for this date.
+    SHARED:           available_count = number of seats admin opens for this date.
+    booked_count is incremented on each confirmed booking.
+    No row for a date = transport option NOT available for that date.
+    """
+    __tablename__ = "package_transport_inventory"
+
+    transport_option_id = Column(
+        ForeignKey("package_transport_options.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    date = Column(Date, nullable=False, index=True)
+
+    # SEPARATE_VEHICLE: vehicles available | SHARED: total seats available
+    available_count = Column(Integer, nullable=False, default=1, server_default="1")
+    # Auto-incremented when bookings are confirmed
+    booked_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # Admin can manually block this transport option for the day
+    is_closed = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Optional per-date price override
+    price_override = Column(Numeric(10, 2), nullable=True)
+
+    transport_option = relationship("PackageTransportOption", back_populates="inventory")
+
+    __table_args__ = (
+        UniqueConstraint("transport_option_id", "date", name="uq_transport_inventory"),
+    )
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.available_count - self.booked_count)

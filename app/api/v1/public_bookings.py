@@ -198,7 +198,8 @@ async def checkout(
             select(PackageVariantInventory)
             .where(
                 PackageVariantInventory.variant_id == request.variant_id,
-                PackageVariantInventory.date == request.travel_date
+                PackageVariantInventory.date == request.travel_date,
+                PackageVariantInventory.deleted_at.is_(None)
             )
             .with_for_update()
         )
@@ -360,6 +361,7 @@ async def checkout(
 
         transport_subtotal = Decimal("0.00")
         transport_snapshot_items = []
+        transport_options_to_broadcast = []
 
         # Resolve transport_selections (new) or fall back to legacy transport_option_id
         effective_selections = request.transport_selections or []
@@ -438,6 +440,58 @@ async def checkout(
                     status_code=400,
                     detail=f"Selected vehicles can only seat {separate_capacity} passengers, but you have {total_pax}. Please add more vehicles."
                 )
+
+            # ── Transport Inventory Availability Check ──────────────────────
+            from app.models.package import PackageTransportInventory
+            travel_date_obj = request.travel_date if hasattr(request.travel_date, 'year') else \
+                __import__('datetime').date.fromisoformat(str(request.travel_date))
+
+            for sel in effective_selections:
+                t_opt = t_opts_map.get(sel.option_id)
+                if not t_opt:
+                    continue
+
+                inv_row = await db.scalar(
+                    select(PackageTransportInventory).where(
+                        PackageTransportInventory.transport_option_id == sel.option_id,
+                        PackageTransportInventory.date == travel_date_obj,
+                        PackageTransportInventory.deleted_at.is_(None),
+                    ).with_for_update()
+                )
+
+                if inv_row is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Transport option '{t_opt.title}' is not available on {travel_date_obj}. The admin has not opened this transport for this date."
+                    )
+
+                if inv_row.is_closed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Transport option '{t_opt.title}' is closed for {travel_date_obj}."
+                    )
+
+                t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                if t_type_str == 'SEPARATE_VEHICLE':
+                    remaining = inv_row.available_count - inv_row.booked_count
+                    if sel.quantity > remaining:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Not enough '{t_opt.title}' vehicles available on {travel_date_obj}. Requested: {sel.quantity}, Available: {remaining}."
+                        )
+                    inv_row.booked_count += sel.quantity
+                else:  # SHARED — consume passenger seats
+                    seats_needed = student_count if is_student_pkg else (adult_count + child_count)
+                    total_seats = inv_row.available_count * (t_opt.capacity or 1)
+                    remaining = total_seats - inv_row.booked_count
+                    if seats_needed > remaining:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Not enough seats on '{t_opt.title}' for {travel_date_obj}. Needed: {seats_needed}, Remaining: {remaining}."
+                        )
+                    inv_row.booked_count += seats_needed
+                transport_options_to_broadcast.append(sel.option_id)
+            # ── End Transport Inventory Check ────────────────────────────────
 
         refreshment_subtotal = Decimal("0.00")
         if parent_package.has_refreshments and request.include_refreshments:
@@ -551,7 +605,8 @@ async def checkout(
                     RoomSlotInventory.room_variant_id == room_variant_id,
                     RoomSlotInventory.date == stay_date,
                     RoomSlotInventory.slot_start == request.slot_start,
-                    RoomSlotInventory.slot_end == request.slot_end
+                    RoomSlotInventory.slot_end == request.slot_end,
+                    RoomSlotInventory.deleted_at.is_(None)
                 )
                 .with_for_update()
             )
@@ -860,6 +915,10 @@ async def checkout(
 
     await db.commit()
     await db.refresh(draft)
+
+    from app.utils.sse import broadcast_transport_update
+    for opt_id in transport_options_to_broadcast:
+        await broadcast_transport_update(db, opt_id, request.travel_date)
 
     for p in sse_payloads:
         target_channel = "package" if request.target_type.lower() == 'package' else "room"

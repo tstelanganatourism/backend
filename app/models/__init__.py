@@ -14,7 +14,7 @@ from app.models.package import (
     Package, PackageVariant, PackageVariantInventory, package_tags,
     PackageGalleryImage, PackageItineraryDay, PackageHighlight,
     PackageInclusion, PackageExclusion, PackageBoardingPoint,
-    PackageFAQ, PackagePolicy
+    PackageFAQ, PackagePolicy, PackageTransportOption, PackageTransportInventory
 )
 from app.models.booking import Booking, BookingStayDate, BookingPassenger, CancellationRequest, PostponeRequest
 from app.models.payment import Payment
@@ -33,7 +33,7 @@ __all__ = [
     "Package", "PackageVariant", "PackageVariantInventory", "package_tags",
     "PackageGalleryImage", "PackageItineraryDay", "PackageHighlight",
     "PackageInclusion", "PackageExclusion", "PackageBoardingPoint",
-    "PackageFAQ", "PackagePolicy",
+    "PackageFAQ", "PackagePolicy", "PackageTransportOption", "PackageTransportInventory",
     "Booking", "BookingStayDate", "BookingPassenger", "CancellationRequest", "PostponeRequest", "Payment", "AddOn",
     "Promotion", "Coupon", "SystemSettings", "AuditLog"
 ]

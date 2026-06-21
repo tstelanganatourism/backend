@@ -426,6 +426,7 @@ async def admin_create_booking(
     adult_count = request.adult_count or request.quantity
     child_count = request.child_count or 0
     subtotal_amount = Decimal("0.00")
+    transport_options_to_broadcast = []
     room_variant_id_val = None
     package_variant_id_val = None
 
@@ -481,6 +482,8 @@ async def admin_create_booking(
             )
             db.add(inv)
             await db.flush()
+        elif inv.is_closed:
+            raise HTTPException(status_code=400, detail="Booking is closed for this date")
 
         # Calculate subtotal using effective prices
         is_weekend_admin = travel_date.weekday() in (5, 6)
@@ -497,10 +500,10 @@ async def admin_create_booking(
             subtotal_amount = (Decimal(str(eff_adult)) * adult_count) + \
                               (Decimal(str(eff_child)) * child_count)
         
-        # Transport pricing for admin direct booking
+        # Transport pricing & inventory verification for admin direct booking
         transport_snapshot_items = []
         if request.transport_selections:
-            from app.models.package import PackageTransportOption as PTO
+            from app.models.package import PackageTransportOption as PTO, PackageTransportInventory as PTI
             pkg_res_for_transport = await db.execute(
                 select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
             )
@@ -516,7 +519,29 @@ async def admin_create_booking(
                     t_opt = t_map.get(sel_id)
                     if not t_opt:
                         continue
-                    if t_opt.type == 'SHARED':
+                    
+                    inv_row = await db.scalar(
+                        select(PTI).where(
+                            PTI.transport_option_id == sel_id,
+                            PTI.date == travel_date,
+                            PTI.deleted_at.is_(None)
+                        ).with_for_update()
+                    )
+                    
+                    if inv_row is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Transport option '{t_opt.title}' is not opened/available on {travel_date}."
+                        )
+                        
+                    if inv_row.is_closed:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Transport option '{t_opt.title}' is closed for {travel_date}."
+                        )
+
+                    t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                    if t_type_str == 'SHARED':
                         if is_student_pkg:
                             t_student = getattr(t_opt, 'student_price', None) or Decimal("0.00")
                             if is_weekend_admin and getattr(t_opt, 'weekend_student_price', None):
@@ -530,11 +555,34 @@ async def admin_create_booking(
                             item_cost = Decimal(str(adult_count)) * Decimal(str(t_adult)) + Decimal(str(child_count)) * Decimal(str(t_child))
                             subtotal_amount += item_cost
                             transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SHARED", "capacity": int(t_opt.capacity or 0), "quantity": 1, "adult_price": float(t_adult), "child_price": float(t_child), "item_total": float(item_cost)})
+                        
+                        # Increment booked seats in transport inventory
+                        seats_needed = student_count if is_student_pkg else (adult_count + child_count)
+                        total_seats = inv_row.available_count * (t_opt.capacity or 1)
+                        remaining = total_seats - inv_row.booked_count
+                        if seats_needed > remaining:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Not enough seats on '{t_opt.title}' for {travel_date}. Needed: {seats_needed}, Remaining: {remaining}."
+                            )
+                        inv_row.booked_count += seats_needed
+                        transport_options_to_broadcast.append(sel_id)
+
                     elif t_opt.type == 'SEPARATE_VEHICLE':
                         t_fixed = (t_opt.weekend_fixed_price if is_weekend_admin and t_opt.weekend_fixed_price else t_opt.fixed_price) or Decimal("0.00")
                         item_cost = Decimal(str(sel_qty)) * Decimal(str(t_fixed))
                         subtotal_amount += item_cost
                         transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SEPARATE_VEHICLE", "capacity": int(t_opt.capacity or 0), "quantity": sel_qty, "fixed_price": float(t_fixed), "item_total": float(item_cost)})
+                        
+                        # Increment booked vehicles in transport inventory
+                        remaining = inv_row.available_count - inv_row.booked_count
+                        if sel_qty > remaining:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Not enough '{t_opt.title}' vehicles available on {travel_date}. Requested: {sel_qty}, Available: {remaining}."
+                            )
+                        inv_row.booked_count += sel_qty
+                        transport_options_to_broadcast.append(sel_id)
 
         # Refreshments for admin direct booking
         if request.include_refreshments:
@@ -611,6 +659,11 @@ async def admin_create_booking(
                     is_closed=False,
                 )
                 db.add(room_inv)
+            elif room_inv.is_closed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Rooms are closed/unavailable on {sd.isoformat()}."
+                )
 
             if room_inv.booked_rooms + required_rooms > room_inv.total_rooms:
                 room_inv.total_rooms = room_inv.booked_rooms + room_inv.reserved_rooms + required_rooms
@@ -811,6 +864,11 @@ async def admin_create_booking(
 
     await db.commit()
 
+    # Broadcast transport SSE
+    from app.utils.sse import broadcast_transport_update
+    for opt_id in transport_options_to_broadcast:
+        await broadcast_transport_update(db, opt_id, travel_date)
+
     # Immediately invalidate L1+L2 cache so availability is reflected
     from app.utils.cache import clear_cache_prefix
     if request.target_type == 'package':
@@ -948,6 +1006,7 @@ async def admin_cancel_booking(
     3. Perform calculations: deduct 35% fee if APPROVED and set refund_amount. Refund is manual.
     4. Release reserved seats/rooms back to inventories if booking is APPROVED.
     """
+    transport_options_to_broadcast = []
     from app.models.enums import BookingStatus, CancellationStatus, BookingSource
     from app.models.booking import CancellationRequest
     from loguru import logger
@@ -1028,6 +1087,41 @@ async def admin_cancel_booking(
             inv.booked_count = max(0, inv.booked_count - quantity)
             logger.info(f"Released {quantity} seats for package variant inventory {booking.variant_id} on {booking.travel_date}")
             await db.flush()
+            
+            # Release transport inventory
+            transport_sels = (booking.pricing_snapshot or {}).get("transport_selections", [])
+            if transport_sels:
+                from app.models.package import PackageTransportOption, PackageTransportInventory
+                selected_opt_ids = [ts["option_id"] for ts in transport_sels]
+                t_opts_res = await db.execute(select(PackageTransportOption).where(PackageTransportOption.id.in_(selected_opt_ids)))
+                t_opts_map = {t.id: t for t in t_opts_res.scalars().all()}
+                
+                for ts in transport_sels:
+                    opt_id = ts["option_id"]
+                    t_opt = t_opts_map.get(opt_id)
+                    if not t_opt:
+                        continue
+                    
+                    t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                    if t_type_str == 'SEPARATE_VEHICLE':
+                        qty = ts["quantity"]
+                    else:
+                        is_student_pkg = booking.student_count > 0
+                        qty = booking.student_count if is_student_pkg else (booking.adult_count + booking.child_count)
+                    
+                    trans_inv = await db.scalar(
+                        select(PackageTransportInventory)
+                        .where(
+                            PackageTransportInventory.transport_option_id == opt_id,
+                            PackageTransportInventory.date == booking.travel_date,
+                            PackageTransportInventory.deleted_at.is_(None)
+                        )
+                        .with_for_update()
+                    )
+                    if trans_inv:
+                        trans_inv.booked_count = max(0, trans_inv.booked_count - qty)
+                        await db.flush()
+                        transport_options_to_broadcast.append(opt_id)
             import time
             from app.core.timezone import get_ist_now
             from app.models.package import PackageVariant
@@ -1134,6 +1228,11 @@ async def admin_cancel_booking(
         db.add(cancellation_req)
 
     await db.commit()
+    
+    # Broadcast transport SSE
+    from app.utils.sse import broadcast_transport_update
+    for opt_id in transport_options_to_broadcast:
+        await broadcast_transport_update(db, opt_id, booking.travel_date)
     
     # Immediately invalidate L1+L2 cache so freed seats are reflected to all visitors
     from app.utils.cache import clear_cache_prefix
@@ -1700,7 +1799,7 @@ async def admin_process_postpone(
         
     # Run the common date rescheduling logic
     postpone_req.original_travel_date = booking.travel_date
-    await _reschedule_booking_date(booking, new_date, db)
+    transport_updates = await _reschedule_booking_date(booking, new_date, db)
     
     postpone_req.status = CancellationStatus.APPROVED
     postpone_req.processed_at = func.now()
@@ -1710,6 +1809,12 @@ async def admin_process_postpone(
     
     await db.commit()
     
+    # Broadcast transport SSE
+    if transport_updates:
+        from app.utils.sse import broadcast_transport_update
+        for opt_id, slot_date in transport_updates:
+            await broadcast_transport_update(db, opt_id, slot_date)
+            
     # Invalidate cache
     from app.utils.cache import clear_cache_prefix
     if booking.variant_id:
@@ -1746,7 +1851,7 @@ async def admin_change_booking_date(
         raise HTTPException(status_code=404, detail="Booking not found")
         
     old_travel_date = booking.travel_date
-    await _reschedule_booking_date(booking, payload.new_travel_date, db)
+    transport_updates = await _reschedule_booking_date(booking, payload.new_travel_date, db)
     
     # Create approved postponement request record for history
     from app.models.booking import PostponeRequest
@@ -1767,6 +1872,12 @@ async def admin_change_booking_date(
     
     await db.commit()
     
+    # Broadcast transport SSE
+    if transport_updates:
+        from app.utils.sse import broadcast_transport_update
+        for opt_id, slot_date in transport_updates:
+            await broadcast_transport_update(db, opt_id, slot_date)
+            
     # Invalidate cache
     from app.utils.cache import clear_cache_prefix
     if booking.variant_id:
@@ -1780,7 +1891,7 @@ async def admin_change_booking_date(
         
     return {"status": "success", "message": f"Booking travel date successfully updated to {payload.new_travel_date.isoformat()}."}
 
-async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSession):
+async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSession) -> list:
     from app.models.booking import BookingStayDate
     from app.models.package import PackageVariantInventory
     from app.models.room import RoomSlotInventory, RoomVariant, Room
@@ -1824,6 +1935,79 @@ async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSe
         if new_inv.booked_count + quantity > new_inv.total_capacity:
             new_inv.total_capacity = new_inv.booked_count + new_inv.reserved_count + quantity
         new_inv.booked_count += quantity
+        
+        # Release and occupy transport slots
+        transport_updates = []
+        transport_sels = (booking.pricing_snapshot or {}).get("transport_selections", [])
+        if transport_sels:
+            from app.models.package import PackageTransportOption, PackageTransportInventory
+            selected_opt_ids = [ts["option_id"] for ts in transport_sels]
+            t_opts_res = await db.execute(select(PackageTransportOption).where(PackageTransportOption.id.in_(selected_opt_ids)))
+            t_opts_map = {t.id: t for t in t_opts_res.scalars().all()}
+            
+            for ts in transport_sels:
+                opt_id = ts["option_id"]
+                t_opt = t_opts_map.get(opt_id)
+                if not t_opt:
+                    continue
+                
+                t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                if t_type_str == 'SEPARATE_VEHICLE':
+                    qty = ts["quantity"]
+                else:
+                    is_student_pkg = booking.student_count > 0
+                    qty = booking.student_count if is_student_pkg else (booking.adult_count + booking.child_count)
+                
+                # 1. Release from old date
+                old_trans_inv = await db.scalar(
+                    select(PackageTransportInventory)
+                    .where(
+                        PackageTransportInventory.transport_option_id == opt_id,
+                        PackageTransportInventory.date == booking.travel_date,
+                        PackageTransportInventory.deleted_at.is_(None)
+                    )
+                    .with_for_update()
+                )
+                if old_trans_inv:
+                    old_trans_inv.booked_count = max(0, old_trans_inv.booked_count - qty)
+                    await db.flush()
+                    transport_updates.append((opt_id, booking.travel_date))
+                
+                # 2. Book on new date - auto-create if missing
+                new_trans_inv = await db.scalar(
+                    select(PackageTransportInventory)
+                    .where(
+                        PackageTransportInventory.transport_option_id == opt_id,
+                        PackageTransportInventory.date == new_date,
+                        PackageTransportInventory.deleted_at.is_(None)
+                    )
+                    .with_for_update()
+                )
+                if not new_trans_inv:
+                    new_avail = ts["quantity"] if t_type_str == 'SEPARATE_VEHICLE' else 1
+                    new_trans_inv = PackageTransportInventory(
+                        transport_option_id=opt_id,
+                        date=new_date,
+                        available_count=new_avail,
+                        booked_count=0,
+                        is_closed=False,
+                    )
+                    db.add(new_trans_inv)
+                    await db.flush()
+                
+                if t_type_str != 'SEPARATE_VEHICLE':
+                    total_seats = new_trans_inv.available_count * (t_opt.capacity or 1)
+                    if new_trans_inv.booked_count + qty > total_seats:
+                        import math
+                        needed_avail = math.ceil((new_trans_inv.booked_count + qty) / (t_opt.capacity or 1))
+                        new_trans_inv.available_count = max(new_trans_inv.available_count, needed_avail)
+                else:
+                    if new_trans_inv.booked_count + qty > new_trans_inv.available_count:
+                        new_trans_inv.available_count = new_trans_inv.booked_count + qty
+                        
+                new_trans_inv.booked_count += qty
+                await db.flush()
+                transport_updates.append((opt_id, new_date))
             
     # Check if room variant
     elif booking.room_variant_id:
@@ -1914,3 +2098,5 @@ async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSe
         await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True, True)
     except Exception as e:
         logger.error(f"Failed to queue post-booking documents task: {e}")
+        
+    return locals().get("transport_updates", [])

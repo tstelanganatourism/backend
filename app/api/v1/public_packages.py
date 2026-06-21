@@ -519,6 +519,7 @@ async def get_package_availability(
                 PackageVariantInventory.variant_id.in_(variant_ids),
                 PackageVariantInventory.date >= from_date,
                 PackageVariantInventory.date <= to_date,
+                PackageVariantInventory.deleted_at.is_(None),
             )
         ).order_by(PackageVariantInventory.date.asc(), PackageVariantInventory.variant_id.asc())
     )
@@ -528,6 +529,44 @@ async def get_package_availability(
     inv_map: dict[tuple, PackageVariantInventory] = {}
     for row in inv_rows:
         inv_map[(row.variant_id, row.date)] = row
+
+    transport_inv_map = {}
+    if pkg.has_transport:
+        from app.models.package import PackageTransportOption, PackageTransportInventory
+        transport_options_q = select(PackageTransportOption).where(PackageTransportOption.package_id == pkg.id)
+        transport_options = (await db.execute(transport_options_q)).scalars().all()
+        option_ids = [opt.id for opt in transport_options]
+        
+        if option_ids:
+            # Pre-calculate capacity multipliers
+            opt_info = {}
+            for opt in transport_options:
+                t_type = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
+                opt_info[opt.id] = {
+                    "is_shared": t_type != 'SEPARATE_VEHICLE',
+                    "capacity": opt.capacity or 1
+                }
+                
+            trans_inv_result = await db.execute(
+                select(PackageTransportInventory).where(
+                    and_(
+                        PackageTransportInventory.transport_option_id.in_(option_ids),
+                        PackageTransportInventory.date >= from_date,
+                        PackageTransportInventory.date <= to_date,
+                        PackageTransportInventory.deleted_at.is_(None),
+                    )
+                )
+            )
+            for row in trans_inv_result.scalars().all():
+                info = opt_info.get(row.transport_option_id, {"is_shared": True, "capacity": 1})
+                total_capacity = (row.available_count * info["capacity"]) if info["is_shared"] else row.available_count
+                
+                transport_inv_map.setdefault(row.date, []).append({
+                    "option_id": row.transport_option_id,
+                    "remaining": max(0, total_capacity - row.booked_count),
+                    "is_closed": row.is_closed,
+                    "price_override": row.price_override
+                })
 
     availability: list[PublicDateAvailability] = []
 
@@ -579,6 +618,8 @@ async def get_package_availability(
                     eff_child = Decimal("1.00")
 
             if inv is None:
+                if current.day == 21:
+                    print(f"DEBUG: 21st NO_INVENTORY transport_avail: {transport_inv_map.get(current, None)}")
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -593,6 +634,7 @@ async def get_package_availability(
                         available_seats=0,
                         is_closed=False,
                         status="NO_INVENTORY",
+                        transport_availability=transport_inv_map.get(current, None)
                     )
                 )
             elif inv.is_closed or (is_agent and not allowed):
@@ -618,6 +660,7 @@ async def get_package_availability(
                         available_seats=avail_seats,
                         is_closed=True,
                         status="CLOSED",
+                        transport_availability=transport_inv_map.get(current, None)
                     )
                 )
             else:
@@ -645,6 +688,7 @@ async def get_package_availability(
                         available_seats=avail_seats,
                         is_closed=False,
                         status=slot_status,
+                        transport_availability=transport_inv_map.get(current, None)
                     )
                 )
 
@@ -658,7 +702,7 @@ async def get_package_availability(
     )
     if not is_agent:
         from app.services.redis_client import set_cached_availability
-        await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+        await set_cached_availability(slug, month, res_data.model_dump(mode='json'), ttl_seconds=60)
     return res_data
 
 

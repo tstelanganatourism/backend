@@ -36,53 +36,8 @@ async def release_expired_drafts():
             logger.info(f"Releasing expired draft {draft.draft_id} for order {draft.pg_transaction_id}")
             
             try:
-                if draft.target_type == 'package':
-                    inv_query = select(PackageVariantInventory).where(
-                        PackageVariantInventory.variant_id == draft.variant_id,
-                        PackageVariantInventory.date == draft.travel_date
-                    ).with_for_update()
-                    inv_res = await db.execute(inv_query)
-                    inv = inv_res.scalar_one_or_none()
-                    if inv:
-                        inv.reserved_count = max(0, inv.reserved_count - draft.quantity)
-
-                elif draft.target_type == 'room':
-                    # Parse stay dates from payload
-                    payload = draft.checkout_payload
-                    from datetime import date, timedelta, time
-                    arrival = date.fromisoformat(payload['travel_date'])
-                    departure_str = payload.get('departure_date')
-                    departure = date.fromisoformat(departure_str) if departure_str else (arrival + timedelta(days=1))
-                    
-                    current = arrival
-                    stay_dates = []
-                    while current < departure:
-                        stay_dates.append(current)
-                        current += timedelta(days=1)
-                        
-                    slot_start = time.fromisoformat(payload['slot_start']) if payload.get('slot_start') else None
-                    slot_end = time.fromisoformat(payload['slot_end']) if payload.get('slot_end') else None
-
-                    # Required rooms logic
-                    from app.models.room import RoomVariant
-                    room_var = await db.execute(select(RoomVariant).where(RoomVariant.id == draft.room_variant_id))
-                    rv = room_var.scalar_one_or_none()
-                    if rv:
-                        from app.services.room_calculation import calculate_required_rooms
-                        required_rooms = calculate_required_rooms(draft.quantity, rv.capacity_per_room)
-
-                        for stay_date in stay_dates:
-                            inv_query = select(RoomSlotInventory).where(
-                                RoomSlotInventory.room_variant_id == draft.room_variant_id,
-                                RoomSlotInventory.date == stay_date,
-                                RoomSlotInventory.slot_start == slot_start,
-                                RoomSlotInventory.slot_end == slot_end
-                            ).with_for_update()
-                            inv_res = await db.execute(inv_query)
-                            room_inv = inv_res.scalar_one_or_none()
-                            if room_inv:
-                                room_inv.reserved_rooms = max(0, room_inv.reserved_rooms - required_rooms)
-                
+                from app.api.v1.payments import release_draft_inventory
+                await release_draft_inventory(draft, db)
                 await db.delete(draft)
             except Exception as e:
                 logger.error(f"Error releasing draft {draft.draft_id}: {str(e)}")

@@ -214,18 +214,8 @@ async def create_room(
     db.add(room)
     await db.commit()
 
-    # Reload room
-    query = (
-        select(Room)
-        .where(Room.id == room.id)
-        .options(
-            selectinload(Room.variants),
-            selectinload(Room.gallery),
-            selectinload(Room.highlights),
-            selectinload(Room.faqs),
-            selectinload(Room.policies)
-        )
-    )
+    # Reload room scalar attributes
+    query = select(Room).where(Room.id == room.id)
     result = await db.execute(query)
     room = result.scalar_one()
     
@@ -346,18 +336,8 @@ async def update_room(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
-    # Reload room with all relationships loaded to prevent MissingGreenlet errors during serialization
-    refresh_query = (
-        select(Room)
-        .where(Room.id == room.id)
-        .options(
-            selectinload(Room.variants),
-            selectinload(Room.gallery),
-            selectinload(Room.highlights),
-            selectinload(Room.faqs),
-            selectinload(Room.policies)
-        )
-    )
+    # Reload room scalar attributes to refresh expired fields like updated_at
+    refresh_query = select(Room).where(Room.id == room.id)
     refresh_result = await db.execute(refresh_query)
     room = refresh_result.scalar_one()
     

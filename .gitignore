@@ -38,13 +38,14 @@ current_otp.txt
 Thumbs.db
 
 # Scratch and test utility files
-check_status.py
+check_*.py
 ensure_new100.py
 fix_rooms_status.py
 scratch_*.py
 trigger_brochure.py
 update_package_4_duration.py
 scratch/
+print_*.py
 
 # Tests
 tests/
@@ -52,6 +53,7 @@ tests/
 playwright.config.ts
 playwright-report/
 test-results/
+test_*.py
 
 # Temp Dumps & Guides
 api_dump.json
