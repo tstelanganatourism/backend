@@ -297,6 +297,30 @@ async def send_admin_booking_notification(
           text-align:right;border-top:2px solid #e2e8f0;">₹{float(tourist_total):,.2f}</td>
     </tr>"""
 
+    # ── 6.5 Payment Method / Gateway ──────────────────────────────────────────
+    from app.models.enums import PaymentStatus
+    pm_label = "Online"
+    if hasattr(booking, "payments") and booking.payments:
+        captured_p = [p for p in booking.payments if p.status == PaymentStatus.CAPTURED]
+        if captured_p:
+            p_methods = []
+            for p in captured_p:
+                m = (p.payment_method or p.collected_by_type or "").upper()
+                if "CASHFREE" in m:
+                    p_methods.append("Cashfree")
+                elif "PHONEPE" in m or "RAZORPAY" in m:
+                    p_methods.append("PhonePe")
+                elif "CASH" in m:
+                    p_methods.append("Agent Cash")
+                elif "BANK" in m:
+                    p_methods.append("Bank Transfer")
+                elif "WALLET" in m:
+                    p_methods.append("Wallet")
+                else:
+                    p_methods.append(p.payment_method.capitalize() if p.payment_method else "Online")
+            if p_methods:
+                pm_label = " & ".join(sorted(list(set(p_methods))))
+                
     # ── 7. Agent section ──────────────────────────────────────────────────────
     agent_section_html = ""
     is_agent_booking = booking.agent_id is not None
@@ -338,28 +362,6 @@ async def send_admin_booking_notification(
         commission_label = (
             f"Agent Commission ({commission_pct_meta}%)" if commission_pct_meta else "Agent Commission"
         )
-
-        # Determine actual payment method dynamically from the payment ledger
-        from app.models.enums import PaymentStatus
-        pm_label = "Agent Cash"
-        if hasattr(booking, "payments") and booking.payments:
-            captured_p = [p for p in booking.payments if p.status == PaymentStatus.CAPTURED]
-            if captured_p:
-                p_methods = []
-                for p in captured_p:
-                    m = (p.payment_method or p.collected_by_type or "").upper()
-                    if "CASHFREE" in m:
-                        p_methods.append("Cashfree")
-                    elif "PHONEPE" in m or "RAZORPAY" in m:
-                        p_methods.append("PhonePe")
-                    elif "CASH" in m:
-                        p_methods.append("Agent Cash")
-                    elif "BANK" in m:
-                        p_methods.append("Bank Transfer")
-                    else:
-                        p_methods.append(p.payment_method.capitalize() if p.payment_method else "Online")
-                if p_methods:
-                    pm_label = " & ".join(sorted(list(set(p_methods))))
 
         agent_section_html = f"""
         <!-- AGENT SECTION -->
@@ -571,6 +573,10 @@ async def send_admin_booking_notification(
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Booking Type</td>
                 <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;">{booking_type_label}</td>
+              </tr>
+              <tr>
+                <td style="padding:5px 0;font-size:13px;color:#64748b;">Payment Gateway</td>
+                <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;color:#059669;">{pm_label}</td>
               </tr>
             </table>
           </td>
