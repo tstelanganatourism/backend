@@ -19,8 +19,9 @@ class Coupon(BaseModel):
     valid_from = Column(DateTime(timezone=True), nullable=True)
     valid_until = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
+    is_weekend_only = Column(Boolean, default=False, nullable=False, server_default='false')
 
-    def is_valid(self, booking_amount: float = 0.0, target_type: str = None, target_id: int = None, ticket_count: int = 0) -> bool:
+    def is_valid(self, booking_amount: float = 0.0, target_type: str = None, target_id: int = None, ticket_count: int = 0, travel_date=None) -> bool:
         """
         Evaluate if this coupon is active and valid for redemption.
         Enforces:
@@ -62,16 +63,26 @@ class Coupon(BaseModel):
         if self.min_tickets is not None and ticket_count < self.min_tickets:
             return False
             
-        # 6. Target product constraints check
+        # 6. Weekend only check
+        if self.is_weekend_only and travel_date:
+            # 5 is Saturday, 6 is Sunday
+            if travel_date.weekday() not in (5, 6):
+                return False
+            
+        # 7. Target product constraints check
         is_global = not self.applicable_package_ids and not self.applicable_room_ids
         if is_global:
             pass # Applies to all
         else:
             if target_type == 'PACKAGE':
-                if target_id not in (self.applicable_package_ids or []):
+                if not self.applicable_package_ids:
+                    return False
+                if -1 not in self.applicable_package_ids and target_id not in self.applicable_package_ids:
                     return False
             elif target_type == 'ROOM':
-                if target_id not in (self.applicable_room_ids or []):
+                if not self.applicable_room_ids:
+                    return False
+                if -1 not in self.applicable_room_ids and target_id not in self.applicable_room_ids:
                     return False
             else:
                 return False # Unknown target_type and coupon is restricted

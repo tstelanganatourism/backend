@@ -1,5 +1,5 @@
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, date
 from pydantic import Field, field_validator
 from decimal import Decimal
 from app.schemas.base import AppBaseModel, TimestampSchema
@@ -17,7 +17,7 @@ class CouponBase(AppBaseModel):
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     is_active: bool = True
-
+    is_weekend_only: bool = False
     @field_validator("discount_type")
     @classmethod
     def validate_discount_type(cls, v: str) -> str:
@@ -42,6 +42,7 @@ class CouponUpdate(AppBaseModel):
     valid_from: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     is_active: Optional[bool] = None
+    is_weekend_only: Optional[bool] = None
 
     @field_validator("discount_type")
     @classmethod
@@ -63,6 +64,7 @@ class CouponValidateRequest(AppBaseModel):
     target_id: Optional[int] = None
     booking_amount: float
     ticket_count: int = 0
+    travel_date: Optional[date] = None
 
 class CouponValidateResponse(AppBaseModel):
     valid: bool

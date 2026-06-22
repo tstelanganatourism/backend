@@ -684,7 +684,8 @@ async def checkout(
             booking_amount=float(subtotal_amount),
             target_type=request.target_type.upper(),
             target_id=target_id,
-            ticket_count=request.quantity
+            ticket_count=request.quantity,
+            travel_date=request.travel_date
         ):
             raise HTTPException(status_code=400, detail="Invalid or expired promo code.")
             

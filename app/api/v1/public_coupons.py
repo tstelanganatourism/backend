@@ -39,7 +39,8 @@ async def validate_coupon(
         booking_amount=body.booking_amount, 
         target_type=body.target_type, 
         target_id=body.target_id,
-        ticket_count=body.ticket_count
+        ticket_count=body.ticket_count,
+        travel_date=body.travel_date
     )
     if not is_valid:
         # Determine specific reason for UX
@@ -51,6 +52,8 @@ async def validate_coupon(
             reason = "Coupon has expired"
         elif coupon.valid_from and coupon.valid_from > now:
             reason = "Coupon is not yet valid"
+        elif coupon.is_weekend_only and body.travel_date and body.travel_date.weekday() not in (5, 6):
+            reason = "This coupon is only valid for weekend travel dates"
         elif coupon.usage_limit is not None and coupon.usage_count >= coupon.usage_limit:
             reason = "Coupon usage limit reached"
         elif coupon.min_tickets is not None and body.ticket_count < coupon.min_tickets:
