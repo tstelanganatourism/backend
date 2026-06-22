@@ -79,6 +79,7 @@ class PackageListDTO(AppBaseModel):
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
     cover_image_url: Optional[str] = None
+    is_active: bool = True
     is_featured: bool
     is_student_package: bool = False
     tags: List[str] = Field(default_factory=list)

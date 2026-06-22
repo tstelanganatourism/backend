@@ -936,16 +936,15 @@ async def generate_transport_inventory(
     if not opts:
         raise HTTPException(status_code=404, detail="No transport options found for this package")
 
-    # Fetch all existing slots in one query to avoid N+1
+    # Fetch all existing slots in one query to avoid N+1 (including deleted ones)
     existing_res = await db.execute(
-        select(PackageTransportInventory.transport_option_id, PackageTransportInventory.date).where(
+        select(PackageTransportInventory).where(
             PackageTransportInventory.transport_option_id.in_([o.id for o in opts]),
             PackageTransportInventory.date >= payload.from_date,
             PackageTransportInventory.date <= payload.to_date,
-            PackageTransportInventory.deleted_at.is_(None),
         )
     )
-    existing_set = set(existing_res.fetchall())
+    existing_rows = { (r.transport_option_id, r.date): r for r in existing_res.scalars().all() }
 
     created = 0
     skipped = 0
@@ -962,22 +961,31 @@ async def generate_transport_inventory(
 
         for day_offset in range(total_days):
             d = payload.from_date + timedelta(days=day_offset)
-            
             # Check if row already exists
-            if (opt.id, d) in existing_set:
-                skipped += 1
-                continue
-
-            row = PackageTransportInventory(
-                transport_option_id=opt.id,
-                date=d,
-                available_count=opt_count,
-                booked_count=0,
-                is_closed=False,
-            )
-            db.add(row)
-            created += 1
-            created_slots.append((opt.id, d))
+            existing_row = existing_rows.get((opt.id, d))
+            if existing_row:
+                if existing_row.deleted_at is None:
+                    skipped += 1
+                    continue
+                else:
+                    # Restore softly deleted row
+                    existing_row.deleted_at = None
+                    existing_row.available_count = opt_count
+                    existing_row.booked_count = 0
+                    existing_row.is_closed = False
+                    created += 1
+                    created_slots.append((opt.id, d))
+            else:
+                row = PackageTransportInventory(
+                    transport_option_id=opt.id,
+                    date=d,
+                    available_count=opt_count,
+                    booked_count=0,
+                    is_closed=False,
+                )
+                db.add(row)
+                created += 1
+                created_slots.append((opt.id, d))
 
     await db.commit()
     
