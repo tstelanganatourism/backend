@@ -773,12 +773,32 @@ async def checkout(
     
     tourist_amount_payable = (total_amount * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
     
+    user_phone = None
+    if request.passengers:
+        user_phone = next((p.phone for p in request.passengers if p.phone), None)
+
+    user_name = None
+    user_email = None
+    if request.passengers:
+        lead = request.passengers[0]
+        user_name = lead.full_name
+    if request.customer_email:
+        user_email = request.customer_email
+    elif current_user and current_user.email:
+        user_email = current_user.email
+
     if is_agent:
         payable_amount = (agent_payable * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
     else:
         payable_amount = tourist_amount_payable
 
-    # Overrides removed.
+    # Developer test bypass (only active in development/staging environments)
+    if settings.ENVIRONMENT != "production" and (user_email == '2024eb01987@online.bits-pilani.ac.in' or user_phone == '8886154275'):
+        payable_amount = Decimal("1.00")
+        total_amount = Decimal("1.00")
+        tourist_amount_payable = Decimal("1.00")
+        pricing_snapshot["tourist_total"] = "1.00"
+        pricing_snapshot["tourist_amount_payable"] = "1.00"
 
     pricing_snapshot["payment_percentage"] = str(payment_percentage)
     pricing_snapshot["tourist_amount_payable"] = str(tourist_amount_payable)
@@ -793,20 +813,7 @@ async def checkout(
     host = fastapi_req.headers.get('host')
     protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
 
-    user_phone = None
-    if request.passengers:
-        user_phone = next((p.phone for p in request.passengers if p.phone), None)
-
-    # Get lead passenger name + email for Cashfree
-    user_name = None
-    user_email = None
-    if request.passengers:
-        lead = request.passengers[0]
-        user_name = lead.full_name
-    if request.customer_email:
-        user_email = request.customer_email
-    elif current_user and current_user.email:
-        user_email = current_user.email
+    # user_phone and user_email extracted above
 
     # Determine selected gateway (default: PHONEPE)
     selected_gateway = (request.gateway or "PHONEPE").upper()

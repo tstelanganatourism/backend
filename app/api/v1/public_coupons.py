@@ -60,9 +60,9 @@ async def validate_coupon(
             reason = f"Minimum {coupon.min_tickets} tickets/passengers required"
         elif coupon.min_booking_amount is not None and body.booking_amount < float(coupon.min_booking_amount):
             reason = f"Minimum booking amount of ₹{coupon.min_booking_amount} required"
-        elif body.target_type == 'PACKAGE' and coupon.applicable_package_ids and body.target_id not in coupon.applicable_package_ids:
+        elif body.target_type == 'PACKAGE' and coupon.applicable_package_ids and body.target_id not in coupon.applicable_package_ids and -1 not in coupon.applicable_package_ids:
             reason = "Coupon is not applicable for this package"
-        elif body.target_type == 'ROOM' and coupon.applicable_room_ids and body.target_id not in coupon.applicable_room_ids:
+        elif body.target_type == 'ROOM' and coupon.applicable_room_ids and body.target_id not in coupon.applicable_room_ids and -1 not in coupon.applicable_room_ids:
             reason = "Coupon is not applicable for this room"
             
         return CouponValidateResponse(
