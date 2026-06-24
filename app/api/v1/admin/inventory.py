@@ -17,7 +17,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -107,9 +107,9 @@ async def generate_package_inventory(
     if (body.to_date - body.from_date).days > 365:
         raise HTTPException(status_code=400, detail="Date range cannot exceed 365 days.")
 
-    # Fetch existing rows to skip duplicates
+    # Fetch existing rows (including soft-deleted ones) to skip duplicates or restore
     existing_result = await db.execute(
-        select(PackageVariantInventory.date).where(
+        select(PackageVariantInventory).where(
             and_(
                 PackageVariantInventory.variant_id == body.variant_id,
                 PackageVariantInventory.date >= body.from_date,
@@ -117,15 +117,27 @@ async def generate_package_inventory(
             )
         )
     )
-    existing_dates = {row for (row,) in existing_result.all()}
+    existing_rows = {row.date: row for row in existing_result.scalars().all()}
 
     created = 0
     skipped = 0
     current = body.from_date
+    created_dates = []
 
     while current <= body.to_date:
-        if current in existing_dates:
-            skipped += 1
+        existing_row = existing_rows.get(current)
+        if existing_row:
+            if existing_row.deleted_at is None:
+                skipped += 1
+            else:
+                # Restore soft-deleted row
+                existing_row.deleted_at = None
+                existing_row.total_capacity = body.total_capacity
+                existing_row.booked_count = 0
+                existing_row.is_closed = False
+                existing_row.price_override = None
+                created += 1
+                created_dates.append(current)
         else:
             row = PackageVariantInventory(
                 variant_id=body.variant_id,
@@ -137,6 +149,7 @@ async def generate_package_inventory(
             )
             db.add(row)
             created += 1
+            created_dates.append(current)
         current += timedelta(days=1)
 
     await db.commit()
@@ -156,10 +169,11 @@ async def generate_package_inventory(
         },
     )
     await db.commit()
-    clear_cache_prefix(f"inventory:packages:{body.variant_id}")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:packages:{body.variant_id}")
     await _clear_package_cache_for_variant(db, body.variant_id)
 
-    # Broadcast SSE for newly created inventory dates
+    # Broadcast SSE for newly created or restored inventory dates
     if created > 0:
         from app.utils.sse import sse_manager, build_package_sse_payload
         from sqlalchemy.orm import joinedload
@@ -170,13 +184,22 @@ async def generate_package_inventory(
         )
         variant = variant_res.scalar_one_or_none()
         if variant:
-            current_date = body.from_date
-            while current_date <= body.to_date:
-                if current_date not in existing_dates:
-                    sse_payload = build_package_sse_payload(variant, None, current_date)
+            if created > 50:
+                import time
+                from app.core.timezone import get_ist_now
+                bulk_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": variant.package_id,
+                    "type": "packages"
+                }
+                await sse_manager.broadcast_event("package", str(variant.package_id), "BULK_REFRESH", bulk_payload)
+            else:
+                for d in created_dates:
+                    sse_payload = build_package_sse_payload(variant, None, d)
                     sse_payload["available"] = body.total_capacity
+                    sse_payload["is_closed"] = False
                     await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
-                current_date += timedelta(days=1)
 
     return PackageInventoryGenerateResponse(
         created=created,
@@ -199,7 +222,10 @@ async def list_variant_inventory(
 ):
     """List all inventory rows for a package variant, optionally filtered by date range."""
     query = select(PackageVariantInventory).where(
-        PackageVariantInventory.variant_id == variant_id
+        and_(
+            PackageVariantInventory.variant_id == variant_id,
+            PackageVariantInventory.deleted_at.is_(None),
+        )
     )
     if from_date:
         query = query.where(PackageVariantInventory.date >= from_date)
@@ -221,8 +247,12 @@ async def list_variant_inventory(
 async def get_variant_calendar(
     variant_id: int,
     month: str = Query(..., description="YYYY-MM format"),
+    response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
+    if response:
+        from app.utils.cache import set_no_store_headers
+        set_no_store_headers(response)
     """
     Get all inventory rows for a variant within a specific month.
     Used to render the admin calendar grid.
@@ -249,6 +279,7 @@ async def get_variant_calendar(
                     PackageVariantInventory.variant_id == variant_id,
                     PackageVariantInventory.date >= from_date,
                     PackageVariantInventory.date <= to_date,
+                    PackageVariantInventory.deleted_at.is_(None),
                 )
             )
             .order_by(PackageVariantInventory.date.asc())
@@ -289,6 +320,7 @@ async def update_inventory_row(
             and_(
                 PackageVariantInventory.variant_id == variant_id,
                 PackageVariantInventory.date == inv_date,
+                PackageVariantInventory.deleted_at.is_(None),
             )
         )
     )
@@ -339,7 +371,8 @@ async def update_inventory_row(
         details={"date": str(inv_date), "variant_id": variant_id, **updates},
     )
     await db.commit()
-    clear_cache_prefix(f"inventory:packages:{variant_id}")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:packages:{variant_id}")
     await _clear_package_cache_for_variant(db, variant_id)
 
     return _compute_row(row)
@@ -363,6 +396,7 @@ async def delete_inventory_row(
             and_(
                 PackageVariantInventory.variant_id == variant_id,
                 PackageVariantInventory.date == inv_date,
+                PackageVariantInventory.deleted_at.is_(None),
             )
         )
     )
@@ -379,7 +413,8 @@ async def delete_inventory_row(
             ),
         )
 
-    await db.delete(row)
+    from sqlalchemy import func
+    row.deleted_at = func.now()
     await db.commit()
 
     await log_action(
@@ -403,7 +438,8 @@ async def delete_inventory_row(
         sse_payload["is_closed"] = True
         await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
 
-    clear_cache_prefix(f"inventory:packages:{variant_id}")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:packages:{variant_id}")
     await _clear_package_cache_for_variant(db, variant_id)
     return None
 
@@ -551,9 +587,9 @@ async def generate_room_inventory(
 
             slot_capacity_map[key] = slot_capacity.total_rooms
 
-    # Query existing (date, slot_start, slot_end) combinations for idempotency
+    # Query existing (date, slot_start, slot_end) combinations for idempotency/restoration
     existing_result = await db.execute(
-        select(RoomSlotInventory.date, RoomSlotInventory.slot_start, RoomSlotInventory.slot_end).where(
+        select(RoomSlotInventory).where(
             and_(
                 RoomSlotInventory.room_variant_id == body.room_variant_id,
                 RoomSlotInventory.date >= body.from_date,
@@ -561,16 +597,30 @@ async def generate_room_inventory(
             )
         )
     )
-    existing_slots = {(r[0], r[1], r[2]) for r in existing_result.all()}
+    existing_slots = {
+        (r.date, r.slot_start, r.slot_end): r for r in existing_result.scalars().all()
+    }
 
     created = 0
     skipped = 0
     current = body.from_date
+    created_slots = []
 
     while current <= body.to_date:
         for s_start, s_end in slots_to_generate:
-            if (current, s_start, s_end) in existing_slots:
-                skipped += 1
+            existing_row = existing_slots.get((current, s_start, s_end))
+            if existing_row:
+                if existing_row.deleted_at is None:
+                    skipped += 1
+                else:
+                    # Restore soft-deleted row
+                    existing_row.deleted_at = None
+                    existing_row.total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
+                    existing_row.booked_rooms = 0
+                    existing_row.reserved_rooms = 0
+                    existing_row.is_closed = False
+                    created += 1
+                    created_slots.append((current, s_start, s_end))
             else:
                 total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
                 db.add(RoomSlotInventory(
@@ -584,6 +634,7 @@ async def generate_room_inventory(
                     is_closed=False,
                 ))
                 created += 1
+                created_slots.append((current, s_start, s_end))
         current += timedelta(days=1)
 
     await db.commit()
@@ -612,9 +663,9 @@ async def generate_room_inventory(
     )
     await db.commit()
     
-    # Invalidate cache
-    clear_cache_prefix(f"inventory:rooms:{body.room_variant_id}")
-    clear_cache_prefix("rooms:")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:rooms:{body.room_variant_id}")
+    await clear_cache_prefix_async("rooms:")
     room_result = await db.execute(
         select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
             RoomVariant.id == body.room_variant_id
@@ -631,32 +682,37 @@ async def generate_room_inventory(
         from app.utils.cache import trigger_frontend_revalidation
         trigger_frontend_revalidation(tags=[f"room-{slug}"])
 
-        # Broadcast SSE for newly created room inventory slots
+        # Broadcast SSE for newly created or restored room inventory slots
         if created > 0:
             import time
             from app.core.timezone import get_ist_now
             from app.utils.sse import sse_manager
             
-            current_date = body.from_date
-            while current_date <= body.to_date:
-                for s_start, s_end in slots_to_generate:
-                    if (current_date, s_start, s_end) not in existing_slots:
-                        total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
-                        sse_payload = {
-                            "version": int(time.time() * 1000),
-                            "timestamp": get_ist_now().isoformat(),
-                            "room_id": room_id,
-                            "travel_date": str(current_date),
-                            "available": total_rooms,
-                            "reserved": 0,
-                            "booked": 0,
-                            "is_closed": False,
-                            "variant_id": body.room_variant_id,
-                            "slot_start": str(s_start),
-                            "slot_end": str(s_end)
-                        }
-                        await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
-                current_date += timedelta(days=1)
+            if created > 50:
+                bulk_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "room_id": room_id,
+                    "type": "rooms"
+                }
+                await sse_manager.broadcast_event("room", str(room_id), "BULK_REFRESH", bulk_payload)
+            else:
+                for current_date, s_start, s_end in created_slots:
+                    total_rooms = slot_capacity_map.get((s_start, s_end), default_total_rooms)
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "room_id": room_id,
+                        "travel_date": str(current_date),
+                        "available": total_rooms,
+                        "reserved": 0,
+                        "booked": 0,
+                        "is_closed": False,
+                        "variant_id": body.room_variant_id,
+                        "slot_start": str(s_start),
+                        "slot_end": str(s_end)
+                    }
+                    await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
 
     return RoomInventoryGenerateResponse(
         created=created,
@@ -677,8 +733,12 @@ async def generate_room_inventory(
 async def get_room_calendar(
     room_variant_id: int,
     month: str = Query(..., description="YYYY-MM format"),
+    response: Response = None,
     db: AsyncSession = Depends(get_db),
 ):
+    if response:
+        from app.utils.cache import set_no_store_headers
+        set_no_store_headers(response)
     """Get all RoomSlotInventory rows for a specific room variant within a month."""
     try:
         year, mon = int(month[:4]), int(month[5:7])
@@ -701,6 +761,7 @@ async def get_room_calendar(
                     RoomSlotInventory.room_variant_id == room_variant_id,
                     RoomSlotInventory.date >= from_date,
                     RoomSlotInventory.date <= to_date,
+                    RoomSlotInventory.deleted_at.is_(None),
                 )
             )
             .order_by(RoomSlotInventory.date.asc())
@@ -727,7 +788,12 @@ async def update_room_inventory_row(
     Hard rule: total_rooms cannot be reduced below booked_rooms.
     """
     result = await db.execute(
-        select(RoomSlotInventory).where(RoomSlotInventory.id == slot_id)
+        select(RoomSlotInventory).where(
+            and_(
+                RoomSlotInventory.id == slot_id,
+                RoomSlotInventory.deleted_at.is_(None),
+            )
+        )
     )
     row = result.scalar_one_or_none()
     if not row:
@@ -769,9 +835,9 @@ async def update_room_inventory_row(
         details={"date": str(row.date), "room_variant_id": row.room_variant_id, "slot_id": slot_id, **updates},
     )
     
-    # Broadcast to invalidate caches
-    clear_cache_prefix(f"inventory:rooms:{row.room_variant_id}")
-    clear_cache_prefix("rooms:")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:rooms:{row.room_variant_id}")
+    await clear_cache_prefix_async("rooms:")
     from app.services.redis_client import invalidate_cached_availability
     
     # Need to find the slug for this room variant
@@ -784,7 +850,7 @@ async def update_room_inventory_row(
     if slug_row:
         slug = slug_row[0]
         room_id = slug_row[1]
-        clear_cache_prefix(f"rooms:detail:{slug}")
+        await clear_cache_prefix_async(f"rooms:detail:{slug}")
         import asyncio
         asyncio.create_task(invalidate_cached_availability(slug))
         from app.utils.cache import trigger_frontend_revalidation
@@ -825,7 +891,12 @@ async def delete_room_inventory_row(
 ):
     """Delete a specific inventory row by ID. Blocked if booked_rooms > 0."""
     result = await db.execute(
-        select(RoomSlotInventory).where(RoomSlotInventory.id == slot_id)
+        select(RoomSlotInventory).where(
+            and_(
+                RoomSlotInventory.id == slot_id,
+                RoomSlotInventory.deleted_at.is_(None),
+            )
+        )
     )
     row = result.scalar_one_or_none()
     if not row:
@@ -851,7 +922,8 @@ async def delete_room_inventory_row(
     )
     slug_row = room_result.first()
 
-    await db.delete(row)
+    from sqlalchemy import func
+    row.deleted_at = func.now()
     await db.commit()
 
     await log_action(
@@ -863,12 +935,13 @@ async def delete_room_inventory_row(
         details={"date": date_str, "room_variant_id": room_variant_id},
     )
     
-    clear_cache_prefix(f"inventory:rooms:{room_variant_id}")
-    clear_cache_prefix("rooms:")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:rooms:{room_variant_id}")
+    await clear_cache_prefix_async("rooms:")
     if slug_row:
         slug = slug_row[0]
         room_id = slug_row[1]
-        clear_cache_prefix(f"rooms:detail:{slug}")
+        await clear_cache_prefix_async(f"rooms:detail:{slug}")
         from app.services.redis_client import invalidate_cached_availability
         import asyncio
         asyncio.create_task(invalidate_cached_availability(slug))
@@ -989,10 +1062,45 @@ async def generate_transport_inventory(
 
     await db.commit()
     
-    # Broadcast SSE for generated slots
-    from app.utils.sse import broadcast_transport_update
-    for opt_id, slot_date in created_slots:
-        await broadcast_transport_update(db, opt_id, slot_date)
+    # Broadcast SSE for generated slots (optimized to avoid nested queries)
+    import time
+    from app.core.timezone import get_ist_now
+    from app.utils.sse import sse_manager
+    if created > 0 and opts:
+        package_id = opts[0].package_id
+        if created > 50:
+            bulk_payload = {
+                "version": int(time.time() * 1000),
+                "timestamp": get_ist_now().isoformat(),
+                "package_id": package_id,
+                "type": "transport"
+            }
+            await sse_manager.broadcast_event("package", str(package_id), "BULK_REFRESH", bulk_payload)
+        else:
+            opt_map = {o.id: o for o in opts}
+            for opt_id, slot_date in created_slots:
+                opt = opt_map.get(opt_id)
+                if not opt:
+                    continue
+                opt_count = 1
+                if payload.option_counts and str(opt.id) in payload.option_counts:
+                    opt_count = int(payload.option_counts[str(opt.id)])
+                else:
+                    opt_count = int(opt.capacity or 1)
+                t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
+                is_shared = t_type_str != 'SEPARATE_VEHICLE'
+                total_capacity = (opt_count * (opt.capacity or 1)) if is_shared else opt_count
+                sse_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": opt.package_id,
+                    "travel_date": str(slot_date),
+                    "option_id": opt.id,
+                    "remaining": total_capacity,
+                    "is_closed": False,
+                    "price_override": None
+                }
+                await sse_manager.broadcast_event("package", str(opt.package_id), "TRANSPORT_UPDATE", sse_payload)
     
     # Cache invalidation for transport generation
     from app.models.package import Package
@@ -1016,9 +1124,13 @@ async def generate_transport_inventory(
 async def get_transport_inventory_calendar(
     package_id: int,
     month: str = Query(..., description="YYYY-MM"),
+    response: Response = None,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_admin),
 ):
+    if response:
+        from app.utils.cache import set_no_store_headers
+        set_no_store_headers(response)
     """
     Returns all transport inventory rows for a package's transport options
     in the given month. Groups by date → [option_rows].
@@ -1283,27 +1395,29 @@ async def bulk_action_package_inventory(
         
     updated = 0
     import datetime
+    modified_rows = []
     
     for row in rows:
+        modified = False
         if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_capacity is not None:
-            if row.total_capacity == payload.total_capacity:
-                continue
-            row.total_capacity = payload.total_capacity
-            updated += 1
+            if row.total_capacity != payload.total_capacity:
+                row.total_capacity = payload.total_capacity
+                modified = True
         elif payload.action == BulkActionType.OPEN:
-            if not row.is_closed:
-                continue
-            row.is_closed = False
-            updated += 1
-        elif payload.action == BulkActionType.CLOSE:
             if row.is_closed:
-                continue
-            row.is_closed = True
-            updated += 1
+                row.is_closed = False
+                modified = True
+        elif payload.action == BulkActionType.CLOSE:
+            if not row.is_closed:
+                row.is_closed = True
+                modified = True
         elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is not None:
-                continue
-            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            if row.deleted_at is None:
+                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                modified = True
+                
+        if modified:
+            modified_rows.append(row)
             updated += 1
             
     if updated == 0:
@@ -1313,7 +1427,40 @@ async def bulk_action_package_inventory(
         )
             
     await db.commit()
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:packages:{payload.variant_id}")
     await _clear_package_cache_for_variant(db, payload.variant_id)
+    
+    # Broadcast SSE updates for modified rows
+    if updated > 0:
+        from app.utils.sse import sse_manager, build_package_sse_payload
+        from sqlalchemy.orm import joinedload
+        variant_res = await db.execute(
+            select(PackageVariant)
+            .options(joinedload(PackageVariant.package))
+            .where(PackageVariant.id == payload.variant_id)
+        )
+        variant = variant_res.scalar_one_or_none()
+        if variant:
+            if updated > 50:
+                import time
+                from app.core.timezone import get_ist_now
+                bulk_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": variant.package_id,
+                    "type": "packages"
+                }
+                await sse_manager.broadcast_event("package", str(variant.package_id), "BULK_REFRESH", bulk_payload)
+            else:
+                for row in modified_rows:
+                    if row.deleted_at is not None:
+                        sse_payload = build_package_sse_payload(variant, None, row.date)
+                        sse_payload["available"] = 0
+                        sse_payload["is_closed"] = True
+                    else:
+                        sse_payload = build_package_sse_payload(variant, row, row.date)
+                    await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
         
     action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
     return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
@@ -1342,27 +1489,29 @@ async def bulk_action_room_inventory(
         
     updated = 0
     import datetime
+    modified_rows = []
     
     for row in rows:
+        modified = False
         if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_rooms is not None:
-            if row.total_rooms == payload.total_rooms:
-                continue
-            row.total_rooms = payload.total_rooms
-            updated += 1
+            if row.total_rooms != payload.total_rooms:
+                row.total_rooms = payload.total_rooms
+                modified = True
         elif payload.action == BulkActionType.OPEN:
-            if not row.is_closed:
-                continue
-            row.is_closed = False
-            updated += 1
-        elif payload.action == BulkActionType.CLOSE:
             if row.is_closed:
-                continue
-            row.is_closed = True
-            updated += 1
+                row.is_closed = False
+                modified = True
+        elif payload.action == BulkActionType.CLOSE:
+            if not row.is_closed:
+                row.is_closed = True
+                modified = True
         elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is not None:
-                continue
-            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            if row.deleted_at is None:
+                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                modified = True
+                
+        if modified:
+            modified_rows.append(row)
             updated += 1
             
     if updated == 0:
@@ -1374,9 +1523,9 @@ async def bulk_action_room_inventory(
     await db.commit()
     
     # Clear Redis caches
-    from app.utils.cache import clear_cache_prefix
-    clear_cache_prefix(f"inventory:rooms:{payload.room_variant_id}")
-    clear_cache_prefix("rooms:")
+    from app.utils.cache import clear_cache_prefix_async
+    await clear_cache_prefix_async(f"inventory:rooms:{payload.room_variant_id}")
+    await clear_cache_prefix_async("rooms:")
     
     from app.models.room import RoomVariant, Room
     from app.services.redis_client import invalidate_cached_availability
@@ -1391,9 +1540,41 @@ async def bulk_action_room_inventory(
     room_info = room_result.first()
     if room_info:
         slug, room_id = room_info
-        clear_cache_prefix(f"rooms:detail:{slug}")
+        await clear_cache_prefix_async(f"rooms:detail:{slug}")
         asyncio.create_task(invalidate_cached_availability(slug))
         trigger_frontend_revalidation(tags=[f"room-{slug}"])
+        
+        # Broadcast SSE updates for modified rows
+        if updated > 0:
+            import time
+            from app.core.timezone import get_ist_now
+            from app.utils.sse import sse_manager
+            
+            if updated > 50:
+                bulk_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "room_id": room_id,
+                    "type": "rooms"
+                }
+                await sse_manager.broadcast_event("room", str(room_id), "BULK_REFRESH", bulk_payload)
+            else:
+                for row in modified_rows:
+                    is_deleted = row.deleted_at is not None
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "room_id": room_id,
+                        "travel_date": str(row.date),
+                        "available": 0 if is_deleted else max(0, row.total_rooms - row.booked_rooms - row.reserved_rooms),
+                        "reserved": 0 if is_deleted else row.reserved_rooms,
+                        "booked": 0 if is_deleted else row.booked_rooms,
+                        "is_closed": True if is_deleted else row.is_closed,
+                        "variant_id": payload.room_variant_id,
+                        "slot_start": str(row.slot_start),
+                        "slot_end": str(row.slot_end)
+                    }
+                    await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
 
     action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
     return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
@@ -1435,30 +1616,32 @@ async def bulk_action_transport_inventory(
         
     updated = 0
     import datetime
+    modified_rows = []
     
     for row in rows:
+        modified = False
         if payload.action == BulkActionType.UPDATE_CAPACITY and payload.option_counts:
             # Only update if a count was provided for this option
             if str(row.transport_option_id) in payload.option_counts:
                 new_capacity = int(payload.option_counts[str(row.transport_option_id)])
-                if row.available_count == new_capacity:
-                    continue
-                row.available_count = new_capacity
-                updated += 1
+                if row.available_count != new_capacity:
+                    row.available_count = new_capacity
+                    modified = True
         elif payload.action == BulkActionType.OPEN:
-            if not row.is_closed:
-                continue
-            row.is_closed = False
-            updated += 1
-        elif payload.action == BulkActionType.CLOSE:
             if row.is_closed:
-                continue
-            row.is_closed = True
-            updated += 1
+                row.is_closed = False
+                modified = True
+        elif payload.action == BulkActionType.CLOSE:
+            if not row.is_closed:
+                row.is_closed = True
+                modified = True
         elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is not None:
-                continue
-            row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+            if row.deleted_at is None:
+                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                modified = True
+                
+        if modified:
+            modified_rows.append(row)
             updated += 1
             
     if updated == 0:
@@ -1477,6 +1660,52 @@ async def bulk_action_transport_inventory(
     if pkg:
         asyncio.create_task(invalidate_cached_availability(pkg.slug))
         trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+        
+        # Broadcast SSE updates for modified rows
+        if updated > 0:
+            import time
+            from app.core.timezone import get_ist_now
+            from app.utils.sse import sse_manager
+            
+            if updated > 50:
+                bulk_payload = {
+                    "version": int(time.time() * 1000),
+                    "timestamp": get_ist_now().isoformat(),
+                    "package_id": payload.package_id,
+                    "type": "transport"
+                }
+                await sse_manager.broadcast_event("package", str(payload.package_id), "BULK_REFRESH", bulk_payload)
+            else:
+                opt_map = {o.id: o for o in opts}
+                for row in modified_rows:
+                    opt = opt_map.get(row.transport_option_id)
+                    if not opt:
+                        continue
+                    is_deleted = row.deleted_at is not None
+                    t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
+                    is_shared = t_type_str != 'SEPARATE_VEHICLE'
+                    
+                    if is_deleted:
+                        remaining = 0
+                        is_closed = True
+                        price_override = None
+                    else:
+                        total_capacity = (row.available_count * (opt.capacity or 1)) if is_shared else row.available_count
+                        remaining = max(0, total_capacity - row.booked_count)
+                        is_closed = row.is_closed
+                        price_override = row.price_override
+                        
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "package_id": opt.package_id,
+                        "travel_date": str(row.date),
+                        "option_id": row.transport_option_id,
+                        "remaining": remaining,
+                        "is_closed": is_closed,
+                        "price_override": float(price_override) if price_override is not None else None
+                    }
+                    await sse_manager.broadcast_event("package", str(opt.package_id), "TRANSPORT_UPDATE", sse_payload)
         
     action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
     return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}

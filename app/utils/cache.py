@@ -128,6 +128,22 @@ def clear_cache_prefix(prefix: str) -> None:
     except RuntimeError:
         asyncio.run(_clear())
 
+async def clear_cache_prefix_async(prefix: str) -> None:
+    """
+    Clears Redis keys matching prefix AND the in-process memory cache.
+    Awaits the Redis delete operation to prevent race conditions.
+    """
+    _mem_delete_prefix(prefix)
+    try:
+        from app.services.redis_client import get_redis_raw
+        redis = get_redis_raw()
+        keys = await asyncio.wait_for(redis.keys(f"{prefix}*"), timeout=1.0)
+        if keys:
+            await asyncio.wait_for(redis.delete(*keys), timeout=1.0)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to clear cache prefix {prefix} async: {e}")
+
 def trigger_frontend_revalidation(tags: List[str] = None, paths: List[str] = None) -> None:
     """
     Triggers Next.js On-Demand Revalidation via Webhook.
