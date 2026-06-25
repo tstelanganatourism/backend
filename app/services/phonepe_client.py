@@ -116,7 +116,9 @@ class PhonePeService:
         token = await self._get_oauth_token()
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"O-Bearer {token}"
+            "Authorization": f"O-Bearer {token}",
+            "X-CALLBACK-URL": callback_url,
+            "X-CALL-MODE": "POST"
         }
 
         try:
@@ -206,8 +208,22 @@ class PhonePeService:
     def verify_webhook_signature(self, base64_response: str, received_signature: str) -> bool:
         """
         Verify the signature of the webhook callback.
-        For V2, we return True as polling performs secure confirmation.
         """
-        return True
+        if self.is_mock:
+            return True
+            
+        if not received_signature:
+            return False
+            
+        import hashlib
+        try:
+            # Formula: SHA256(base64_response + salt_key) + "###" + salt_index
+            string_to_hash = base64_response + self.client_secret
+            hashed = hashlib.sha256(string_to_hash.encode('utf-8')).hexdigest()
+            expected_signature = f"{hashed}###{self.client_version}"
+            return expected_signature == received_signature
+        except Exception as e:
+            logger.error(f"Error verifying PhonePe webhook signature: {e}")
+            return False
 
 phonepe_service = PhonePeService()
