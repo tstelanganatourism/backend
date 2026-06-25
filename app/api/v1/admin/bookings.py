@@ -452,14 +452,9 @@ async def admin_create_booking(
             child_count = request.child_count or 0
             student_count = 0
 
-        # Minimum passengers check for admins/agents as well
+        # Minimum passengers check bypassed for admins
         min_pax = getattr(variant.package, 'min_passengers', 1) or 1
         total_passengers = student_count if is_student_pkg else (adult_count + child_count)
-        if total_passengers < min_pax:
-            raise HTTPException(
-                status_code=400,
-                detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
-            )
 
         package_variant_id_val = variant.id
 
@@ -482,9 +477,6 @@ async def admin_create_booking(
             )
             db.add(inv)
             await db.flush()
-        elif inv.is_closed:
-            raise HTTPException(status_code=400, detail="Booking is closed for this date")
-
         # Calculate subtotal using effective prices
         is_weekend_admin = travel_date.weekday() in (5, 6)
         if is_student_pkg:
@@ -535,16 +527,15 @@ async def admin_create_booking(
                     )
                     
                     if inv_row is None:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Transport option '{t_opt.title}' is not opened/available on {travel_date}."
+                        inv_row = PTI(
+                            transport_option_id=sel_id,
+                            date=travel_date,
+                            available_count=9999,
+                            booked_count=0,
+                            is_closed=False,
                         )
-                        
-                    if inv_row.is_closed:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Transport option '{t_opt.title}' is closed for {travel_date}."
-                        )
+                        db.add(inv_row)
+                        await db.flush()
 
                     t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
                     if t_type_str == 'SHARED':
@@ -564,13 +555,6 @@ async def admin_create_booking(
                         
                         # Increment booked seats in transport inventory
                         seats_needed = student_count if is_student_pkg else (adult_count + child_count)
-                        total_seats = inv_row.available_count * (t_opt.capacity or 1)
-                        remaining = total_seats - inv_row.booked_count
-                        if seats_needed > remaining:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Not enough seats on '{t_opt.title}' for {travel_date}. Needed: {seats_needed}, Remaining: {remaining}."
-                            )
                         inv_row.booked_count += seats_needed
                         transport_options_to_broadcast.append(sel_id)
 
@@ -581,12 +565,6 @@ async def admin_create_booking(
                         transport_snapshot_items.append({"option_id": t_opt.id, "title": t_opt.title, "type": "SEPARATE_VEHICLE", "capacity": int(t_opt.capacity or 0), "quantity": sel_qty, "fixed_price": float(t_fixed), "item_total": float(item_cost)})
                         
                         # Increment booked vehicles in transport inventory
-                        remaining = inv_row.available_count - inv_row.booked_count
-                        if sel_qty > remaining:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Not enough '{t_opt.title}' vehicles available on {travel_date}. Requested: {sel_qty}, Available: {remaining}."
-                            )
                         inv_row.booked_count += sel_qty
                         transport_options_to_broadcast.append(sel_id)
 

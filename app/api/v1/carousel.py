@@ -55,7 +55,7 @@ async def get_carousel_slides(
     """
     Returns all published, featured packages and rooms for the homepage carousel.
     Items are ordered by order_priority (highest first), then by id descending.
-    The carousel will show up to 6 total slides (first 3 packages + first 3 rooms).
+    The carousel will show all slides added by the administrator.
     """
     cache_key = "carousel:homepage:slides"
     set_public_cache_headers(response)
@@ -86,7 +86,6 @@ async def get_carousel_slides(
                 Package.deleted_at.is_(None),
             )
             .order_by(Package.order_priority.desc(), Package.id.desc())
-            .limit(5)
         )
         packages = pkg_result.all()
 
@@ -158,7 +157,6 @@ async def get_carousel_slides(
                 Room.deleted_at.is_(None),
             )
             .order_by(Room.order_priority.desc(), Room.id.desc())
-            .limit(5)
         )
         rooms = room_result.all()
 

@@ -208,13 +208,25 @@ async def checkout(
         inventory = result.scalar_one_or_none()
         
         if not inventory:
-            raise HTTPException(status_code=404, detail="Inventory not found for this date")
+            if is_admin:
+                inventory = PackageVariantInventory(
+                    variant_id=request.variant_id,
+                    date=request.travel_date,
+                    total_capacity=request.quantity,
+                    booked_count=0,
+                    reserved_count=0,
+                    is_closed=False,
+                )
+                db.add(inventory)
+                await db.flush()
+            else:
+                raise HTTPException(status_code=404, detail="Inventory not found for this date")
             
-        if inventory.is_closed:
+        if inventory.is_closed and not is_admin:
             raise HTTPException(status_code=400, detail="Booking closed for this date")
             
         available = inventory.total_capacity - (inventory.booked_count + inventory.reserved_count)
-        if available < request.quantity:
+        if available < request.quantity and not is_admin:
             raise HTTPException(status_code=400, detail=f"Insufficient inventory. Requested: {request.quantity}, Available: {available}")
             
         # 2. Get base variant details and verify parent package is active/not deleted
@@ -326,7 +338,7 @@ async def checkout(
         # ── Minimum passengers check ───────────────────────────────────
         min_pax = getattr(parent_package, 'min_passengers', 1) or 1
         total_passengers = student_count if is_student_pkg else (adult_count + child_count)
-        if total_passengers < min_pax:
+        if total_passengers < min_pax and not is_admin:
             raise HTTPException(
                 status_code=400,
                 detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
@@ -466,12 +478,23 @@ async def checkout(
                 )
 
                 if inv_row is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Transport option '{t_opt.title}' is not available on {travel_date_obj}. The admin has not opened this transport for this date."
-                    )
+                    if is_admin:
+                        inv_row = PackageTransportInventory(
+                            transport_option_id=sel.option_id,
+                            date=travel_date_obj,
+                            available_count=9999,
+                            booked_count=0,
+                            is_closed=False,
+                        )
+                        db.add(inv_row)
+                        await db.flush()
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Transport option '{t_opt.title}' is not available on {travel_date_obj}. The admin has not opened this transport for this date."
+                        )
 
-                if inv_row.is_closed:
+                if inv_row.is_closed and not is_admin:
                     raise HTTPException(
                         status_code=400,
                         detail=f"Transport option '{t_opt.title}' is closed for {travel_date_obj}."
@@ -480,7 +503,7 @@ async def checkout(
                 t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
                 if t_type_str == 'SEPARATE_VEHICLE':
                     remaining = inv_row.available_count - inv_row.booked_count
-                    if sel.quantity > remaining:
+                    if sel.quantity > remaining and not is_admin:
                         raise HTTPException(
                             status_code=400,
                             detail=f"Not enough '{t_opt.title}' vehicles available on {travel_date_obj}. Requested: {sel.quantity}, Available: {remaining}."
@@ -490,7 +513,7 @@ async def checkout(
                     seats_needed = student_count if is_student_pkg else (adult_count + child_count)
                     total_seats = inv_row.available_count * (t_opt.capacity or 1)
                     remaining = total_seats - inv_row.booked_count
-                    if seats_needed > remaining:
+                    if seats_needed > remaining and not is_admin:
                         raise HTTPException(
                             status_code=400,
                             detail=f"Not enough seats on '{t_opt.title}' for {travel_date_obj}. Needed: {seats_needed}, Remaining: {remaining}."
