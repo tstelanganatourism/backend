@@ -502,6 +502,12 @@ async def admin_create_booking(
         
         # Transport pricing & inventory verification for admin direct booking
         transport_snapshot_items = []
+        if variant.package.has_transport and not request.transport_selections:
+            raise HTTPException(
+                status_code=400,
+                detail="Transport selection is mandatory for this package."
+            )
+
         if request.transport_selections:
             from app.models.package import PackageTransportOption as PTO, PackageTransportInventory as PTI
             pkg_res_for_transport = await db.execute(

@@ -58,7 +58,7 @@ class CheckoutRequest(BaseModel):
 
     # Common
     travel_date: date
-    quantity: int  # Total passengers / guests
+    quantity: int = Field(..., ge=1)  # Total passengers / guests
 
     # Package specific
     variant_id: Optional[int] = None
@@ -367,6 +367,12 @@ async def checkout(
         effective_selections = request.transport_selections or []
         if not effective_selections and request.transport_option_id:
             effective_selections = [TransportSelection(option_id=request.transport_option_id, quantity=1)]
+
+        if parent_package.has_transport and not effective_selections:
+            raise HTTPException(
+                status_code=400,
+                detail="Transport selection is mandatory for this package."
+            )
 
         if parent_package.has_transport and effective_selections:
             selected_opt_ids = [s.option_id for s in effective_selections]
