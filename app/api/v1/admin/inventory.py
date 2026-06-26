@@ -1401,6 +1401,8 @@ async def bulk_action_package_inventory(
         modified = False
         if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_capacity is not None:
             if row.total_capacity != payload.total_capacity:
+                if payload.total_capacity < row.booked_count:
+                    raise HTTPException(status_code=400, detail=f"Cannot reduce capacity to {payload.total_capacity} on {row.date} — {row.booked_count} seats already booked.")
                 row.total_capacity = payload.total_capacity
                 modified = True
         elif payload.action == BulkActionType.OPEN:
@@ -1413,6 +1415,8 @@ async def bulk_action_package_inventory(
                 modified = True
         elif payload.action == BulkActionType.DELETE:
             if row.deleted_at is None:
+                if row.booked_count > 0:
+                    raise HTTPException(status_code=400, detail=f"Cannot delete inventory on {row.date} — {row.booked_count} seats already booked.")
                 row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
                 modified = True
                 
@@ -1495,6 +1499,8 @@ async def bulk_action_room_inventory(
         modified = False
         if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_rooms is not None:
             if row.total_rooms != payload.total_rooms:
+                if payload.total_rooms < row.booked_rooms:
+                    raise HTTPException(status_code=400, detail=f"Cannot reduce rooms to {payload.total_rooms} on {row.date} — {row.booked_rooms} rooms already booked.")
                 row.total_rooms = payload.total_rooms
                 modified = True
         elif payload.action == BulkActionType.OPEN:
@@ -1507,6 +1513,8 @@ async def bulk_action_room_inventory(
                 modified = True
         elif payload.action == BulkActionType.DELETE:
             if row.deleted_at is None:
+                if row.booked_rooms > 0:
+                    raise HTTPException(status_code=400, detail=f"Cannot delete inventory on {row.date} — {row.booked_rooms} rooms already booked.")
                 row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
                 modified = True
                 
@@ -1625,6 +1633,17 @@ async def bulk_action_transport_inventory(
             if str(row.transport_option_id) in payload.option_counts:
                 new_capacity = int(payload.option_counts[str(row.transport_option_id)])
                 if row.available_count != new_capacity:
+                    opt = next((o for o in opts if o.id == row.transport_option_id), None)
+                    if opt:
+                        t_type = opt.type.value if hasattr(opt.type, "value") else str(opt.type)
+                        is_shared = t_type != "SEPARATE_VEHICLE"
+                        new_cap = opt.capacity or 1
+                        total_capacity_new = (new_capacity * new_cap) if is_shared else new_capacity
+                        if total_capacity_new < row.booked_count:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Cannot set vehicles to {new_capacity} on {row.date} for {opt.title} as it results in {total_capacity_new} capacity, below already booked ({row.booked_count})."
+                            )
                     row.available_count = new_capacity
                     modified = True
         elif payload.action == BulkActionType.OPEN:
@@ -1637,6 +1656,8 @@ async def bulk_action_transport_inventory(
                 modified = True
         elif payload.action == BulkActionType.DELETE:
             if row.deleted_at is None:
+                if row.booked_count > 0:
+                    raise HTTPException(status_code=400, detail=f"Cannot delete transport on {row.date} — {row.booked_count} booked.")
                 row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
                 modified = True
                 
