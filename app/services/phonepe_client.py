@@ -117,8 +117,8 @@ class PhonePeService:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"O-Bearer {token}",
-            "X-CALLBACK-URL": callback_url,
-            "X-CALL-MODE": "POST"
+            # "X-CALLBACK-URL": callback_url,
+            # "X-CALL-MODE": "POST"
         }
 
         try:
@@ -130,7 +130,20 @@ class PhonePeService:
                     timeout=15.0
                 )
             
-            res_json = response.json()
+            try:
+                res_json = response.json()
+            except ValueError:
+                logger.error(f"PhonePe Pay API responded with non-JSON: {response.status_code} {response.text}")
+                error_msg = response.text.strip()
+                if error_msg == "R016":
+                    detail_msg = "PhonePe Error R016: Callback URL is not whitelisted. Please whitelist the callback URL in PhonePe Dashboard."
+                else:
+                    detail_msg = f"PhonePe gateway error: {error_msg}"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=detail_msg
+                )
+
             if response.status_code == 200:
                 redirect_url_from_api = res_json.get("redirectUrl")
                 if redirect_url_from_api:

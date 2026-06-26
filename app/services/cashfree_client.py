@@ -74,7 +74,7 @@ class CashfreeService:
             },
             "order_meta": {
                 "return_url": return_url,
-                "notify_url": "",  # We use polling instead of webhook for Cashfree
+                # Avoid sending empty notify_url to prevent validation errors
             },
         }
 
@@ -85,13 +85,21 @@ class CashfreeService:
                     headers=self._headers(),
                     json=payload,
                 )
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.error(f"Cashfree Pay API responded with non-JSON: {resp.status_code} {resp.text}")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Cashfree gateway error: {resp.text.strip()}"
+                    )
+
                 if resp.status_code not in (200, 201):
                     logger.error(f"Cashfree create_order failed: {resp.status_code} {resp.text}")
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Cashfree gateway error: {resp.json().get('message', 'Order creation failed.')}",
+                        detail=f"Cashfree gateway error: {data.get('message', 'Order creation failed.')}",
                     )
-                data = resp.json()
                 return {
                     "order_id": data.get("order_id"),
                     "payment_session_id": data.get("payment_session_id"),
@@ -125,7 +133,12 @@ class CashfreeService:
                     logger.error(f"Cashfree get_order_status failed: {resp.status_code} {resp.text}")
                     return {"status": "ERROR", "pg_payment_id": None}
 
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.error(f"Cashfree get_order_status returned non-JSON: {resp.text}")
+                    return {"status": "ERROR", "pg_payment_id": None}
+
                 order_status = data.get("order_status", "ACTIVE")  # PAID | ACTIVE | EXPIRED | CANCELLED
 
                 # Fetch the payment details if paid
@@ -136,7 +149,11 @@ class CashfreeService:
                         headers=self._headers(),
                     )
                     if pay_resp.status_code == 200:
-                        payments = pay_resp.json()
+                        try:
+                            payments = pay_resp.json()
+                        except ValueError:
+                            logger.error(f"Cashfree payments API returned non-JSON: {pay_resp.text}")
+                            payments = []
                         if payments and isinstance(payments, list):
                             # Get the latest successful payment
                             for p in payments:
