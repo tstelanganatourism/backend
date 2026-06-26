@@ -241,6 +241,25 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         safe_office_address = escape(office_address)
         safe_office_maps_url = escape(office_maps_url, quote=True)
 
+        target_name = "—"
+        try:
+            if is_room_booking:
+                from app.models.room import RoomVariant, Room
+                res = await db.execute(select(Room.lodge_name, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
+                room_data = res.first()
+                if room_data:
+                    target_name = f"{room_data[0]} ({room_data[1]})"
+            else:
+                from app.models.package import PackageVariant, Package
+                res = await db.execute(select(Package.title).join(PackageVariant).where(PackageVariant.id == booking.variant_id))
+                pkg_data = res.first()
+                if pkg_data:
+                    target_name = pkg_data[0]
+        except Exception as e:
+            logger.warning(f"Could not fetch target name for booking {booking.public_id}: {e}")
+        safe_target_name = escape(target_name)
+        safe_target_label = "Booked Room" if is_room_booking else "Booked Package"
+
         if is_room_booking:
             preview_text = "Your TS Tours booking documents are ready. Download your ticket before the link expires."
             next_steps_section = """
@@ -386,6 +405,12 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                                 <div style="font-family:Arial, Helvetica, sans-serif; color:#075b60; font-size:20px; line-height:28px; font-weight:800;">{booking_id}</div>
                                             </td>
                                         </tr>
+                                        <tr>
+                                            <td style="padding:18px 20px; border-bottom:1px solid #dbe6ea;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">{safe_target_label}</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:16px; line-height:24px; font-weight:700;">{safe_target_name}</div>
+                                            </td>
+                                        </tr>
                                         {financial_details}
                                     </table>
 
@@ -492,8 +517,10 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 recipient_name=escape(recipient_name_val),
                 message_body=message_body,
                 booking_id=safe_booking_id,
-            financial_details=financial_details,
-            logo1_url=safe_logo1_url,
+                safe_target_label=safe_target_label,
+                safe_target_name=safe_target_name,
+                financial_details=financial_details,
+                logo1_url=safe_logo1_url,
             logo2_url=safe_logo2_url,
             office_phone=office_phone,
             office_phone_tel=office_phone.replace(" ", ""),

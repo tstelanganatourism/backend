@@ -77,6 +77,25 @@ async def send_admin_booking_notification(
     is_room = booking.room_variant_id is not None
     booking_type_label = "Accommodation / Room" if is_room else "Package / Tour"
 
+    target_name = "—"
+    target_label = "Booked Room" if is_room else "Booked Package"
+    if db:
+        try:
+            if is_room:
+                from app.models.room import RoomVariant, Room
+                res = await db.execute(select(Room.lodge_name, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
+                room_data = res.first()
+                if room_data:
+                    target_name = f"{room_data[0]} ({room_data[1]})"
+            else:
+                from app.models.package import PackageVariant, Package
+                res = await db.execute(select(Package.title).join(PackageVariant).where(PackageVariant.id == booking.variant_id))
+                pkg_data = res.first()
+                if pkg_data:
+                    target_name = pkg_data[0]
+        except Exception as e:
+            logger.warning(f"Could not fetch target name for booking {booking.public_id}: {e}")
+
     frontend_url = settings.FRONTEND_URL.rstrip("/")
     secret = _booking_hash(booking.public_id)
     ticket_url   = f"{frontend_url}/print/ticket/{booking.public_id}?secret={secret}"
@@ -573,6 +592,10 @@ async def send_admin_booking_notification(
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Booking Type</td>
                 <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;">{booking_type_label}</td>
+              </tr>
+              <tr>
+                <td style="padding:5px 0;font-size:13px;color:#64748b;">{target_label}</td>
+                <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;">{target_name}</td>
               </tr>
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Payment Gateway</td>
