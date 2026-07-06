@@ -697,6 +697,18 @@ async def send_admin_booking_notification(
 </body>
 </html>"""
 
+    if db:
+        from app.models.booking import EmailLog
+        existing_logs_query = select(EmailLog.id).where(
+            EmailLog.booking_id == booking.id,
+            EmailLog.email_type == "ADMIN_NOTIFICATION",
+            EmailLog.delivery_status == "SENT"
+        )
+        existing_logs_result = await db.execute(existing_logs_query)
+        if existing_logs_result.first():
+            logger.info(f"Skipping admin notification for {booking.public_id} because it was already SENT.")
+            return True
+
     success, error = await email_service.send_booking_email(
         recipient_email=admin_email,
         recipient_name="TS Tours Admin",
@@ -707,12 +719,20 @@ async def send_admin_booking_notification(
     )
 
     if not success:
-        logger.error(
-            f"Failed to send admin notification for booking {booking.public_id}: {error}"
-        )
+        logger.error(f"Failed to send admin notification for booking {booking.public_id}: {error}")
     else:
-        logger.info(
-            f"Admin notification sent successfully for booking {booking.public_id}"
+        logger.info(f"Admin notification sent successfully for booking {booking.public_id}")
+
+    if db:
+        from app.models.booking import EmailLog
+        log_entry = EmailLog(
+            booking_id=booking.id,
+            recipient_email=admin_email,
+            email_type="ADMIN_NOTIFICATION",
+            delivery_status="SENT" if success else "FAILED",
+            failure_reason=error if not success else None
         )
+        db.add(log_entry)
+        # We don't commit here, we let the calling task commit so it's one transaction
 
     return success

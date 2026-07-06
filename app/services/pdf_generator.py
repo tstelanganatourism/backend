@@ -206,14 +206,19 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                     recipients.append((agent.email, agent.full_name))
 
         # 5. Prepare and Send Email
+        has_failure = False
+
         if not recipients:
             if not is_postponement:
                 # Send admin notification even if customer has no email (walk-in/guest/admin direct)
                 try:
                     from app.services.admin_notification import send_admin_booking_notification
-                    await send_admin_booking_notification(booking, db=db)
+                    admin_success = await send_admin_booking_notification(booking, db=db)
+                    if not admin_success:
+                        has_failure = True
                 except Exception as e:
                     logger.error(f"Failed to dispatch admin notification for recipient-less booking: {e}")
+                    has_failure = True
 
             # Skip customer email but log the skip
             log_entry = EmailLog(
@@ -226,6 +231,8 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             db.add(log_entry)
             await db.commit()
             logger.info(f"No customer email recipient for booking {booking_id}; admin notified.")
+            if has_failure:
+                raise Exception(f"Admin email failed for recipient-less booking {booking_id}. ARQ will retry.")
             return
 
         # Build premium, email-client-safe HTML content.
@@ -533,11 +540,22 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         )
 
 
+        # Check existing successful emails to prevent duplicates on ARQ retry
+        existing_logs_query = select(EmailLog.recipient_email).where(
+            EmailLog.booking_id == booking.id,
+            EmailLog.email_type == email_type,
+            EmailLog.delivery_status == "SENT"
+        )
+        existing_logs_result = await db.execute(existing_logs_query)
+        already_sent_emails = {row[0] for row in existing_logs_result.fetchall() if row[0]}
+
         # Send to all resolved recipients — pass db so send_booking_email reuses
         # this session instead of opening a new one (prevents connection pool exhaustion).
-        success = False
-        error_reason = "No recipients"
         for r_email, r_name in recipients:
+            if r_email in already_sent_emails:
+                logger.info(f"Skipping email to {r_email} because it was already SENT for booking {booking_id}")
+                continue
+
             html = _generate_html(r_name)
             s, err = await email_service.send_booking_email(
                 recipient_email=r_email,
@@ -546,8 +564,8 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 html_content=html,
                 db=db,
             )
-            if s: success = True
-            else: error_reason = err
+            if not s:
+                has_failure = True
 
             # Log each recipient
             log_entry = EmailLog(
@@ -562,9 +580,15 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         # Send admin notification — reuse same session (Skip if postponement)
         if not is_postponement:
             try:
-                await send_admin_booking_notification(booking, db=db)
+                admin_success = await send_admin_booking_notification(booking, db=db)
+                if not admin_success:
+                    has_failure = True
             except Exception as e:
                 logger.error(f"Failed to dispatch admin notification: {e}")
+                has_failure = True
 
         await db.commit()
         logger.info(f"process_post_booking_documents_task completed for booking {booking_id}")
+        
+        if has_failure:
+            raise Exception(f"One or more emails failed to send for booking {booking_id}. ARQ will retry.")
