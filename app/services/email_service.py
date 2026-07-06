@@ -34,6 +34,8 @@ class EmailService:
         if is_admin:
             primary_key = settings.BREVO_API_KEY_ADMIN
             primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+            if primary_from and "@gmail.com" in primary_from:
+                primary_from = settings.BREVO_FROM_EMAIL
         else:
             primary_key = settings.BREVO_API_KEY_USER
             primary_from = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL
