@@ -38,6 +38,10 @@ class EmailService:
             primary_key = settings.BREVO_API_KEY_USER
             primary_from = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL
 
+        if not primary_key:
+            primary_key = settings.BREVO_API_KEY  # Legacy fallback
+            primary_from = settings.BREVO_FROM_EMAIL
+
         # 2. Smart Brevo Rotation: Check daily sent count using the PASSED-IN session.
         # Never open a new connection here — that causes a deadlock in the ARQ worker.
         try:
@@ -60,10 +64,6 @@ class EmailService:
                 logger.debug("No DB session provided to send_booking_email; skipping daily count check.")
         except Exception as e:
             logger.error(f"Failed to check daily email count: {e}")
-
-        if not primary_key:
-            primary_key = settings.BREVO_API_KEY  # Legacy fallback
-            primary_from = settings.BREVO_FROM_EMAIL
 
         backup_key = settings.BREVO_API_KEY_BACKUP
         backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
