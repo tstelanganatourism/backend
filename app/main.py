@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -7,6 +8,26 @@ from app.core.logging import setup_logging
 from loguru import logger
 import sqlalchemy
 import asyncio
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────────────────────
+    from app.services.r2_storage import r2_service
+    try:
+        if r2_service.is_configured:
+            logger.info("Pre-warming R2 Storage Service Client...")
+            await r2_service.get_client()
+            logger.info("R2 Storage Service Client pre-warmed successfully!")
+    except Exception as e:
+        logger.error(f"Failed to pre-warm R2 Storage client during startup: {e}")
+
+    yield
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+    from app.db.session import engine
+    await engine.dispose()
+    logger.info("Database connection pool disposed gracefully.")
 
 from app.api.v1 import auth
 from app.api.v1 import public_packages, public_rooms
@@ -19,6 +40,7 @@ app = FastAPI(
     description="Backend API for Papikondalu Tourism Booking Platform",
     docs_url=None if settings.ENVIRONMENT == "production" else "/docs",
     redoc_url=None if settings.ENVIRONMENT == "production" else "/redoc",
+    lifespan=lifespan,
 )
 
 # Initialize structured logging and error handlers
@@ -229,23 +251,4 @@ async def health_check():
     return health_status
 
 
-@app.on_event("startup")
-async def startup_event():
-    # Warm up R2 Storage client
-    from app.services.r2_storage import r2_service
-    try:
-        if r2_service.is_configured:
-            logger.info("Pre-warming R2 Storage Service Client...")
-            await r2_service.get_client()
-            logger.info("R2 Storage Service Client pre-warmed successfully!")
-    except Exception as e:
-        logger.error(f"Failed to pre-warm R2 Storage client during startup: {e}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    # Crucial: Dispose of SQLAlchemy connection pool to prevent connection leaks on reload
-    from app.db.session import engine
-    await engine.dispose()
-    logger.info("Database connection pool disposed gracefully.")
 # reload trigger

@@ -7,6 +7,7 @@ from app.services.pdf_generator import generate_package_brochure_task, process_p
 from app.services.sms_service import dispatch_sms_payload
 from app.workers.daily_cutoff import perform_daily_cutoff
 from app.workers.missed_emails import recover_missed_emails
+from app.workers.inventory_cleanup import cleanup_expired_drafts
 
 logger = logging.getLogger(__name__)
 
@@ -19,22 +20,38 @@ REDIS_SETTINGS.conn_retry_delay = 2
 
 async def startup(ctx):
     logger.info("Worker starting up...")
-    # Initialize any required resources
-    pass
+
 
 async def shutdown(ctx):
     logger.info("Worker shutting down...")
+    # Close the ARQ pool gracefully to prevent Redis connection leaks on restart
+    global _pool
+    if _pool is not None:
+        try:
+            await _pool.aclose()
+        except Exception as e:
+            logger.warning(f"Error closing ARQ pool during shutdown: {e}")
+        finally:
+            _pool = None
+    # Dispose SQLAlchemy connection pool
     from app.db.session import engine
     await engine.dispose()
     logger.info("Database connection pool disposed gracefully.")
 
+
 class WorkerSettings:
     functions = [generate_package_brochure_task, process_post_booking_documents_task, dispatch_sms_payload]
     cron_jobs = [
+        # Close today's inventory slots at 6 AM IST (runs every minute, idempotent via Redis key)
         cron(perform_daily_cutoff, second=0, run_at_startup=True),
-        # Recover any emails that were missed while the worker was down.
+
+        # Recover any emails missed while the worker was down.
         # Runs immediately on startup and then every 15 minutes.
         cron(recover_missed_emails, minute={0, 15, 30, 45}, run_at_startup=True),
+
+        # Release inventory locked by expired/abandoned booking drafts.
+        # Runs every 5 minutes. Prevents seats being stuck as "reserved" forever.
+        cron(cleanup_expired_drafts, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, run_at_startup=False),
     ]
     redis_settings = REDIS_SETTINGS
     on_startup = startup
@@ -42,8 +59,10 @@ class WorkerSettings:
     max_jobs = 3   # Must not exceed the ARQ worker's DB pool ceiling (pool_size=2, max_overflow=1)
     max_tries = 3  # Retry up to 3 times if email sending fails
     job_timeout = 90   # 90 seconds to handle slow Brevo or DB responses
-    
+
+
 _pool = None
+
 
 # ARQ global pool to enqueue jobs from FastAPI
 async def get_arq_pool():

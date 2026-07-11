@@ -35,6 +35,11 @@ class EmailService:
             primary_key = settings.BREVO_API_KEY_ADMIN
             primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
             if primary_from and "@gmail.com" in primary_from:
+                logger.warning(
+                    f"BREVO_FROM_EMAIL_ADMIN is set to a Gmail address ({primary_from}), "
+                    f"which Brevo cannot use as a sender. Falling back to BREVO_FROM_EMAIL. "
+                    f"Fix: set BREVO_FROM_EMAIL_ADMIN to a verified domain address in Render."
+                )
                 primary_from = settings.BREVO_FROM_EMAIL
         else:
             primary_key = settings.BREVO_API_KEY_USER

@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     PHONEPE_CLIENT_ID: Optional[str] = None
     PHONEPE_SALT_KEY: Optional[str] = None
     PHONEPE_SALT_INDEX: int = 1
-    PHONEPE_ENV: str = "UAT"
+    PHONEPE_ENV: str = "PRODUCTION"
 
     
     # Brevo (Email Sending)
