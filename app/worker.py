@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.services.pdf_generator import generate_package_brochure_task, process_post_booking_documents_task
 from app.services.sms_service import dispatch_sms_payload
 from app.workers.daily_cutoff import perform_daily_cutoff
+from app.workers.missed_emails import recover_missed_emails
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,9 @@ class WorkerSettings:
     functions = [generate_package_brochure_task, process_post_booking_documents_task, dispatch_sms_payload]
     cron_jobs = [
         cron(perform_daily_cutoff, second=0, run_at_startup=True),
+        # Recover any emails that were missed while the worker was down.
+        # Runs immediately on startup and then every 15 minutes.
+        cron(recover_missed_emails, minute={0, 15, 30, 45}, run_at_startup=True),
     ]
     redis_settings = REDIS_SETTINGS
     on_startup = startup
