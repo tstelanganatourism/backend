@@ -58,7 +58,7 @@ class WorkerSettings:
     on_shutdown = shutdown
     max_jobs = 3   # Must not exceed the ARQ worker's DB pool ceiling (pool_size=2, max_overflow=1)
     max_tries = 3  # Retry up to 3 times if email sending fails
-    job_timeout = 90   # 90 seconds to handle slow Brevo or DB responses
+    job_timeout = 300   # 300 seconds to handle slow Brevo, DB, or Playwright PDF generation
 
 
 _pool = None

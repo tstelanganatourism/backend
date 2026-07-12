@@ -125,11 +125,29 @@ async def generate_package_brochure_task(ctx, package_id: int):
             clear_cache_prefix(f"packages:detail:{package.slug}")
             logger.info(f"Successfully generated and uploaded brochure for package {package.slug}")
             
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             logger.exception(f"Failed to generate brochure for package {package_id}: {e}")
-            package.brochure_generation_status = DocumentGenerationStatus.FAILED
-            await db.commit()
-            raise e # Raise to let ARQ handle retries if applicable
+            
+            async def set_failed():
+                try:
+                    async with AsyncSessionLocal() as fail_db:
+                        fail_package = await fail_db.get(Package, package_id)
+                        if fail_package:
+                            fail_package.brochure_generation_status = DocumentGenerationStatus.FAILED
+                            await fail_db.commit()
+                            logger.info(f"Successfully marked package {package_id} brochure status as FAILED")
+                except Exception as db_err:
+                    logger.error(f"Failed to set brochure status to FAILED in cleanup for package {package_id}: {db_err}")
+
+            # Run the database update in a separate task and shield it
+            # This ensures it runs to completion even if the current task is cancelled
+            cleanup_task = asyncio.create_task(set_failed())
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # Still raise the original CancelledError
+                pass
+            raise e
 
 async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None, is_postponement: bool = False):
     """
