@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     PROJECT_NAME: str = "TS Boat Tourism Booking API"
     CORS_ORIGINS: list[str] = ["https://tstelanganatourism.com", "https://www.tstelanganatourism.com"]
-    ALLOWED_HOSTS: list[str] = ["tstelanganatourism.com", "www.tstelanganatourism.com", "127.0.0.1", "localhost"]
+    ALLOWED_HOSTS: list[str] = ["*"]
     
     # Security
     SECRET_KEY: str
