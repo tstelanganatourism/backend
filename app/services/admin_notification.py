@@ -68,7 +68,7 @@ async def send_admin_booking_notification(
         except Exception:
             pass
 
-    admin_email = "tsboattourismservices@gmail.com"
+    admin_email = "tstelanganatourism@gmail.com"
     subject = f"🆕 New Booking — {booking.public_id}"
 
     pricing = booking.pricing_snapshot or {}
@@ -325,9 +325,7 @@ async def send_admin_booking_notification(
             p_methods = []
             for p in captured_p:
                 m = (p.payment_method or p.collected_by_type or "").upper()
-                if "CASHFREE" in m:
-                    p_methods.append("Cashfree")
-                elif "PHONEPE" in m or "RAZORPAY" in m:
+                if "PHONEPE" in m or "RAZORPAY" in m:
                     p_methods.append("PhonePe")
                 elif "CASH" in m:
                     p_methods.append("Agent Cash")
@@ -512,46 +510,46 @@ async def send_admin_booking_notification(
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>New Booking — {booking.public_id}</title>
 </head>
-<body style="margin:0;padding:0;background:#f0f4f8;font-family:Arial,Helvetica,sans-serif;">
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
 
 <table width="100%" cellpadding="0" cellspacing="0" border="0"
-       style="background:#f0f4f8;min-height:100vh;">
+       style="background:#f3f4f6;min-height:100vh;">
   <tr>
     <td align="center" style="padding:32px 16px;">
 
       <!-- CARD -->
       <table width="100%" cellpadding="0" cellspacing="0" border="0"
              style="max-width:620px;background:#ffffff;border-radius:16px;
-             overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,.10);">
+             overflow:hidden;box-shadow:0 10px 30px rgba(10, 35, 81, 0.05);border: 1px solid #e2e8f0;">
 
         <!-- ===== HEADER ===== -->
         <tr>
-          <td style="background:linear-gradient(135deg,#0f766e 0%,#0d5a5a 100%);
-              padding:28px 32px;">
-            <div style="font-size:11px;font-weight:700;color:#99f6e4;
+          <td style="background:linear-gradient(135deg,#0a2351 0%,#1a3a6b 100%);
+              padding:28px 32px;border-bottom: 4px solid #c8a45a;">
+            <div style="font-size:11px;font-weight:800;color:#c8a45a;
                 text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">
               TS Boat Tourism — Admin Notification
             </div>
             <div style="font-size:26px;font-weight:800;color:#ffffff;
-                line-height:1.2;margin-bottom:12px;">
+                line-height:1.2;margin-bottom:12px;font-family:'Outfit', Arial, sans-serif;">
               🆕 New Booking Received
             </div>
             <table cellpadding="0" cellspacing="0" border="0">
               <tr>
                 <td style="background:rgba(255,255,255,.15);border-radius:20px;
                     padding:5px 14px;margin-right:8px;">
-                  <span style="font-size:13px;font-weight:700;color:#fff;
+                  <span style="font-size:13px;font-weight:800;color:#fff;
                       letter-spacing:.5px;">{booking.public_id}</span>
                 </td>
                 <td style="width:8px;"></td>
                 <td style="background:{badge_bg};border-radius:20px;padding:5px 14px;">
-                  <span style="font-size:12px;font-weight:700;color:{badge_col};">
+                  <span style="font-size:12px;font-weight:800;color:{badge_col};">
                     {status_str}
                   </span>
                 </td>
                 <td style="width:8px;"></td>
                 <td style="background:{source_badge_bg};border-radius:20px;padding:5px 14px;">
-                  <span style="font-size:12px;font-weight:700;color:{source_badge_col};">
+                  <span style="font-size:12px;font-weight:800;color:{source_badge_col};">
                     {source_label}
                   </span>
                 </td>
@@ -563,12 +561,12 @@ async def send_admin_booking_notification(
         <!-- ===== CUSTOMER DETAILS ===== -->
         <tr>
           <td style="padding:24px 32px 0 32px;">
-            <div style="font-size:11px;font-weight:700;color:#94a3b8;
+            <div style="font-size:11px;font-weight:800;color:#0a2351;
                 text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
               Customer Details
             </div>
             <table width="100%" cellpadding="0" cellspacing="0" border="0"
-                   style="background:#f8fafc;border-radius:10px;padding:16px 20px;">
+                   style="background:#f8fafc;border-radius:10px;padding:16px 20px;border: 1px solid #e2e8f0;">
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;width:35%;">Name</td>
                 <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:700;">{primary_name}</td>
@@ -599,7 +597,7 @@ async def send_admin_booking_notification(
               </tr>
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Payment Gateway</td>
-                <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;color:#059669;">{pm_label}</td>
+                <td style="padding:5px 0;font-size:13px;color:#059669;font-weight:600;">{pm_label}</td>
               </tr>
             </table>
           </td>
@@ -608,7 +606,7 @@ async def send_admin_booking_notification(
         <!-- ===== PASSENGER ROSTER ===== -->
         <tr>
           <td style="padding:20px 32px 0 32px;">
-            <div style="font-size:11px;font-weight:700;color:#94a3b8;
+            <div style="font-size:11px;font-weight:800;color:#0a2351;
                 text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">
               Passenger Roster
             </div>
@@ -616,11 +614,11 @@ async def send_admin_booking_notification(
                    style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;">
               <thead>
                 <tr style="background:#f1f5f9;">
-                  <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
+                  <th style="padding:8px 12px;font-size:11px;font-weight:800;color:#0a2351;
                       text-align:left;text-transform:uppercase;letter-spacing:.5px;">Name</th>
-                  <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
+                  <th style="padding:8px 12px;font-size:11px;font-weight:800;color:#0a2351;
                       text-align:center;text-transform:uppercase;letter-spacing:.5px;">{age_or_class_header}</th>
-                  <th style="padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;
+                  <th style="padding:8px 12px;font-size:11px;font-weight:800;color:#0a2351;
                       text-align:center;text-transform:uppercase;letter-spacing:.5px;">Gender</th>
                 </tr>
               </thead>
@@ -634,12 +632,12 @@ async def send_admin_booking_notification(
         <!-- ===== FINANCIAL BREAKDOWN ===== -->
         <tr>
           <td style="padding:20px 32px 0 32px;">
-            <div style="font-size:11px;font-weight:700;color:#94a3b8;
+            <div style="font-size:11px;font-weight:800;color:#0a2351;
                 text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">
               Financial Breakdown
             </div>
             <table width="100%" cellpadding="0" cellspacing="0" border="0"
-                   style="background:#f8fafc;border-radius:10px;padding:16px 20px;">
+                   style="background:#f8fafc;border-radius:10px;padding:16px 20px;border: 1px solid #e2e8f0;">
               {fin_rows}
               {grand_total_row}
             </table>
@@ -655,7 +653,7 @@ async def send_admin_booking_notification(
         <!-- ===== DOCUMENT LINKS ===== -->
         <tr>
           <td style="padding:0 32px 24px 32px;">
-            <div style="font-size:11px;font-weight:700;color:#94a3b8;
+            <div style="font-size:11px;font-weight:800;color:#0a2351;
                 text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">
               Booking Documents
             </div>
@@ -669,9 +667,9 @@ async def send_admin_booking_notification(
         <tr>
           <td style="padding:0 32px 32px 32px;">
             <a href="{dashboard_url}" target="_blank"
-               style="display:block;background:#0f172a;color:#fff;text-decoration:none;
+               style="display:block;background:#0a2351;color:#fff;text-decoration:none;
                text-align:center;padding:14px 24px;border-radius:10px;font-size:14px;
-               font-weight:700;letter-spacing:.3px;">
+               font-weight:800;letter-spacing:.3px;box-shadow: 0 4px 12px rgba(10, 35, 81, 0.15);">
               🖥️ Open Admin Dashboard
             </a>
           </td>
@@ -681,8 +679,8 @@ async def send_admin_booking_notification(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e2e8f0;
               padding:16px 32px;text-align:center;">
-            <div style="font-size:11px;color:#94a3b8;line-height:1.6;">
-              Automated notification from <strong>TS Boat Tourism Platform</strong>.
+            <div style="font-size:11px;color:#94a3b8;line-height:1.6;font-weight:600;">
+              Automated notification from <strong>TS Boat Tourism Platform</strong>.<br>
               This email is intended for admin use only.
             </div>
           </td>
@@ -711,7 +709,7 @@ async def send_admin_booking_notification(
 
     success, error = await email_service.send_booking_email(
         recipient_email=admin_email,
-        recipient_name="TS Tours Admin",
+        recipient_name="TS Boat Tourism Admin",
         subject=subject,
         html_content=html_content,
         is_admin=True,

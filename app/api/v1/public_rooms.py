@@ -221,11 +221,7 @@ async def get_room_detail(
         else:
             starting_price = min((v.weekday_price for v in r_variants), default=None)
         
-        from app.services.r2_storage import r2_service
-        brochure_url, gen_brochure_url = await asyncio.gather(
-            r2_service.get_public_url(r.brochure_pdf_url or r.generated_brochure_url),
-            r2_service.get_public_url(r.generated_brochure_url)
-        )
+        active_brochure_url = r.brochure_pdf_url or r.generated_brochure_url
         
         return RoomDetailDTO(
             id=r.id,
@@ -238,8 +234,8 @@ async def get_room_detail(
             map_url=r.map_url,
             facilities=r.facilities if r.facilities else [],
             description=r.description,
-            brochure_pdf_url=brochure_url,
-            generated_brochure_url=gen_brochure_url,
+            brochure_pdf_url=active_brochure_url,
+            generated_brochure_url=r.generated_brochure_url,
             total_rooms=r.total_rooms,
             slot_start=r.slot_start,
             slot_end=r.slot_end,

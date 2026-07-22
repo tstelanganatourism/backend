@@ -10,7 +10,7 @@ class Booking(BaseModel):
     public_id = Column(String, unique=True, nullable=False, index=True)
     user_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     agent_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
-    source = Column(SQLEnum(BookingSource), default=BookingSource.PUBLIC, server_default="PUBLIC", nullable=False)
+    source = Column(SQLEnum(BookingSource), default=BookingSource.PUBLIC, server_default="USER", nullable=False)
     customer_email = Column(String, nullable=True)  # Tourist email for direct/agent bookings
 
     # Strict Mutually Exclusive Foreign Keys
@@ -30,6 +30,7 @@ class Booking(BaseModel):
     child_count = Column(Integer, default=0, server_default="0", nullable=False)
     student_count = Column(Integer, default=0, server_default="0", nullable=False)  # for student packages
     has_refreshment_addon = Column(Boolean, default=False, server_default="false", nullable=False)
+    has_food_addon = Column(Boolean, default=False, server_default="false", nullable=False)
 
     # Monetary Calculations (BR-08 / BR-09 / BR-10 / BR-11)
     subtotal_amount = Column(Numeric(12, 2), nullable=False)
@@ -57,6 +58,7 @@ class Booking(BaseModel):
 
     passengers = relationship("BookingPassenger", back_populates="booking", cascade="all, delete-orphan")
     stay_dates = relationship("BookingStayDate", back_populates="booking", cascade="all, delete-orphan")
+
     payments = relationship("Payment", back_populates="booking", cascade="all, delete-orphan")
     cancellation_requests = relationship("CancellationRequest", back_populates="booking", cascade="all, delete-orphan")
     postpone_requests = relationship("PostponeRequest", back_populates="booking", cascade="all, delete-orphan")
@@ -65,6 +67,18 @@ class Booking(BaseModel):
     package_variant = relationship("PackageVariant", foreign_keys=[variant_id])
     room_variant = relationship("RoomVariant", foreign_keys=[room_variant_id])
 
+def generate_pnr_prefix(title: str) -> str:
+    if not title:
+        return "BKG"
+    import re
+    clean_title = re.sub(r'[^a-zA-Z\s]', '', title)
+    words = [w for w in clean_title.split() if w.lower() not in ['to', 'and', 'for', 'with', 'the', 'a', 'an']]
+    if len(words) >= 3:
+        return "".join(w[0] for w in words[:3]).upper()
+    elif len(words) == 2:
+        return (words[0][0] + words[1][:2]).upper()
+    else:
+        return title[:3].upper()
 class BookingStayDate(BaseModel):
     __tablename__ = "booking_stay_dates"
 
@@ -133,13 +147,14 @@ class PostponeRequest(BaseModel):
 class BookingDraft(BaseModel):
     """
     Temporary hold for checkouts. Converted to Booking only on payment webhook success.
-    Works for both PhonePe and Cashfree gateways.
+    Temporary hold for checkouts. Converted to Booking only on payment webhook success.
+    Works for PhonePe gateway.
     """
     __tablename__ = "booking_drafts"
 
     draft_id = Column(String, unique=True, nullable=False, index=True)
-    pg_transaction_id = Column(String, unique=True, nullable=True, index=True)  # PhonePe: merchant_txn_id | Cashfree: order_id
-    payment_gateway = Column(String(20), nullable=True, server_default="PHONEPE")  # PHONEPE | CASHFREE
+    pg_transaction_id = Column(String, unique=True, nullable=True, index=True)  # PhonePe: merchant_txn_id
+    payment_gateway = Column(String(20), nullable=True, server_default="PHONEPE")  # PHONEPE
 
     user_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)
     agent_id = Column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, index=True)

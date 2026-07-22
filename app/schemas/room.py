@@ -3,7 +3,7 @@ from pydantic import Field
 from decimal import Decimal
 from datetime import time
 from app.schemas.base import AppBaseModel, TimestampSchema
-from app.models.enums import PolicyType, PublishStatus
+from app.models.enums import PolicyType, PublishStatus, AdvancePaymentType
 
 class RoomBookingSlotSchema(AppBaseModel):
     title: str
@@ -99,6 +99,9 @@ class RoomBase(AppBaseModel):
     is_featured: bool = False
     is_active: bool = True
     status: PublishStatus = PublishStatus.DRAFT
+    
+    advance_payment_type: Optional[AdvancePaymentType] = AdvancePaymentType.FULL_PAYMENT
+    advance_payment_value: Optional[Decimal] = Decimal("0.00")
 
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None

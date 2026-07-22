@@ -9,8 +9,43 @@ from playwright.async_api import async_playwright
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.core.config import settings
-from app.services.r2_storage import r2_service
 from app.db.session import AsyncSessionLocal
+import cloudinary
+import cloudinary.uploader
+
+# Cloudinary configuration is initialized globally when app loads, but we ensure it is ready
+if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
+    cloudinary.config(
+        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+        api_key=settings.CLOUDINARY_API_KEY,
+        api_secret=settings.CLOUDINARY_API_SECRET,
+        secure=True
+    )
+
+def sync_cloudinary_upload(pdf_bytes: bytes, filename: str) -> str:
+    res = cloudinary.uploader.upload(
+        pdf_bytes,
+        folder="ts_tours/brochures",
+        resource_type="raw",
+        public_id=filename
+    )
+    return res.get("secure_url")
+
+def sync_cloudinary_delete(url: str):
+    if not url:
+        return
+    try:
+        parts = url.split("/upload/")
+        if len(parts) > 1:
+            path_parts = parts[1].split("/")
+            if path_parts[0].startswith("v") and path_parts[0][1:].isdigit():
+                public_id = "/".join(path_parts[1:])
+            else:
+                public_id = "/".join(path_parts)
+            # For raw file resource types, the extension is part of public_id
+            cloudinary.uploader.destroy(public_id, resource_type="raw")
+    except Exception as e:
+        logger.error(f"Failed to delete Cloudinary PDF: {url}. Error: {e}")
 from app.models.package import Package
 from app.models.room import Room
 from app.models.enums import DocumentGenerationStatus
@@ -33,7 +68,8 @@ async def generate_pdf_from_url(url: str) -> bytes:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         try:
-            page = await browser.new_page()
+            context = await browser.new_context(ignore_https_errors=True)
+            page = await context.new_page()
             logger.info(f"Navigating to {url} for brochure PDF generation")
             response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
@@ -41,7 +77,7 @@ async def generate_pdf_from_url(url: str) -> bytes:
                 status = response.status if response else "no response"
                 raise Exception(f"Failed to load PDF page {url}: HTTP {status}")
 
-            await page.wait_for_selector(".page", timeout=15000)
+            await page.wait_for_selector(".brochure-container", timeout=15000)
             await page.emulate_media(media="print")
 
             try:
@@ -103,22 +139,24 @@ async def generate_package_brochure_task(ctx, package_id: int):
             package.brochure_generation_status = DocumentGenerationStatus.GENERATING
             await db.commit()
             
-            # 2. Generate PDF using a separate thread with its own ProactorEventLoop on Windows
-            frontend_url = settings.FRONTEND_URL.rstrip('/')
+            if settings.ENVIRONMENT == "development":
+                frontend_url = "https://localhost:3000"
+            else:
+                frontend_url = settings.FRONTEND_URL.rstrip('/')
             print_url = f"{frontend_url}/print/package/{package.slug}"
             pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
             
-            # 3. Upload to R2
+            # 3. Upload to Cloudinary
             version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            object_name = f"private/brochures/generated/package_{package.slug}_{version}.pdf"
-            await r2_service.upload_file(pdf_bytes, object_name, content_type="application/pdf")
+            filename = f"package_{package.slug}_{version}"
+            cloudinary_url = await asyncio.to_thread(sync_cloudinary_upload, pdf_bytes, filename)
             
             # 4. Clean up old generated brochure if exists and different
-            if package.generated_brochure_url and package.generated_brochure_url != object_name:
-                await r2_service.delete_file(package.generated_brochure_url)
+            if package.generated_brochure_url and package.generated_brochure_url != cloudinary_url:
+                await asyncio.to_thread(sync_cloudinary_delete, package.generated_brochure_url)
                 
             # 5. Update DB
-            package.generated_brochure_url = object_name
+            package.generated_brochure_url = cloudinary_url
             package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
             await db.commit()
             clear_cache_prefix("packages:list:")
@@ -256,7 +294,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         # Build premium, email-client-safe HTML content.
         office_phone = "+91 95420 69573"
         office_address = "DR NO:4-1-78/1, KALYANA MANDAPAM ROAD OPP SBI ATM, BHADRACHALAM, BHADRADRI KOTHAGUDEM (DIST), TELANGANA-507111"
-        office_maps_url = "https://maps.app.goo.gl/ZZynQYDrgaDAipDz6?g_st=awb"
+        office_maps_url = "https://maps.app.goo.gl/b9ZvxUvvFq6FgKVU8"
         # Recipient name is handled per-recipient in _generate_html
         safe_booking_id = escape(booking.public_id)
         safe_ticket_url = escape(ticket_url, quote=True)
@@ -269,11 +307,38 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         target_name = "—"
         try:
             if is_room_booking:
-                from app.models.room import RoomVariant, Room
+                from app.models.room import RoomVariant, Room, RoomSlotInventory
+                slot_start = None
+                slot_end = None
+                if booking.pricing_snapshot:
+                    slot_start = booking.pricing_snapshot.get("slot_start")
+                    slot_end = booking.pricing_snapshot.get("slot_end")
+                
+                inv_stmt = select(RoomSlotInventory).where(
+                    RoomSlotInventory.room_variant_id == booking.room_variant_id,
+                    RoomSlotInventory.date == booking.travel_date
+                )
+                if slot_start and slot_end:
+                    from datetime import datetime
+                    try:
+                        s_time = datetime.strptime(slot_start, "%H:%M:%S").time()
+                        e_time = datetime.strptime(slot_end, "%H:%M:%S").time()
+                        inv_stmt = inv_stmt.where(
+                            RoomSlotInventory.slot_start == s_time,
+                            RoomSlotInventory.slot_end == e_time
+                        )
+                    except Exception:
+                        pass
+                inv_res = await db.execute(inv_stmt)
+                inv_row = inv_res.scalars().first()
+                
                 res = await db.execute(select(Room.lodge_name, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
                 room_data = res.first()
-                if room_data:
-                    target_name = f"{room_data[0]} ({room_data[1]})"
+                if inv_row and inv_row.hotel_name:
+                    target_name = f"{inv_row.hotel_name} — {room_data[0]} ({room_data[1]})" if room_data else inv_row.hotel_name
+                else:
+                    if room_data:
+                        target_name = f"{room_data[0]} ({room_data[1]})"
             else:
                 from app.models.package import PackageVariant, Package
                 res = await db.execute(select(Package.title).join(PackageVariant).where(PackageVariant.id == booking.variant_id))
@@ -286,7 +351,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         safe_target_label = "Booked Room" if is_room_booking else "Booked Package"
 
         if is_room_booking:
-            preview_text = "Your TS Tours booking documents are ready. Download your ticket before the link expires."
+            preview_text = "Your TS Boat Tourism booking documents are ready. Download your ticket before the link expires."
             next_steps_section = """
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
                                         <tr>
@@ -325,7 +390,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                     </table>
             """.strip()
         else:
-            preview_text = "Your TS Tours booking documents are ready. Download your ticket and passenger form before the links expire."
+            preview_text = "Your TS Boat Tourism booking documents are ready. Download your ticket and passenger form before the links expire."
             next_steps_section = """
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
                                         <tr>
@@ -383,57 +448,58 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 body, table, td, a {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
                 table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
                 img {{ -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }}
+                body {{ margin: 0; padding: 0; background-color: #f3f4f6; }}
                 @media only screen and (max-width: 620px) {{
                     .email-shell {{ width: 100% !important; }}
                     .mobile-pad {{ padding-left: 20px !important; padding-right: 20px !important; }}
                     .stack-column {{ display: block !important; width: 100% !important; max-width: 100% !important; }}
                     .stack-spacer {{ height: 12px !important; line-height: 12px !important; }}
                     .mobile-center {{ text-align: center !important; }}
-                    .logo-img {{ width: 74px !important; height: 74px !important; }}
-                    .brand-title {{ font-size: 24px !important; line-height: 30px !important; }}
+                    .logo-img {{ width: 64px !important; height: 64px !important; }}
+                    .brand-title {{ font-size: 22px !important; line-height: 28px !important; }}
                 }}
             </style>
         </head>
-        <body style="margin:0; padding:0; background-color:#eef3f6;">
+        <body style="margin:0; padding:0; background-color:#f3f4f6; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif;">
             <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
                 {preview_text}
             </div>
-            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#eef3f6; margin:0; padding:0;">
+            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#f3f4f6; margin:0; padding:0;">
                 <tr>
-                    <td align="center" style="padding:28px 12px;">
-                        <table role="presentation" class="email-shell" width="640" border="0" cellpadding="0" cellspacing="0" style="width:640px; max-width:640px; background-color:#ffffff; border:1px solid #dbe6ea; border-radius:18px; overflow:hidden;">
+                    <td align="center" style="padding:40px 12px;">
+                        <table role="presentation" class="email-shell" width="600" border="0" cellpadding="0" cellspacing="0" style="width:600px; max-width:600px; background-color:#ffffff; border:1px solid #e2e8f0; border-radius:24px; overflow:hidden; box-shadow: 0 10px 30px rgba(10, 35, 81, 0.05);">
+                            <!-- Header -->
                             <tr>
-                                <td align="center" class="mobile-pad" style="background-color:#075b60; padding:30px 34px 26px 34px;">
-                                    <table role="presentation" width="190" border="0" cellpadding="0" cellspacing="0" style="width:190px; margin:0 auto 16px auto;">
+                                <td align="center" class="mobile-pad" style="background-color:#0a2351; padding:36px 40px 36px 40px; border-bottom: 4px solid #c8a45a;">
+                                    <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                         <tr>
-                                            <td align="center" width="95" style="padding:0 7px;">
-                                                <img class="logo-img" src="{logo1_url}" width="82" height="82" alt="APTDC" style="display:block; width:82px; height:82px; border-radius:41px;">
-                                            </td>
-                                            <td align="center" width="95" style="padding:0 7px;">
-                                                <img class="logo-img" src="{logo2_url}" width="82" height="82" alt="Telangana Tourism" style="display:block; width:82px; height:82px; border-radius:41px;">
+                                            <td align="center">
+                                                <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #c8a45a; background-color:#ffffff; object-fit:cover;">
                                             </td>
                                         </tr>
                                     </table>
-                                    <div class="brand-title" style="font-family:Arial, Helvetica, sans-serif; color:#ffffff; font-size:28px; line-height:34px; font-weight:800; letter-spacing:0; margin:4px 0 6px 0;">TS Boating &amp; Tourism</div>
-                                    <div style="font-family:Arial, Helvetica, sans-serif; color:#d6f4ef; font-size:14px; line-height:20px; font-weight:700;">Booking documents ready</div>
+                                    <div class="brand-title" style="color:#ffffff; font-size:26px; line-height:32px; font-weight:800; letter-spacing:-0.5px; margin:0 0 4px 0; font-family:'Outfit', Arial, sans-serif;">TS Boat Tourism</div>
+                                    <div style="color:#c8a45a; font-size:12px; line-height:16px; font-weight:800; letter-spacing:1.5px; text-transform:uppercase;">Official Booking Platform</div>
                                 </td>
                             </tr>
+                            <!-- Body Content -->
                             <tr>
-                                <td class="mobile-pad" style="padding:36px 42px 24px 42px; font-family:Arial, Helvetica, sans-serif; color:#14313a;">
-                                    <p style="margin:0 0 16px 0; color:#102f3a; font-size:22px; line-height:29px; font-weight:800;">Hello {recipient_name},</p>
-                                    <p style="margin:0 0 24px 0; color:#415865; font-size:15px; line-height:24px;">{message_body}</p>
+                                <td class="mobile-pad" style="padding:40px 48px 32px 48px; color:#1e293b;">
+                                    <p style="margin:0 0 16px 0; color:#0a2351; font-size:22px; line-height:28px; font-weight:800; letter-spacing:-0.5px;">Hello {recipient_name},</p>
+                                    <p style="margin:0 0 24px 0; color:#475569; font-size:15px; line-height:24px; font-weight:500;">{message_body}</p>
 
-                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border:1px solid #dbe6ea; border-radius:14px; background-color:#f8fbfc;">
+                                    <!-- Summary Table -->
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0; border-radius:16px; background-color:#f8fafc; margin-bottom:24px; overflow:hidden;">
                                         <tr>
-                                            <td style="padding:18px 20px; border-bottom:1px solid #dbe6ea;">
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">Booking reference</div>
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#075b60; font-size:20px; line-height:28px; font-weight:800;">{booking_id}</div>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0; background: #fafafb;">
+                                                <div style="color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">Booking reference</div>
+                                                <div style="color:#0a2351; font-size:18px; line-height:24px; font-weight:800; font-family:Courier, monospace;">{booking_id}</div>
                                             </td>
                                         </tr>
                                         <tr>
-                                            <td style="padding:18px 20px; border-bottom:1px solid #dbe6ea;">
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase;">{safe_target_label}</div>
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:16px; line-height:24px; font-weight:700;">{safe_target_name}</div>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0;">
+                                                <div style="color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">{safe_target_label}</div>
+                                                <div style="color:#0a2351; font-size:15px; line-height:20px; font-weight:800;">{safe_target_name}</div>
                                             </td>
                                         </tr>
                                         {financial_details}
@@ -446,16 +512,18 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                     {mandatory_notice_section}
                                 </td>
                             </tr>
+                            <!-- Footer Support & Map -->
                             <tr>
-                                <td align="center" class="mobile-pad" style="background-color:#f7fafb; border-top:1px solid #dbe6ea; padding:24px 34px 28px 34px; font-family:Arial, Helvetica, sans-serif;">
-                                    <div style="color:#102f3a; font-size:15px; line-height:22px; font-weight:800; margin-bottom:7px;">Thank you for choosing TS Boating &amp; Tourism.</div>
-                                    <div style="color:#526a76; font-size:13px; line-height:20px; margin-bottom:14px;">For booking support, call <a href="tel:{office_phone_tel}" style="color:#075b60; font-weight:800; text-decoration:none;">{office_phone}</a></div>
-                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border:1px solid #dbe6ea; border-radius:12px;">
+                                <td align="center" class="mobile-pad" style="background-color:#0a2351; border-top:2px solid #c8a45a; padding:32px 40px; color:#cbd5e1; font-size:12px; line-height:18px;">
+                                    <div style="color:#ffffff; font-size:15px; line-height:22px; font-weight:800; margin-bottom:6px;">Thank you for choosing TS Boat Tourism.</div>
+                                    <div style="margin-bottom:20px; font-weight:700;">For booking support, call <a href="tel:{office_phone_tel}" style="color:#c8a45a; font-weight:800; text-decoration:none;">{office_phone}</a></div>
+                                    
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#1e293b; border:1px solid #334155; border-radius:16px;">
                                         <tr>
-                                            <td align="left" style="padding:15px 16px; font-family:Arial, Helvetica, sans-serif;">
-                                                <div style="color:#102f3a; font-size:13px; line-height:19px; font-weight:800; margin-bottom:5px;">Manual ticket collection office</div>
-                                                <div style="color:#526a76; font-size:12px; line-height:18px; margin-bottom:12px;">{office_address}</div>
-                                                <a href="{office_maps_url}" target="_blank" style="display:inline-block; background-color:#075b60; border-radius:8px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:18px; font-weight:800; padding:9px 13px; text-decoration:none;">Open Google Maps</a>
+                                            <td align="left" style="padding:20px 20px;">
+                                                <div style="color:#ffffff; font-size:13px; line-height:18px; font-weight:800; margin-bottom:4px; text-transform:uppercase; letter-spacing:0.5px; color:#c8a45a;">Manual ticket collection office</div>
+                                                <div style="color:#cbd5e1; font-size:12px; line-height:18px; margin-bottom:16px; font-weight:500;">{office_address}</div>
+                                                <a href="{office_maps_url}" target="_blank" style="display:inline-block; background-color:#1a6b7a; border-radius:10px; color:#ffffff; font-size:12px; line-height:18px; font-weight:800; padding:10px 16px; text-decoration:none; border: 1px solid #1a6b7a;">Open Google Maps</a>
                                             </td>
                                         </tr>
                                     </table>
@@ -493,7 +561,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
 
         if is_postponement:
             email_type = "POSTPONEMENT"
-            subject = "Booking Rescheduled - TS Tours"
+            subject = "Booking Rescheduled - TS Boat Tourism"
             message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> has been successfully rescheduled to {booking.travel_date.isoformat()}. Your updated official ticket is ready below."
             financial_details = f"""
                         <tr>
@@ -505,7 +573,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             """.rstrip()
         elif is_fully_paid:
             email_type = "FULL_PAYMENT"
-            subject = "Booking Confirmed - TS Tours"
+            subject = "Booking Confirmed - TS Boat Tourism"
             if is_room_booking:
                 message_body = f"Your booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong> is confirmed and fully paid. Your official ticket is ready below."
             else:
@@ -521,7 +589,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             """.rstrip()
         else:
             email_type = "PARTIAL_PAYMENT"
-            subject = "Booking Payment Received - TS Tours"
+            subject = "Booking Payment Received - TS Boat Tourism"
             if is_room_booking:
                 message_body = f"We received your payment for booking <strong style=\"color:#075b60;\">{safe_booking_id}</strong>. Please clear the remaining balance before your journey and keep the ticket below ready."
             else:

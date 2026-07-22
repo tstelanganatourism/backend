@@ -31,6 +31,10 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     packages_count, rooms_count, bookings_count, users_count = result.one()
 
     # Get recent bookings
+    from app.models.package import Package, PackageVariant
+    from app.models.room import Room, RoomVariant
+    from sqlalchemy.orm import selectinload
+    
     recent_result = await db.execute(
         select(Booking)
         .where(Booking.deleted_at.is_(None))
@@ -38,11 +42,31 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         .limit(5)
     )
     recent_bookings = []
+    
     for b in recent_result.scalars().all():
+        booking_title = None
+        if b.variant_id:
+            pkg_res = await db.execute(
+                select(Package.title)
+                .join(PackageVariant, PackageVariant.package_id == Package.id)
+                .where(PackageVariant.id == b.variant_id)
+            )
+            booking_title = pkg_res.scalar_one_or_none()
+        elif b.room_variant_id:
+            rm_res = await db.execute(
+                select(Room.title)
+                .join(RoomVariant, RoomVariant.room_id == Room.id)
+                .where(RoomVariant.id == b.room_variant_id)
+            )
+            booking_title = rm_res.scalar_one_or_none()
+            
+        if not booking_title:
+            booking_title = "Package Booking" if b.variant_id else ("Room Booking" if b.room_variant_id else "Booking")
+            
         recent_bookings.append({
             "id": b.id,
             "public_id": b.public_id,
-            "title": "Package Booking" if b.variant_id else ("Room Booking" if b.room_variant_id else "Booking"),
+            "title": booking_title,
             "amount": float(b.total_amount),
             "status": b.status.value if hasattr(b.status, "value") else str(b.status),
             "created_at": b.created_at.isoformat() if b.created_at else None

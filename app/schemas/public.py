@@ -126,6 +126,27 @@ class TransportOptionPublicDTO(AppBaseModel):
     fixed_price: Optional[Decimal] = None
     weekend_fixed_price: Optional[Decimal] = None
 
+class PackageMealItemPublicDTO(AppBaseModel):
+    id: int
+    meal_type: str
+    name: str
+    serving_time: Optional[str] = None
+    description: Optional[str] = None
+    cost_per_person: Decimal = Decimal("0.00")
+    is_vegetarian: bool = True
+    day_number: Optional[int] = None
+    sort_order: int
+
+class PackageExtraPublicDTO(AppBaseModel):
+    id: int
+    title: str
+    description: Optional[str] = None
+    adult_price: Optional[Decimal] = None
+    child_price: Optional[Decimal] = None
+    student_price: Optional[Decimal] = None
+    min_passengers: int = 1
+    sort_order: int
+
 class PackageDetailDTO(PackageListDTO, SEOSchema):
     description: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
@@ -136,6 +157,11 @@ class PackageDetailDTO(PackageListDTO, SEOSchema):
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
     refreshment_student_price: Optional[Decimal] = None
+    refreshments_min_passengers: int = 1
+    has_food_option: bool = False
+    food_adult_price: Optional[Decimal] = None
+    food_child_price: Optional[Decimal] = None
+    food_student_price: Optional[Decimal] = None
     variants: List[PackageVariantPublicDTO] = Field(default_factory=list)
     gallery: List[GalleryImageDTO] = Field(default_factory=list)
     itinerary: List[PackageItineraryDayDTO] = Field(default_factory=list)
@@ -145,6 +171,8 @@ class PackageDetailDTO(PackageListDTO, SEOSchema):
     boarding_points: List[PackageBoardingPointDTO] = Field(default_factory=list)
     faqs: List[FAQDTO] = Field(default_factory=list)
     policies: List[PolicyDTO] = Field(default_factory=list)
+    meals: List[PackageMealItemPublicDTO] = Field(default_factory=list)
+    extras: List[PackageExtraPublicDTO] = Field(default_factory=list)
 
 class RoomVariantPublicDTO(AppBaseModel):
     id: int

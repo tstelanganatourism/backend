@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict
 import re
 
 from sqlalchemy.orm import selectinload
+from app.models.enums import AdvancePaymentType
 
 router = APIRouter(
     prefix="/rooms",
@@ -76,6 +77,9 @@ class RoomUpdate(BaseModel):
     is_featured: Optional[bool] = None
     is_active: Optional[bool] = None
     status: Optional[str] = None
+    
+    advance_payment_type: Optional[AdvancePaymentType] = None
+    advance_payment_value: Optional[float] = None
     
     meta_title: Optional[str] = None
     meta_description: Optional[str] = None
@@ -146,6 +150,15 @@ async def list_rooms(
         "size": limit
     }
 
+def full_room_options():
+    return (
+        selectinload(Room.variants),
+        selectinload(Room.gallery),
+        selectinload(Room.highlights),
+        selectinload(Room.faqs),
+        selectinload(Room.policies)
+    )
+
 @router.get("/{room_id}", response_model=RoomDetailResponse)
 async def get_room(
     room_id: int,
@@ -155,13 +168,7 @@ async def get_room(
     query = (
         select(Room)
         .where(Room.id == room_id, Room.deleted_at.is_(None))
-        .options(
-            selectinload(Room.variants),
-            selectinload(Room.gallery),
-            selectinload(Room.highlights),
-            selectinload(Room.faqs),
-            selectinload(Room.policies)
-        )
+        .options(*full_room_options())
     )
     result = await db.execute(query)
     room = result.scalar_one_or_none()
@@ -214,8 +221,8 @@ async def create_room(
     db.add(room)
     await db.commit()
 
-    # Reload room scalar attributes
-    query = select(Room).where(Room.id == room.id)
+    # Reload room with all options
+    query = select(Room).where(Room.id == room.id).options(*full_room_options())
     result = await db.execute(query)
     room = result.scalar_one()
     
@@ -246,13 +253,7 @@ async def update_room(
     query = (
         select(Room)
         .where(Room.id == room_id, Room.deleted_at.is_(None))
-        .options(
-            selectinload(Room.variants),
-            selectinload(Room.gallery),
-            selectinload(Room.highlights),
-            selectinload(Room.faqs),
-            selectinload(Room.policies)
-        )
+        .options(*full_room_options())
     )
     result = await db.execute(query)
     room = result.scalar_one_or_none()
@@ -336,8 +337,8 @@ async def update_room(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=[f"room-{room.id}"])
     
-    # Reload room scalar attributes to refresh expired fields like updated_at
-    refresh_query = select(Room).where(Room.id == room.id)
+    # Reload room with all options to prevent expired attributes during Pydantic serialization
+    refresh_query = select(Room).where(Room.id == room.id).options(*full_room_options())
     refresh_result = await db.execute(refresh_query)
     room = refresh_result.scalar_one()
     

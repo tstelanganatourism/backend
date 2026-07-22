@@ -82,6 +82,17 @@ class PolicyType(str, enum.Enum):
     SMOKING = 'SMOKING'
     OTHER = 'OTHER'
 
+class AdvancePaymentType(str, enum.Enum):
+    PERCENTAGE = 'PERCENTAGE'
+    FIXED_AMOUNT = 'FIXED_AMOUNT'
+    FULL_PAYMENT = 'FULL_PAYMENT'
+
+class MealType(str, enum.Enum):
+    BREAKFAST = 'BREAKFAST'
+    LUNCH = 'LUNCH'
+    DINNER = 'DINNER'
+    SNACKS = 'SNACKS'
+
 # ─── Promotion Enums (Phase-3) ────────────────────────────────────────────────
 
 class PromotionType(str, enum.Enum):

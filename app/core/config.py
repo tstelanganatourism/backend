@@ -9,9 +9,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
-    PROJECT_NAME: str = "Papikondalu Tourism Booking API"
-    CORS_ORIGINS: list[str] = ["https://tsboattourism.org", "https://www.tsboattourism.org"]
-    ALLOWED_HOSTS: list[str] = ["tsboattourism.org", "www.tsboattourism.org", "127.0.0.1", "localhost"]
+    PROJECT_NAME: str = "TS Boat Tourism Booking API"
+    CORS_ORIGINS: list[str] = ["https://tstelanganatourism.com", "https://www.tstelanganatourism.com"]
+    ALLOWED_HOSTS: list[str] = ["tstelanganatourism.com", "www.tstelanganatourism.com", "127.0.0.1", "localhost"]
     
     # Security
     SECRET_KEY: str
@@ -37,20 +37,11 @@ class Settings(BaseSettings):
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
 
-    # Cloudflare R2
-    R2_ACCOUNT_ID: Optional[str] = None
-    R2_ACCESS_KEY_ID: Optional[str] = None
-    R2_SECRET_ACCESS_KEY: Optional[str] = None
-    R2_BUCKET_NAME: Optional[str] = None
-    
-    # Cashfree
-    CASHFREE_APP_ID: Optional[str] = None
-    CASHFREE_SECRET_KEY: Optional[str] = None
-    CASHFREE_ENV: str = "PRODUCTION"  # PRODUCTION or TEST
-    
     # PhonePe
     PHONEPE_MERCHANT_ID: Optional[str] = None
     PHONEPE_CLIENT_ID: Optional[str] = None
+    PHONEPE_CLIENT_SECRET: Optional[str] = None
+    PHONEPE_CLIENT_VERSION: str = "1"
     PHONEPE_SALT_KEY: Optional[str] = None
     PHONEPE_SALT_INDEX: int = 1
     PHONEPE_ENV: str = "PRODUCTION"
@@ -61,7 +52,7 @@ class Settings(BaseSettings):
     BREVO_API_KEY_USER: Optional[str] = None
     BREVO_API_KEY_ADMIN: Optional[str] = None
     BREVO_API_KEY_BACKUP: Optional[str] = None
-    BREVO_FROM_EMAIL: str = "bookings@tsboattourism.org"
+    BREVO_FROM_EMAIL: str = "bookings@tstelanganatourism.com"
     BREVO_FROM_EMAIL_USER: Optional[str] = None
     BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
     BREVO_FROM_EMAIL_BACKUP: Optional[str] = None

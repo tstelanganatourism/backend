@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Numeric, Integer, Time, Boolean, ForeignKey, UniqueConstraint, Computed, Date, CheckConstraint, Enum as SQLEnum, Index, Table, BigInteger
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel, SortableMixin, SEOMixin
-from app.models.enums import PolicyType, PublishStatus, DocumentGenerationStatus
+from app.models.enums import PolicyType, PublishStatus, DocumentGenerationStatus, AdvancePaymentType
 from sqlalchemy.dialects.postgresql import JSONB
 
 # Association table for Room -> Tags
@@ -26,6 +26,10 @@ class Room(BaseModel, SEOMixin):
     facilities = Column(JSONB, nullable=True) # Array of strings
     starting_price = Column(Numeric(12, 2), nullable=False, server_default="0.00", index=True)
     starting_weekend_price = Column(Numeric(12, 2), nullable=True)
+    
+    advance_payment_type = Column(SQLEnum(AdvancePaymentType), default=AdvancePaymentType.FULL_PAYMENT, server_default="FULL_PAYMENT", nullable=False)
+    advance_payment_value = Column(Numeric(12, 2), default=0.00, server_default="0.00", nullable=False)
+    
     cover_image_url = Column(String, nullable=True)
     brochure_pdf_url = Column(String, nullable=True)
     generated_brochure_url = Column(String, nullable=True)
@@ -130,6 +134,12 @@ class RoomSlotInventory(BaseModel):
     booked_rooms = Column(Integer, default=0, server_default="0", nullable=False)
     reserved_rooms = Column(Integer, default=0, server_default="0", nullable=False)
     is_closed = Column(Boolean, default=False, server_default="false", nullable=False)
+    
+    hotel_name = Column(String, nullable=True)
+    hotel_address = Column(String, nullable=True)
+    hotel_map_url = Column(String, nullable=True)
+    weekday_price = Column(Numeric(10, 2), nullable=True)
+    weekend_price = Column(Numeric(10, 2), nullable=True)
     
     # In PostgreSQL we can use Computed. In SQLAlchemy we define it like this:
     available_rooms = Column(Integer, Computed('total_rooms - booked_rooms - reserved_rooms', persisted=True))

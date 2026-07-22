@@ -46,6 +46,16 @@ trigger_brochure.py
 update_package_4_duration.py
 scratch/
 print_*.py
+alter_bookings_table.py
+create_extra_table.py
+list_bookings.py
+reset_and_create_db.py
+scan_ports.py
+seed_admin.py
+seed_first_booking_in_env_db.py
+send_notifications_for_latest_booking.py
+update_bogatha_image.py
+upload_logo.py
 
 # Tests
 tests/

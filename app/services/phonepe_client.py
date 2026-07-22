@@ -10,11 +10,11 @@ class PhonePeService:
     def __init__(self):
         self.merchant_id = settings.PHONEPE_MERCHANT_ID
         self.client_id = settings.PHONEPE_CLIENT_ID
-        self.client_secret = settings.PHONEPE_SALT_KEY
-        self.client_version = str(settings.PHONEPE_SALT_INDEX or 1)
-        self.env = settings.PHONEPE_ENV or "UAT"
+        self.client_secret = settings.PHONEPE_CLIENT_SECRET
+        self.client_version = str(settings.PHONEPE_CLIENT_VERSION or "1")
+        self.env = settings.PHONEPE_ENV or "SANDBOX"
 
-        if self.env.upper() == "PROD":
+        if self.env.upper() in ("PROD", "PRODUCTION"):
             self.base_url = "https://api.phonepe.com/apis/pg"
             self.oauth_url = "https://api.phonepe.com/apis/identity-manager/v1/oauth/token"
         else:

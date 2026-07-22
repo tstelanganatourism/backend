@@ -35,7 +35,7 @@ TEMPLATES = {
     "TSBOAT_TRAVEL_REMINDER":      settings.MSG91_TRAVEL_REMINDER_TEMPLATE_ID,
 }
 
-SITE_BASE = "https://tsboattourism.org"
+SITE_BASE = "https://tstelanganatourism.com"
 
 
 def get_short_package_name(package_title: str) -> str:

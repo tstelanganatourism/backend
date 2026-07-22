@@ -14,7 +14,9 @@ from app.models.package import (
     PackageBoardingPoint,
     PackageFAQ,
     PackagePolicy,
-    PackageTransportOption
+    PackageTransportOption,
+    PackageMealItem,
+    PackageExtra
 )
 from app.schemas.package import PackageCreate, PackageUpdate, PackageDetailResponse, PackageResponse, PackagePaginatedResponse
 from app.middleware.auth import require_admin
@@ -94,6 +96,7 @@ async def list_packages(
     total_count = total_result.scalar_one()
 
     query = base_query.options(
+        selectinload(Package.tags),
         selectinload(Package.variants),
         selectinload(Package.transport_options)
     )
@@ -127,6 +130,23 @@ async def list_packages(
         "size": limit
     }
 
+def full_package_options():
+    return (
+        selectinload(Package.tags),
+        selectinload(Package.variants),
+        selectinload(Package.transport_options),
+        selectinload(Package.gallery),
+        selectinload(Package.itinerary),
+        selectinload(Package.highlights),
+        selectinload(Package.inclusions),
+        selectinload(Package.exclusions),
+        selectinload(Package.boarding_points),
+        selectinload(Package.faqs),
+        selectinload(Package.policies),
+        selectinload(Package.meals),
+        selectinload(Package.extras),
+    )
+
 @router.get("/{package_id}", response_model=PackageDetailResponse)
 async def get_package(
     package_id: int,
@@ -136,18 +156,7 @@ async def get_package(
     query = (
         select(Package)
         .where(Package.id == package_id, Package.deleted_at.is_(None))
-        .options(
-            selectinload(Package.variants),
-            selectinload(Package.transport_options),
-            selectinload(Package.gallery),
-            selectinload(Package.itinerary),
-            selectinload(Package.highlights),
-            selectinload(Package.inclusions),
-            selectinload(Package.exclusions),
-            selectinload(Package.boarding_points),
-            selectinload(Package.faqs),
-            selectinload(Package.policies)
-        )
+        .options(*full_package_options())
     )
     result = await db.execute(query)
     package = result.scalar_one_or_none()
@@ -176,7 +185,7 @@ async def create_package(
         
     package_data = body.model_dump(exclude={
         "variants", "transport_options", "gallery", "itinerary", "highlights", "inclusions", 
-        "exclusions", "boarding_points", "faqs", "policies"
+        "exclusions", "boarding_points", "faqs", "policies", "meals", "extras"
     })
     package_data["slug"] = slug
     
@@ -193,6 +202,8 @@ async def create_package(
     await sync_nested_relation(db, package, "boarding_points", PackageBoardingPoint, body.boarding_points)
     await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
     await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
+    await sync_nested_relation(db, package, "meals", PackageMealItem, body.meals)
+    await sync_nested_relation(db, package, "extras", PackageExtra, body.extras)
     
     # Compute starting_price — use student_price for student packages
     if package.is_student_package:
@@ -209,8 +220,8 @@ async def create_package(
     db.add(package)
     await db.commit()
     
-    # Reload package scalar attributes
-    query = select(Package).where(Package.id == package.id)
+    # Reload package with all options
+    query = select(Package).where(Package.id == package.id).options(*full_package_options())
     result = await db.execute(query)
     package = result.scalar_one()
     
@@ -239,18 +250,7 @@ async def update_package(
     query = (
         select(Package)
         .where(Package.id == package_id, Package.deleted_at.is_(None))
-        .options(
-            selectinload(Package.variants),
-            selectinload(Package.transport_options),
-            selectinload(Package.gallery),
-            selectinload(Package.itinerary),
-            selectinload(Package.highlights),
-            selectinload(Package.inclusions),
-            selectinload(Package.exclusions),
-            selectinload(Package.boarding_points),
-            selectinload(Package.faqs),
-            selectinload(Package.policies)
-        )
+        .options(*full_package_options())
     )
     result = await db.execute(query)
     package = result.scalar_one_or_none()
@@ -263,9 +263,9 @@ async def update_package(
         
     update_data = body.model_dump(exclude_unset=True, exclude={
         "variants", "transport_options", "gallery", "itinerary", "highlights", "inclusions", 
-        "exclusions", "boarding_points", "faqs", "policies"
+        "exclusions", "boarding_points", "faqs", "policies", "meals", "extras"
     })
-    
+
     # If slug is changing, verify uniqueness
     if "slug" in update_data and update_data["slug"]:
         update_data["slug"] = slugify(update_data["slug"])
@@ -286,10 +286,11 @@ async def update_package(
 
     if "brochure_pdf_url" in update_data and update_data["brochure_pdf_url"] != old_brochure_pdf_url:
         from app.models.enums import DocumentGenerationStatus
-        from app.services.r2_storage import r2_service
+        from app.services.pdf_generator import sync_cloudinary_delete
+        import asyncio
 
         if old_generated_brochure_url:
-            await r2_service.delete_file(old_generated_brochure_url)
+            await asyncio.to_thread(sync_cloudinary_delete, old_generated_brochure_url)
         package.generated_brochure_url = None
         package.brochure_generation_status = (
             DocumentGenerationStatus.AVAILABLE
@@ -318,6 +319,10 @@ async def update_package(
         await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
     if body.policies is not None:
         await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
+    if body.meals is not None:
+        await sync_nested_relation(db, package, "meals", PackageMealItem, body.meals)
+    if body.extras is not None:
+        await sync_nested_relation(db, package, "extras", PackageExtra, body.extras)
         
     # Recompute starting_price — use student_price for student packages
     if package.is_student_package:
@@ -365,8 +370,8 @@ async def update_package(
     from app.utils.cache import trigger_frontend_revalidation
     trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}", f"package:{old_slug}"])
     
-    # Reload package scalar attributes to refresh expired fields like updated_at
-    refresh_query = select(Package).where(Package.id == package.id)
+    # Reload package with all options to refresh expired attributes for Pydantic serialization
+    refresh_query = select(Package).where(Package.id == package.id).options(*full_package_options())
     refresh_result = await db.execute(refresh_query)
     package = refresh_result.scalar_one()
     
@@ -562,8 +567,8 @@ async def publish_package(
             logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
             background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
-    # Re-query the package scalar attributes to prevent expired attributes during Pydantic serialization
-    refresh_query = select(Package).where(Package.id == package.id)
+    # Re-query the package with all options to prevent expired attributes during Pydantic serialization
+    refresh_query = select(Package).where(Package.id == package.id).options(*full_package_options())
     refresh_result = await db.execute(refresh_query)
     return refresh_result.scalar_one()
 

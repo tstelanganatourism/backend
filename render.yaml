@@ -1,7 +1,7 @@
 services:
-  # FastAPI Web & Background Worker Service (Combined to remain 100% Free)
+  # FastAPI Web & Background Worker Service
   - type: web
-    name: ts-tours-api
+    name: tsboat-api
     env: docker
     region: singapore # Closest to India for lowest latency
     plan: free # Explicitly use the 100% free plan
@@ -16,6 +16,8 @@ services:
       - key: REDIS_URL
         sync: false
       - key: ALLOWED_HOSTS
-        value: '["tsboattourism.org","www.tsboattourism.org","api.tsboattourism.org","*.onrender.com","localhost"]'
+        value: '["tstelanganatourism.com","www.tstelanganatourism.com","*.onrender.com","localhost"]'
       - key: CORS_ORIGINS
-        value: '["https://tsboattourism.org","https://www.tsboattourism.org"]'
+        value: '["https://tstelanganatourism.com","https://www.tstelanganatourism.com"]'
+      - key: FRONTEND_URL
+        value: "https://tstelanganatourism.com"

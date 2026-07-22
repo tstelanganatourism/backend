@@ -1,8 +1,15 @@
 from typing import Optional, List
 from pydantic import Field
 from decimal import Decimal
+from datetime import datetime
 from app.schemas.base import AppBaseModel, TimestampSchema
-from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, TransportOptionType
+from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, TransportOptionType, AdvancePaymentType, MealType, DocumentGenerationStatus
+
+class TagResponse(AppBaseModel):
+    id: int
+    name: str
+    priority: int = 0
+    is_active: bool = True
 
 class SEOSchema(AppBaseModel):
     meta_title: Optional[str] = None
@@ -104,6 +111,27 @@ class PackagePolicyResponse(AppBaseModel):
     description: str
     sort_order: int
 
+class PackageMealItemResponse(AppBaseModel):
+    id: int
+    meal_type: MealType
+    name: str
+    serving_time: Optional[str] = None
+    description: Optional[str] = None
+    cost_per_person: Decimal
+    is_vegetarian: bool = True
+    day_number: Optional[int] = None
+    sort_order: int
+
+class PackageExtraResponse(AppBaseModel):
+    id: int
+    title: str
+    description: Optional[str] = None
+    adult_price: Optional[Decimal] = None
+    child_price: Optional[Decimal] = None
+    student_price: Optional[Decimal] = None
+    min_passengers: int = 1
+    sort_order: int = 0
+
 # Nested Inputs for single-transaction update
 class PackageVariantInput(AppBaseModel):
     id: Optional[int] = None
@@ -195,6 +223,27 @@ class PackagePolicyInput(AppBaseModel):
     description: str
     sort_order: int = 0
 
+class PackageMealItemInput(AppBaseModel):
+    id: Optional[int] = None
+    meal_type: MealType
+    name: str
+    serving_time: Optional[str] = None
+    description: Optional[str] = None
+    cost_per_person: Decimal = Decimal("0.00")
+    is_vegetarian: bool = True
+    day_number: Optional[int] = None
+    sort_order: int = 0
+
+class PackageExtraInput(AppBaseModel):
+    id: Optional[int] = None
+    title: str
+    description: Optional[str] = None
+    adult_price: Optional[Decimal] = None
+    child_price: Optional[Decimal] = None
+    student_price: Optional[Decimal] = None
+    min_passengers: int = 1
+    sort_order: int = 0
+
 class PackageBase(AppBaseModel):
     title: str
     slug: str
@@ -206,25 +255,37 @@ class PackageBase(AppBaseModel):
     cover_image_url: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
+    brochure_generation_status: DocumentGenerationStatus = DocumentGenerationStatus.MISSING
     order_priority: int = 0
+    starting_price: Decimal = Decimal("0.00")
     has_transport: bool = False
     has_refreshments: bool = False
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
-    # Student package
     is_student_package: bool = False
     refreshment_student_price: Optional[Decimal] = None
+    refreshments_min_passengers: int = 1
+
+    # Food Option fields
+    has_food_option: bool = False
+    food_adult_price: Optional[Decimal] = None
+    food_child_price: Optional[Decimal] = None
+    food_student_price: Optional[Decimal] = None
+
     is_featured: bool = False
     is_active: bool = True
+    advance_payment_type: AdvancePaymentType = AdvancePaymentType.FULL_PAYMENT
+    advance_payment_value: Decimal = Decimal("0.00")
     status: PublishStatus = PublishStatus.DRAFT
-    min_passengers: int = Field(1, ge=1)
+    min_passengers: int = 1
 
-class PackageResponse(PackageBase, TimestampSchema):
+class PackageResponse(PackageBase):
     id: int
+    created_at: datetime
+    updated_at: datetime
+    tags: List[TagResponse] = []
     variants: List[PackageVariantResponse] = []
     transport_options: List[PackageTransportOptionResponse] = []
-    starting_price: Optional[Decimal] = None
-    generated_brochure_url: Optional[str] = None
     active_booking_count: Optional[int] = 0
 
 class PackageDetailResponse(PackageResponse, SEOSchema):
@@ -236,6 +297,8 @@ class PackageDetailResponse(PackageResponse, SEOSchema):
     boarding_points: List[PackageBoardingPointResponse] = []
     faqs: List[PackageFAQResponse] = []
     policies: List[PackagePolicyResponse] = []
+    meals: List[PackageMealItemResponse] = []
+    extras: List[PackageExtraResponse] = []
 
 class PackageCreate(PackageBase, SEOSchema):
     variants: List[PackageVariantInput] = []
@@ -248,6 +311,8 @@ class PackageCreate(PackageBase, SEOSchema):
     boarding_points: List[PackageBoardingPointInput] = []
     faqs: List[PackageFAQInput] = []
     policies: List[PackagePolicyInput] = []
+    meals: List[PackageMealItemInput] = []
+    extras: List[PackageExtraInput] = []
 
 class PackageUpdate(AppBaseModel):
     title: Optional[str] = None
@@ -265,9 +330,16 @@ class PackageUpdate(AppBaseModel):
     has_refreshments: Optional[bool] = None
     refreshment_adult_price: Optional[Decimal] = None
     refreshment_child_price: Optional[Decimal] = None
-    # Student package
     is_student_package: Optional[bool] = None
     refreshment_student_price: Optional[Decimal] = None
+    refreshments_min_passengers: Optional[int] = None
+
+    # Food option
+    has_food_option: Optional[bool] = None
+    food_adult_price: Optional[Decimal] = None
+    food_child_price: Optional[Decimal] = None
+    food_student_price: Optional[Decimal] = None
+
     is_featured: Optional[bool] = None
     is_active: Optional[bool] = None
     status: Optional[PublishStatus] = None
@@ -288,6 +360,8 @@ class PackageUpdate(AppBaseModel):
     boarding_points: Optional[List[PackageBoardingPointInput]] = None
     faqs: Optional[List[PackageFAQInput]] = None
     policies: Optional[List[PackagePolicyInput]] = None
+    meals: Optional[List[PackageMealItemInput]] = None
+    extras: Optional[List[PackageExtraInput]] = None
 
 
 class PackagePaginatedResponse(AppBaseModel):

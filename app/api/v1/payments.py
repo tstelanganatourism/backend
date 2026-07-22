@@ -16,7 +16,6 @@ from app.models.room import RoomSlotInventory
 from app.models.coupon import Coupon
 from app.models.enums import BookingStatus, BookingSource, GenderType
 from app.services.phonepe_client import phonepe_service
-from app.services.cashfree_client import cashfree_service
 from app.core.security import AadharCryptography, AadharHashing
 from app.core.timezone import get_ist_now
 
@@ -251,25 +250,45 @@ async def _finalize_draft(
     if draft.target_type == 'room':
         seq_res = await db.execute(text("SELECT nextval('booking_seq_ac')"))
         seq_val = seq_res.scalar()
-        public_id = f"TBT_AC_{seq_val}"
+        
+        # Get room title prefix
+        from app.models.room import RoomVariant, Room
+        from app.models.booking import generate_pnr_prefix
+        room_res = await db.execute(
+            select(Room.title)
+            .join(RoomVariant, RoomVariant.room_id == Room.id)
+            .where(RoomVariant.id == draft.room_variant_id)
+        )
+        room_title = room_res.scalar_one_or_none() or "ROOM"
+        prefix = generate_pnr_prefix(room_title)
+        
+        date_str = draft.travel_date.strftime("%d%m%Y")
+        seq_str = f"{seq_val:04d}"
+        public_id = f"TSBOAT_{prefix}_{date_str}_{seq_str}"
     else:
         from app.models.package import PackageVariant, Package
         from app.models.enums import PackageType
+        from app.models.booking import generate_pnr_prefix
         pkg_res = await db.execute(
-            select(Package.type)
+            select(Package.type, Package.title)
             .join(PackageVariant, PackageVariant.package_id == Package.id)
             .where(PackageVariant.id == draft.variant_id)
         )
-        pkg_type = pkg_res.scalar_one_or_none()
+        pkg_row = pkg_res.first()
+        pkg_type = pkg_row[0] if pkg_row else None
+        pkg_title = pkg_row[1] if pkg_row else "PACKAGE"
+        
+        prefix = generate_pnr_prefix(pkg_title)
+        date_str = draft.travel_date.strftime("%d%m%Y")
 
         if pkg_type == PackageType.TRIP:
             seq_res = await db.execute(text("SELECT nextval('booking_seq_ss')"))
-            seq_val = seq_res.scalar()
-            public_id = f"TBT_SS_{seq_val}"
         else:
             seq_res = await db.execute(text("SELECT nextval('booking_seq_bt')"))
-            seq_val = seq_res.scalar()
-            public_id = f"TBT_BT_{seq_val}"
+            
+        seq_val = seq_res.scalar()
+        seq_str = f"{seq_val:04d}"
+        public_id = f"TSBOAT_{prefix}_{date_str}_{seq_str}"
 
     # 6. Generate actual Booking
     booking = Booking(
@@ -285,6 +304,7 @@ async def _finalize_draft(
         child_count=draft.checkout_payload.get('child_count') or 0,
         student_count=snapshot.get('student_count') or draft.checkout_payload.get('student_count') or 0,
         has_refreshment_addon=bool(snapshot.get('has_refreshment_addon', False)),
+        has_food_addon=bool(snapshot.get('has_food_addon', False)),
         subtotal_amount=Decimal(snapshot['subtotal_amount']),
         coupon_discount=Decimal(snapshot['coupon_discount']),
         coupon_applied=draft.coupon_applied,
@@ -506,115 +526,7 @@ async def verify_status(
     return {"status": "success", "booking_id": public_id}
 
 
-# ─── Cashfree: Verify Status (polling after popup closes) ────────────────────
 
-@router.get("/verify-cashfree-status")
-async def verify_cashfree_status(
-    order_id: str,
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Frontend polls this after the Cashfree popup closes to check payment status.
-    order_id = the pg_transaction_id (Cashfree order ID) created during checkout.
-    """
-    check_res = await cashfree_service.get_order_status(order_id)
-    order_status = check_res.get("status")  # PAID | ACTIVE | EXPIRED | CANCELLED | ERROR
-    payment_id = check_res.get("pg_payment_id")
-
-    if order_status == "ACTIVE":
-        return {"status": "pending", "message": "Payment is still being processed."}
-    elif order_status in ("EXPIRED", "CANCELLED", "ERROR"):
-        # Release draft inventory
-        draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
-        res = await db.execute(draft_query)
-        draft = res.scalar_one_or_none()
-        if draft:
-            sse_payloads = await release_draft_inventory(draft, db)
-            await db.delete(draft)
-            await db.commit()
-            from app.utils.sse import sse_manager
-            for p in sse_payloads or []:
-                await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-        return {"status": "failed", "message": "Payment was not completed."}
-
-    if order_status != "PAID":
-        return {"status": "pending", "message": "Payment status unknown. Please wait."}
-
-    # PAID — finalize booking
-    draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
-    res = await db.execute(draft_query)
-    draft = res.scalar_one_or_none()
-
-    if not draft:
-        # Already finalized?
-        existing = await db.execute(
-            select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == order_id)
-        )
-        booking = existing.scalar_one_or_none()
-        if booking:
-            return {"status": "success", "booking_id": booking.public_id}
-
-        # Balance payment?
-        from app.models.payment import Payment
-        from app.models.enums import PaymentStatus
-        payment_stmt = select(Payment).where(Payment.pg_order_id == order_id).with_for_update()
-        p_res = await db.execute(payment_stmt)
-        payment = p_res.scalar_one_or_none()
-
-        if payment:
-            booking_stmt = select(Booking).where(Booking.id == payment.booking_id).with_for_update()
-            bk_res = await db.execute(booking_stmt)
-            booking = bk_res.scalar_one()
-
-            if payment.status != PaymentStatus.CAPTURED:
-                payment.status = PaymentStatus.CAPTURED
-                payment.pg_payment_id = payment_id
-                from app.utils.ledger import recompute_booking_ledger
-                booking = await recompute_booking_ledger(booking.id, db)
-
-                # Enqueue SMS via arq (Zero-DB, retried if MSG91 is down)
-                try:
-                    from app.services.sms_service import get_booking_sms_payload
-                    from app.worker import get_arq_pool
-                    sms_payload = await get_booking_sms_payload(booking.id, db)
-                    if sms_payload:
-                        arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
-                except Exception as _sms_err:
-                    logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
-
-            async def _enqueue_cashfree_bal(b_id: int, is_fully_paid: bool):
-                try:
-                    from app.worker import get_arq_pool
-                    arq_pool = await get_arq_pool()
-                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
-                except Exception as arq_err:
-                    logger.warning(f"Failed to enqueue documents task: {arq_err}")
-
-            background_tasks.add_task(_enqueue_cashfree_bal, booking.id, booking.status == BookingStatus.FULLY_PAID)
-            await db.commit()
-            return {"status": "success", "booking_id": booking.public_id}
-
-        raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
-
-    sse_payloads = []
-    public_id = await _finalize_draft(draft, payment_id, db, background_tasks, sse_payloads, payment_source="CASHFREE")
-    await db.commit()
-
-    from app.utils.cache import clear_cache_prefix
-    if draft.target_type == 'package':
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix("packages:detail:")
-    elif draft.target_type == 'room':
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
-
-    from app.utils.sse import sse_manager
-    for p in sse_payloads:
-        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-
-    return {"status": "success", "booking_id": public_id}
 
 
 # ─── PhonePe Webhook ──────────────────────────────────────────────────────────
@@ -768,114 +680,4 @@ async def phonepe_webhook(
     return {"status": "ok"}
 
 
-# ─── Cashfree Webhook (optional — we use polling as primary) ──────────────────
 
-@router.post("/webhook/cashfree")
-async def cashfree_webhook(
-    request: Request,
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Cashfree S2S Webhook — fires on payment events.
-    We use polling (verify-cashfree-status) as primary, but this handles edge cases.
-    """
-    body_bytes = await request.body()
-    raw_body = body_bytes.decode("utf-8")
-    timestamp = request.headers.get("x-webhook-timestamp", "")
-    signature = request.headers.get("x-webhook-signature", "")
-
-    is_valid = cashfree_service.verify_webhook_signature(timestamp, raw_body, signature)
-    if not is_valid:
-        logger.warning("Cashfree Webhook signature verification failed.")
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
-
-    try:
-        data = json.loads(raw_body)
-        event_type = data.get("type", "")
-        order_data = data.get("data", {}).get("order", {})
-        payment_data = data.get("data", {}).get("payment", {})
-
-        order_id = order_data.get("order_id")
-        payment_status = payment_data.get("payment_status")  # SUCCESS | FAILED | USER_DROPPED
-        cf_payment_id = str(payment_data.get("cf_payment_id", "") or "")
-
-        if not order_id:
-            return {"status": "ok"}
-
-        if payment_status == "SUCCESS":
-            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
-            res = await db.execute(draft_query)
-            draft = res.scalar_one_or_none()
-
-            if draft:
-                sse_payloads = []
-                target_type = draft.target_type
-                public_id = await _finalize_draft(draft, cf_payment_id, db, sse_payloads=sse_payloads, payment_source="CASHFREE")
-                await db.commit()
-
-                from app.utils.cache import clear_cache_prefix
-                if target_type == 'package':
-                    clear_cache_prefix("packages:list:")
-                    clear_cache_prefix("packages:detail:")
-                elif target_type == 'room':
-                    clear_cache_prefix("rooms:list:")
-                    clear_cache_prefix("rooms:detail:")
-
-                from app.utils.sse import sse_manager
-                for p in sse_payloads:
-                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-
-                finalized_booking = await db.execute(
-                    select(Booking).where(Booking.public_id == public_id).limit(1)
-                )
-                booking = finalized_booking.scalar_one_or_none()
-                if booking:
-                    try:
-                        from app.worker import get_arq_pool
-                        arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
-                    except Exception as arq_err:
-                        logger.warning(f"Failed to enqueue document tasks from Cashfree webhook: {arq_err}")
-                logger.info(f"Cashfree Webhook finalized booking for order {order_id}")
-            else:
-                # Balance payment
-                from app.models.payment import Payment
-                from app.models.enums import PaymentStatus
-                payment_stmt = select(Payment).where(Payment.pg_order_id == order_id).with_for_update()
-                p_res = await db.execute(payment_stmt)
-                payment = p_res.scalar_one_or_none()
-
-                if payment and payment.status != PaymentStatus.CAPTURED:
-                    payment.status = PaymentStatus.CAPTURED
-                    payment.pg_payment_id = cf_payment_id
-                    from app.utils.ledger import recompute_booking_ledger
-                    booking = await recompute_booking_ledger(payment.booking_id, db)
-                    try:
-                        from app.worker import get_arq_pool
-                        arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
-                    except Exception as arq_err:
-                        logger.warning(f"Failed to enqueue documents task from Cashfree webhook: {arq_err}")
-                    await db.commit()
-                    logger.info(f"Cashfree Webhook finalized balance payment for order {order_id}")
-
-        elif payment_status in ("FAILED", "USER_DROPPED"):
-            # Release draft inventory if payment failed
-            draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == order_id).with_for_update()
-            res = await db.execute(draft_query)
-            draft = res.scalar_one_or_none()
-            if draft:
-                sse_payloads = await release_draft_inventory(draft, db)
-                await db.delete(draft)
-                await db.commit()
-                from app.utils.sse import sse_manager
-                for p in sse_payloads or []:
-                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
-                logger.info(f"Cashfree Webhook released draft after payment {payment_status} for order {order_id}")
-
-    except Exception as e:
-        logger.error(f"Cashfree Webhook processing failed: {str(e)}")
-        await db.rollback()
-        return {"status": "error"}
-
-    return {"status": "ok"}

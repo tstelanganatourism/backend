@@ -468,6 +468,11 @@ def _compute_room_row(row: RoomSlotInventory) -> RoomInventoryRow:
         booked_rooms=row.booked_rooms,
         available_rooms=max(0, row.total_rooms - row.booked_rooms - row.reserved_rooms),
         is_closed=row.is_closed,
+        hotel_name=row.hotel_name,
+        hotel_address=row.hotel_address,
+        hotel_map_url=row.hotel_map_url,
+        weekday_price=row.weekday_price,
+        weekend_price=row.weekend_price,
     )
 
 
@@ -568,6 +573,7 @@ async def generate_room_inventory(
     )
 
     slot_capacity_map = {}
+    slot_details_map = {}
     if body.slot_capacities:
         configured_slots = set(slots_to_generate)
         for slot_capacity in body.slot_capacities:
@@ -586,6 +592,13 @@ async def generate_room_inventory(
                 )
 
             slot_capacity_map[key] = slot_capacity.total_rooms
+            slot_details_map[key] = (
+                slot_capacity.hotel_name,
+                slot_capacity.hotel_address,
+                slot_capacity.hotel_map_url,
+                slot_capacity.weekday_price,
+                slot_capacity.weekend_price
+            )
 
     # Query existing (date, slot_start, slot_end) combinations for idempotency/restoration
     existing_result = await db.execute(
@@ -609,6 +622,23 @@ async def generate_room_inventory(
     while current <= body.to_date:
         for s_start, s_end in slots_to_generate:
             existing_row = existing_slots.get((current, s_start, s_end))
+            
+            # Determine hotel details and pricing for this slot
+            detail_val = slot_details_map.get((s_start, s_end))
+            if detail_val:
+                h_name, h_address, h_map_url, w_price, we_price = detail_val
+                h_name = h_name or body.hotel_name
+                h_address = h_address or body.hotel_address
+                h_map_url = h_map_url or body.hotel_map_url
+                w_price = w_price if w_price is not None else body.weekday_price
+                we_price = we_price if we_price is not None else body.weekend_price
+            else:
+                h_name = body.hotel_name
+                h_address = body.hotel_address
+                h_map_url = body.hotel_map_url
+                w_price = body.weekday_price
+                we_price = body.weekend_price
+
             if existing_row:
                 if existing_row.deleted_at is None:
                     skipped += 1
@@ -619,6 +649,11 @@ async def generate_room_inventory(
                     existing_row.booked_rooms = 0
                     existing_row.reserved_rooms = 0
                     existing_row.is_closed = False
+                    existing_row.hotel_name = h_name
+                    existing_row.hotel_address = h_address
+                    existing_row.hotel_map_url = h_map_url
+                    existing_row.weekday_price = w_price
+                    existing_row.weekend_price = we_price
                     created += 1
                     created_slots.append((current, s_start, s_end))
             else:
@@ -632,6 +667,11 @@ async def generate_room_inventory(
                     booked_rooms=0,
                     reserved_rooms=0,
                     is_closed=False,
+                    hotel_name=h_name,
+                    hotel_address=h_address,
+                    hotel_map_url=h_map_url,
+                    weekday_price=w_price,
+                    weekend_price=we_price,
                 ))
                 created += 1
                 created_slots.append((current, s_start, s_end))

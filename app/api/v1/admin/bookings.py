@@ -392,6 +392,8 @@ class AdminCreateBookingRequest(BaseModel):
     transport_selections: Optional[List] = None  # List[{option_id, quantity}]
     # Refreshments
     include_refreshments: Optional[bool] = False
+    include_food_option: Optional[bool] = False
+    has_food_addon: Optional[bool] = False
     # Room-specific
     departure_date: Optional[str] = None
     slot_start: Optional[str] = None
@@ -575,6 +577,13 @@ async def admin_create_booking(
             )
             parent_pkg_ref = pkg_res_for_ref.scalar_one_or_none()
             if parent_pkg_ref and parent_pkg_ref.has_refreshments:
+                total_passengers_ref = student_count if is_student_pkg else (adult_count + child_count)
+                min_pass_ref = parent_pkg_ref.refreshments_min_passengers or 1
+                if total_passengers_ref < min_pass_ref:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Refreshment rooms (stay/rest option) require a minimum of {min_pass_ref} passengers to book."
+                    )
                 if is_student_pkg:
                     r_student = getattr(parent_pkg_ref, 'refreshment_student_price', None) or \
                                 parent_pkg_ref.refreshment_adult_price or Decimal("0.00")
@@ -585,6 +594,24 @@ async def admin_create_booking(
                     ref_cost = Decimal(str(adult_count)) * Decimal(str(r_adult)) + Decimal(str(child_count)) * Decimal(str(r_child))
                 subtotal_amount += ref_cost
                 refreshment_subtotal = ref_cost
+
+        # Food option for admin direct booking
+        food_subtotal = Decimal("0.00")
+        if request.include_food_option or request.has_food_addon:
+            pkg_res_for_food = await db.execute(
+                select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
+            )
+            parent_pkg_food = pkg_res_for_food.scalar_one_or_none()
+            if parent_pkg_food and parent_pkg_food.has_food_option:
+                if is_student_pkg:
+                    f_student = getattr(parent_pkg_food, 'food_student_price', None) or Decimal("0.00")
+                    food_cost = Decimal(str(student_count)) * Decimal(str(f_student))
+                else:
+                    f_adult = parent_pkg_food.food_adult_price or Decimal("0.00")
+                    f_child = parent_pkg_food.food_child_price or Decimal("0.00")
+                    food_cost = Decimal(str(adult_count)) * Decimal(str(f_adult)) + Decimal(str(child_count)) * Decimal(str(f_child))
+                subtotal_amount += food_cost
+                food_subtotal = food_cost
         
         # Admin direct bookings occupy package inventory, increment booked_count
         if inv.booked_count + total_passengers > inv.total_capacity:
@@ -621,6 +648,7 @@ async def admin_create_booking(
         slot_end_t = time.fromisoformat(request.slot_end) if request.slot_end else room_obj.slot_end
 
         # Fetch each stay date's inventory — auto-create with capacity = booked rooms if missing (no extra rooms)
+        locked_room_inventories = []
         for sd in stay_dates:
             inv_query = select(RoomSlotInventory).where(
                 RoomSlotInventory.room_variant_id == request.room_variant_id,
@@ -654,15 +682,20 @@ async def admin_create_booking(
 
             # Record this booking in the inventory
             room_inv.booked_rooms += required_rooms
+            locked_room_inventories.append(room_inv)
             
         await db.flush()
 
         # Price calculation: use weekday/weekend per date
         total_price = Decimal("0.00")
-        for sd in stay_dates:
+        for i, sd in enumerate(stay_dates):
             is_weekend = sd.weekday() >= 5
-            price = Decimal(str(rv.weekend_price)) if is_weekend else Decimal(str(rv.weekday_price))
-            total_price += price * required_rooms
+            room_inv = locked_room_inventories[i]
+            if is_weekend:
+                price = room_inv.weekend_price if room_inv.weekend_price is not None else rv.weekend_price
+            else:
+                price = room_inv.weekday_price if room_inv.weekday_price is not None else rv.weekday_price
+            total_price += Decimal(str(price)) * required_rooms
         subtotal_amount = total_price
     else:
         raise HTTPException(status_code=400, detail="Invalid target_type. Must be 'package' or 'room'.")
@@ -688,6 +721,8 @@ async def admin_create_booking(
         "subtotal_amount": str(subtotal_amount),
         "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
         "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
+        "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
+        "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
         "coupon_discount": "0.00",
         "coupon_applied": None,
         "gst_amount": str(gst_amount),
@@ -715,25 +750,46 @@ async def admin_create_booking(
     if request.target_type == 'room':
         seq_res = await db.execute(text("SELECT nextval('booking_seq_ac')"))
         seq_val = seq_res.scalar()
-        public_id_val = f"TBT_AC_{seq_val}"
+        
+        # Get room title prefix
+        from app.models.room import RoomVariant, Room
+        from app.models.booking import generate_pnr_prefix
+        room_res = await db.execute(
+            select(Room.title)
+            .join(RoomVariant, RoomVariant.room_id == Room.id)
+            .where(RoomVariant.id == room_variant_id_val)
+        )
+        room_title = room_res.scalar_one_or_none() or "ROOM"
+        prefix = generate_pnr_prefix(room_title)
+        
+        date_str = travel_date.strftime("%d%m%Y")
+        seq_str = f"{seq_val:04d}"
+        public_id_val = f"TSBOAT_{prefix}_{date_str}_{seq_str}"
     else:
         # Determine if Boat Ride (TOUR) or Sightseeing (TRIP)
         from app.models.enums import PackageType
+        from app.models.package import PackageVariant, Package
+        from app.models.booking import generate_pnr_prefix
         pkg_res = await db.execute(
-            select(Package.type)
+            select(Package.type, Package.title)
             .join(PackageVariant, PackageVariant.package_id == Package.id)
             .where(PackageVariant.id == request.variant_id)
         )
-        pkg_type = pkg_res.scalar_one_or_none()
+        pkg_row = pkg_res.first()
+        pkg_type = pkg_row[0] if pkg_row else None
+        pkg_title = pkg_row[1] if pkg_row else "PACKAGE"
+        
+        prefix = generate_pnr_prefix(pkg_title)
+        date_str = travel_date.strftime("%d%m%Y")
         
         if pkg_type == PackageType.TRIP:
             seq_res = await db.execute(text("SELECT nextval('booking_seq_ss')"))
-            seq_val = seq_res.scalar()
-            public_id_val = f"TBT_SS_{seq_val}"
         else:
             seq_res = await db.execute(text("SELECT nextval('booking_seq_bt')"))
-            seq_val = seq_res.scalar()
-            public_id_val = f"TBT_BT_{seq_val}"
+            
+        seq_val = seq_res.scalar()
+        seq_str = f"{seq_val:04d}"
+        public_id_val = f"TSBOAT_{prefix}_{date_str}_{seq_str}"
 
     booking = Booking(
         public_id=public_id_val,
@@ -747,6 +803,8 @@ async def admin_create_booking(
         adult_count=adult_count,
         child_count=child_count,
         student_count=student_count if 'student_count' in locals() else 0,
+        has_refreshment_addon=pricing_snapshot["has_refreshment_addon"],
+        has_food_addon=pricing_snapshot["has_food_addon"],
         subtotal_amount=subtotal_amount,
         coupon_discount=Decimal("0.00"),
         coupon_applied=None,
@@ -764,7 +822,6 @@ async def admin_create_booking(
             else BookingStatus.PENDING
         ),
         pricing_snapshot=pricing_snapshot,
-        has_refreshment_addon=bool(getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False)),
     )
     db.add(booking)
     await db.flush()

@@ -7,7 +7,8 @@ from app.db.session import get_db, AsyncSessionLocal
 from app.middleware.auth import get_current_user_optional, get_current_user
 from app.models.user import User
 from app.models.enums import UserRole
-from app.services.r2_storage import r2_service
+from fastapi.responses import StreamingResponse
+import httpx
 
 router = APIRouter(
     prefix="/documents",
@@ -29,13 +30,16 @@ async def get_signed_url(
     """
     Generate a short-lived (15 minute) signed URL for private document access.
     Brochures can be downloaded by anyone if public.
-    We lazily acquire database connections only for protected documents (tickets, invoices).
     """
-    # 1. Validate object key prevents directory traversal
-    if ".." in req.object_key or req.object_key.startswith("/"):
+    # 1. Validate object key
+    if ".." in req.object_key:
         raise HTTPException(status_code=400, detail="Invalid object key")
         
-    # 2. Access Control Logic
+    # If the key is already a full Cloudinary/HTTPS URL, return it directly.
+    if req.object_key.startswith("http://") or req.object_key.startswith("https://"):
+        return SignedUrlResponse(url=req.object_key, expires_in=900)
+
+    # 2. Access Control Logic (fallback/legacy)
     if req.object_key.startswith("private/invoices/") or req.object_key.startswith("private/tickets/"):
         async with AsyncSessionLocal() as db:
             auth_header = request.headers.get("Authorization")
@@ -76,16 +80,11 @@ async def get_signed_url(
     elif req.object_key.startswith("private/brochures/"):
         pass 
     else:
-        raise HTTPException(status_code=400, detail="Unknown document prefix")
+        raise HTTPException(status_code=400, detail="Unknown document prefix or invalid URL")
 
-    try:
-        url = await r2_service.generate_presigned_url(req.object_key, expires_in=900)
-        return SignedUrlResponse(url=url, expires_in=900)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to generate secure URL")
+    # If it is a legacy key not starting with http, return a dummy/blank url or raise error as R2 is removed
+    raise HTTPException(status_code=404, detail="Legacy R2 keys are no longer accessible.")
 
-
-from fastapi.responses import StreamingResponse
 
 @router.get("/download")
 async def download_document(
@@ -94,13 +93,38 @@ async def download_document(
     filename: Optional[str] = None
 ):
     """
-    Directly download a document by proxying/streaming it from R2.
-    We lazily acquire database connections only for protected documents.
+    Directly download a document by proxying/streaming it from Cloudinary/external URL.
     """
-    if ".." in key or key.startswith("/"):
+    if ".." in key:
         raise HTTPException(status_code=400, detail="Invalid object key")
 
-    # Access control
+    # If it's a full URL (new Cloudinary storage flow)
+    if key.startswith("http://") or key.startswith("https://"):
+        if not filename:
+            filename = key.split("/")[-1].split("?")[0]
+            
+        try:
+            # Stream from external URL (Cloudinary)
+            client = httpx.AsyncClient()
+            req = client.build_request("GET", key)
+            response = await client.send(req, stream=True)
+            
+            return StreamingResponse(
+                response.aiter_raw(),
+                status_code=response.status_code,
+                media_type=response.headers.get('content-type', 'application/pdf'),
+                headers={
+                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Access-Control-Expose-Headers': 'Content-Disposition'
+                },
+                background=client.aclose
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to stream external document: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve document")
+
+    # Access control (legacy)
     if key.startswith("private/invoices/") or key.startswith("private/tickets/"):
         async with AsyncSessionLocal() as db:
             auth_header = request.headers.get("Authorization")
@@ -144,26 +168,5 @@ async def download_document(
     else:
         raise HTTPException(status_code=400, detail="Unknown document prefix")
 
-    if not filename:
-        filename = key.split("/")[-1]
-
-    try:
-        client = await r2_service.get_client()
-        # Retrieve the object directly from R2 to proxy/stream it
-        response = await client.get_object(Bucket=r2_service.bucket_name, Key=key)
-        
-        # Return a StreamingResponse directly from the R2 body stream.
-        # This keeps the request fully same-origin and avoids CORS issues for frontend fetch.
-        return StreamingResponse(
-            response['Body'],
-            media_type=response.get('ContentType', 'application/pdf'),
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Access-Control-Expose-Headers': 'Content-Disposition'
-            }
-        )
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Failed to stream secure document: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve secure document")
+    raise HTTPException(status_code=404, detail="Legacy R2 keys are no longer accessible.")
 

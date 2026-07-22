@@ -5,7 +5,6 @@ import cloudinary.uploader
 from app.core.config import settings
 from app.middleware.auth import require_admin
 from app.models.user import User
-from app.services.r2_storage import r2_service
 
 router = APIRouter(
     prefix="/media",
@@ -51,19 +50,18 @@ async def upload_media(
         
     try:
         if file.content_type == "application/pdf":
-            # Document & Storage Architecture: Route PDFs strictly to R2 Private
-            file_bytes = await file.read()
-            unique_filename = f"{uuid.uuid4()}_{file.filename}"
-            object_name = f"private/brochures/uploaded/{unique_filename}"
-            
-            await r2_service.upload_file(file_bytes, object_name, content_type="application/pdf")
-            
-            # Log the audit event for PDF upload
+            # Route PDFs to Cloudinary
+            upload_result = cloudinary.uploader.upload(
+                file.file,
+                folder="ts_tours/brochures",
+                resource_type="auto",
+                public_id=None
+            )
             
             return {
-                "url": object_name,
-                "public_id": object_name,
-                "format": "pdf",
+                "url": upload_result.get("secure_url"),
+                "public_id": upload_result.get("public_id"),
+                "format": upload_result.get("format", "pdf"),
                 "width": None,
                 "height": None
             }

@@ -178,8 +178,6 @@ def _build_otp_email_html(
     safe_intro = escape(intro)
     safe_expiry_text = escape(expiry_text)
     safe_security_note = escape(security_note)
-    safe_logo1_url = escape(AP_TOURISM_EMAIL_LOGO_URL, quote=True)
-    safe_logo2_url = escape(TS_TOURISM_EMAIL_LOGO_URL, quote=True)
     safe_accent_color = escape(accent_color, quote=True)
 
     return f"""
@@ -194,73 +192,80 @@ def _build_otp_email_html(
             body, table, td, a {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
             table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
             img {{ -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }}
+            body {{ margin: 0; padding: 0; background-color: #f6faf8; }}
             @media only screen and (max-width: 620px) {{
                 .email-shell {{ width: 100% !important; }}
                 .mobile-pad {{ padding-left: 20px !important; padding-right: 20px !important; }}
-                .brand-title {{ font-size: 24px !important; line-height: 30px !important; }}
-                .otp-code {{ font-size: 34px !important; letter-spacing: 8px !important; }}
-                .logo-img {{ width: 74px !important; height: 74px !important; }}
+                .brand-title {{ font-size: 22px !important; line-height: 28px !important; }}
+                .otp-code {{ font-size: 36px !important; letter-spacing: 8px !important; }}
+                .logo-img {{ width: 64px !important; height: 64px !important; }}
             }}
         </style>
     </head>
-    <body style="margin:0; padding:0; background-color:#eef3f6;">
+    <body style="margin:0; padding:0; background-color:#f6faf8; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif;">
         <div style="display:none; max-height:0; overflow:hidden; opacity:0; color:transparent;">
-            Your TS Boating &amp; Tourism security code is {safe_otp}. It expires soon.
+            Your TS Boat Tourism security code is {safe_otp}.
         </div>
-        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#eef3f6; margin:0; padding:0;">
+        <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="background-color:#f6faf8; margin:0; padding:0;">
             <tr>
-                <td align="center" style="padding:28px 12px;">
-                    <table role="presentation" class="email-shell" width="640" border="0" cellpadding="0" cellspacing="0" style="width:640px; max-width:640px; background-color:#ffffff; border:1px solid #dbe6ea; border-radius:18px; overflow:hidden;">
+                <td align="center" style="padding:40px 12px;">
+                    <table role="presentation" class="email-shell" width="600" border="0" cellpadding="0" cellspacing="0" style="width:600px; max-width:600px; background-color:#ffffff; border:1px solid #e2e8f0; border-radius:24px; overflow:hidden; box-shadow: 0 4px 12px rgba(15, 47, 61, 0.03);">
+                        <!-- Header -->
                         <tr>
-                            <td align="center" class="mobile-pad" style="background-color:#075b60; padding:30px 34px 28px 34px;">
-                                <table role="presentation" width="190" border="0" cellpadding="0" cellspacing="0" style="width:190px; margin:0 auto 16px auto;">
+                            <td align="center" class="mobile-pad" style="background-color:#0f2f3d; padding:32px 40px 32px 40px; border-bottom: 4px solid #075b60;">
+                                <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                     <tr>
-                                        <td align="center" width="95" style="padding:0 7px;">
-                                            <img class="logo-img" src="{safe_logo1_url}" width="82" height="82" alt="APTDC" style="display:block; width:82px; height:82px; border-radius:41px;">
-                                        </td>
-                                        <td align="center" width="95" style="padding:0 7px;">
-                                            <img class="logo-img" src="{safe_logo2_url}" width="82" height="82" alt="Telangana Tourism" style="display:block; width:82px; height:82px; border-radius:41px;">
+                                        <td align="center">
+                                            <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784575768/ts_tours/branding/logo.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #ffffff; background-color:#ffffff; object-fit:cover;">
                                         </td>
                                     </tr>
                                 </table>
-                                <div class="brand-title" style="font-family:Arial, Helvetica, sans-serif; color:#ffffff; font-size:28px; line-height:34px; font-weight:800; letter-spacing:0; margin:0 0 6px 0;">TS Boating &amp; Tourism</div>
-                                <div style="font-family:Arial, Helvetica, sans-serif; color:#d6f4ef; font-size:14px; line-height:20px; font-weight:800;">{safe_eyebrow}</div>
+                                <div class="brand-title" style="color:#ffffff; font-size:24px; line-height:30px; font-weight:800; letter-spacing:-0.5px; margin:0 0 4px 0;">TS Boat Tourism</div>
+                                <div style="color:#a5f3fc; font-size:12px; line-height:16px; font-weight:700; letter-spacing:1px; text-transform:uppercase;">{safe_eyebrow}</div>
                             </td>
                         </tr>
+                        <!-- Content -->
                         <tr>
-                            <td class="mobile-pad" style="padding:38px 42px 30px 42px; font-family:Arial, Helvetica, sans-serif; color:#14313a;">
-                                <div style="font-size:12px; line-height:17px; font-weight:800; letter-spacing:0.8px; text-transform:uppercase; color:{safe_accent_color}; margin:0 0 10px 0;">Secure verification</div>
-                                <h1 style="margin:0 0 16px 0; color:#102f3a; font-size:25px; line-height:32px; font-weight:800; letter-spacing:0;">{safe_title}</h1>
-                                <p style="margin:0 0 14px 0; color:#415865; font-size:15px; line-height:24px;">Hello {safe_name},</p>
-                                <p style="margin:0 0 26px 0; color:#415865; font-size:15px; line-height:24px;">{safe_intro}</p>
+                            <td class="mobile-pad" style="padding:40px 48px 32px 48px; color:#1e293b;">
+                                <div style="font-size:11px; line-height:16px; font-weight:800; letter-spacing:1.5px; text-transform:uppercase; color:{safe_accent_color}; margin:0 0 12px 0;">Verification Required</div>
+                                <h1 style="margin:0 0 20px 0; color:#0f2f3d; font-size:24px; line-height:30px; font-weight:800; letter-spacing:-0.5px;">{safe_title}</h1>
+                                <p style="margin:0 0 16px 0; color:#475569; font-size:15px; line-height:24px; font-weight:500;">Hello {safe_name},</p>
+                                <p style="margin:0 0 28px 0; color:#475569; font-size:15px; line-height:24px; font-weight:400;">{safe_intro}</p>
 
-                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border:1px solid #dbe6ea; border-radius:16px; background-color:#f8fbfc;">
+                                <!-- OTP Box -->
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="border:1px solid #ccfbf1; border-radius:20px; background-color:#f0fdfa; margin-bottom:28px;">
                                     <tr>
-                                        <td align="center" style="padding:24px 18px 10px 18px;">
-                                            <div style="font-family:Arial, Helvetica, sans-serif; color:#607380; font-size:11px; line-height:16px; font-weight:800; text-transform:uppercase; letter-spacing:1px;">One-time code</div>
-                                        </td>
-                                    </tr>
-                                    <tr>
-                                        <td align="center" style="padding:0 18px 24px 18px;">
-                                            <div class="otp-code" style="display:inline-block; background-color:#ffffff; border:1px solid #cfe0e5; border-radius:12px; color:{safe_accent_color}; font-family:Arial, Helvetica, sans-serif; font-size:42px; line-height:52px; font-weight:900; letter-spacing:12px; padding:12px 20px 12px 30px;">{safe_otp}</div>
+                                        <td align="center" style="padding:28px 24px;">
+                                            <div style="color:#0f766e; font-size:12px; line-height:16px; font-weight:800; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Verification Code</div>
+                                            <div class="otp-code" style="display:inline-block; background-color:#ffffff; border:2px solid #99f6e4; border-radius:16px; color:#0f2f3d; font-size:40px; line-height:50px; font-weight:900; letter-spacing:10px; padding:14px 24px 14px 34px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); font-family: Courier, monospace;">{safe_otp}</div>
                                         </td>
                                     </tr>
                                 </table>
 
-                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:22px 0 0 0;">
+                                <!-- Expiry & Security Warning -->
+                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
                                     <tr>
-                                        <td style="background-color:#fff8e7; border:1px solid #f1d89a; border-radius:12px; padding:14px 16px; font-family:Arial, Helvetica, sans-serif;">
-                                            <div style="color:#7a4c00; font-size:13px; line-height:20px; font-weight:800;">{safe_expiry_text}</div>
-                                            <div style="color:#8b6b2d; font-size:12px; line-height:18px; margin-top:4px;">{safe_security_note}</div>
+                                        <td style="background-color:#fffbeb; border:1px solid #fde68a; border-radius:16px; padding:16px 20px;">
+                                            <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                                <tr>
+                                                    <td valign="top" style="padding-right:10px; font-size:16px; line-height:20px;">⚠️</td>
+                                                    <td>
+                                                        <div style="color:#b45309; font-size:13px; line-height:18px; font-weight:800; margin-bottom:2px;">{safe_expiry_text}</div>
+                                                        <div style="color:#d97706; font-size:12px; line-height:17px; font-weight:500;">{safe_security_note}</div>
+                                                    </td>
+                                                </tr>
+                                            </table>
                                         </td>
                                     </tr>
                                 </table>
                             </td>
                         </tr>
+                        <!-- Footer -->
                         <tr>
-                            <td align="center" class="mobile-pad" style="background-color:#f7fafb; border-top:1px solid #dbe6ea; padding:24px 34px 28px 34px; font-family:Arial, Helvetica, sans-serif;">
-                                <div style="color:#102f3a; font-size:14px; line-height:21px; font-weight:800; margin-bottom:6px;">TS Tourism Services</div>
-                                <div style="color:#526a76; font-size:12px; line-height:18px;">This security email was sent to protect your account. Never share this code with anyone.</div>
+                            <td align="center" class="mobile-pad" style="background-color:#0f2f3d; border-top:1px solid #e2e8f0; padding:32px 40px; color:#94a3b8; font-size:12px; line-height:18px;">
+                                <div style="color:#ffffff; font-size:14px; line-height:20px; font-weight:800; margin-bottom:6px;">TS Boat Tourism Portal</div>
+                                <div style="margin-bottom:16px; font-weight:500;">Official Booking System for Bhadrachalam &amp; Papikondalu Cruises</div>
+                                <div style="color:#64748b; font-size:11px; line-height:16px; border-top:1px solid #1e293b; padding-top:16px;">This is an automated security transmission. Please do not reply directly to this email.</div>
                             </td>
                         </tr>
                     </table>

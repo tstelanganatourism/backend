@@ -26,14 +26,12 @@ router = APIRouter()
 # ─── Aadhaar Masking Utility ─────────────────────────────────────────────────
 
 def _mask_aadhaar(encrypted_value: str) -> str:
-    """Decrypt an Aadhaar and return masked format XXXX-XXXX-1234."""
+    """Decrypt an Aadhaar and return full decrypted value."""
     try:
         crypto = AadharCryptography()
-        raw = crypto.decrypt(encrypted_value)
-        last4 = raw[-4:] if len(raw) >= 4 else raw
-        return f"XXXX-XXXX-{last4}"
+        return crypto.decrypt(encrypted_value)
     except Exception:
-        return "XXXX-XXXX-****"
+        return encrypted_value
 
 # ─── Passenger Input Schema ───────────────────────────────────────────────────
 
@@ -67,6 +65,7 @@ class CheckoutRequest(BaseModel):
     # New: supports multiple vehicle types with quantities
     transport_selections: Optional[List[TransportSelection]] = None
     include_refreshments: Optional[bool] = False
+    include_food_option: Optional[bool] = False
 
     # Room specific
     room_id: Optional[int] = None
@@ -81,6 +80,7 @@ class CheckoutRequest(BaseModel):
     child_count: Optional[int] = None
     student_count: Optional[int] = None  # for student packages
     has_refreshment_addon: Optional[bool] = False
+    has_food_addon: Optional[bool] = False
 
     # Passenger manifest
     passengers: Optional[List[PassengerInput]] = None
@@ -169,10 +169,14 @@ async def checkout(
                 # Skip strict age/aadhaar for now — re-checked below for non-student packages only
                 pass
     has_refreshment_addon = request.has_refreshment_addon or False
+    has_food_addon = request.has_food_addon or False
     
     subtotal_amount = Decimal("0.00")
     room_variant_id = None
+    room_obj = None
+    required_rooms = 1
     package_variant_id = None
+    parent_package = None
     _room_stay_dates = []  # Populated for room bookings with multi-day stays
     
     # Start inventory validation scope under SELECT FOR UPDATE
@@ -524,6 +528,13 @@ async def checkout(
 
         refreshment_subtotal = Decimal("0.00")
         if parent_package.has_refreshments and request.include_refreshments:
+            total_passengers = student_count if is_student_pkg else (adult_count + child_count)
+            min_pass = parent_package.refreshments_min_passengers or 1
+            if total_passengers < min_pass and not is_admin:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Refreshment rooms (stay/rest option) require a minimum of {min_pass} passengers to book."
+                )
             if is_student_pkg:
                 r_student = getattr(parent_package, 'refreshment_student_price', None) or \
                             parent_package.refreshment_adult_price or Decimal("0.00")
@@ -533,7 +544,17 @@ async def checkout(
                 r_child = parent_package.refreshment_child_price or Decimal("0.00")
                 refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
 
-        subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal
+        food_subtotal = Decimal("0.00")
+        if parent_package.has_food_option and (request.include_food_option or request.has_food_addon):
+            if is_student_pkg:
+                f_student = getattr(parent_package, 'food_student_price', None) or Decimal("0.00")
+                food_subtotal = Decimal(str(student_count)) * Decimal(str(f_student))
+            else:
+                f_adult = parent_package.food_adult_price or Decimal("0.00")
+                f_child = parent_package.food_child_price or Decimal("0.00")
+                food_subtotal = Decimal(str(adult_count)) * f_adult + Decimal(str(child_count)) * f_child
+
+        subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal + food_subtotal
         
         # Hook removed.
             
@@ -559,10 +580,12 @@ async def checkout(
             raise HTTPException(status_code=400, detail="slot_start and slot_end are required for room")
 
         # 1. Fetch RoomVariant and verify parent room is active/not deleted
+        from sqlalchemy.orm import joinedload
         if request.room_variant_id:
             variant_query = (
                 select(RoomVariant)
                 .join(Room, Room.id == RoomVariant.room_id)
+                .options(joinedload(RoomVariant.room))
                 .where(
                     RoomVariant.id == request.room_variant_id,
                     RoomVariant.is_active == True,
@@ -576,6 +599,7 @@ async def checkout(
             variant_query = (
                 select(RoomVariant)
                 .join(Room, Room.id == RoomVariant.room_id)
+                .options(joinedload(RoomVariant.room))
                 .where(
                     RoomVariant.room_id == request.room_id,
                     RoomVariant.is_active == True,
@@ -596,6 +620,7 @@ async def checkout(
             )
 
         room_variant_id = variant.id
+        room_obj = variant.room
 
         # 2. Calculate required rooms
         from app.services.room_calculation import calculate_required_rooms
@@ -672,9 +697,9 @@ async def checkout(
             if special_price is not None:
                 day_price = Decimal(str(special_price))
             elif is_weekend:
-                day_price = variant.weekend_price
+                day_price = inv.weekend_price if inv.weekend_price is not None else variant.weekend_price
             else:
-                day_price = variant.weekday_price
+                day_price = inv.weekday_price if inv.weekday_price is not None else variant.weekday_price
             
         # Hook removed.
             subtotal_amount += Decimal(str(required_rooms)) * day_price
@@ -767,6 +792,8 @@ async def checkout(
         "subtotal_amount": str(subtotal_amount),
         "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
         "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
+        "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
+        "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
@@ -797,8 +824,55 @@ async def checkout(
         
     # --- Payment Gateway Order Generation ---
     payment_percentage = request.payment_percentage if request.payment_percentage is not None else 100.0
-    if not (35.0 <= payment_percentage <= 100.0):
-        raise HTTPException(status_code=400, detail="Payment percentage must be between 35% and 100%")
+    
+    if request.target_type == 'room' and room_obj:
+        adv_type = room_obj.advance_payment_type
+        adv_value = room_obj.advance_payment_value
+        adv_type_str = adv_type.value if hasattr(adv_type, 'value') else str(adv_type)
+        
+        if adv_type_str == 'FULL_PAYMENT':
+            min_percentage = 100.0
+        elif adv_type_str == 'PERCENTAGE':
+            min_percentage = float(adv_value) if adv_value else 50.0
+        elif adv_type_str == 'FIXED_AMOUNT':
+            # Calculate per room: fixed_amount * required_rooms
+            fixed_amt_total = Decimal(str(adv_value)) * Decimal(str(required_rooms or 1))
+            if total_amount > 0:
+                pct = (fixed_amt_total / total_amount) * Decimal("100")
+                min_percentage = float(pct.quantize(Decimal("0.01")))
+                min_percentage = min(100.0, max(0.0, min_percentage))
+            else:
+                min_percentage = 100.0
+        else:
+            min_percentage = 100.0
+            
+        payment_percentage = max(min_percentage, payment_percentage)
+        
+    elif request.target_type == 'package' and parent_package:
+        adv_type = parent_package.advance_payment_type
+        adv_value = parent_package.advance_payment_value
+        adv_type_str = adv_type.value if hasattr(adv_type, 'value') else str(adv_type)
+        
+        if adv_type_str == 'FULL_PAYMENT':
+            min_percentage = 100.0
+        elif adv_type_str == 'PERCENTAGE':
+            min_percentage = float(adv_value) if adv_value else 50.0
+        elif adv_type_str == 'FIXED_AMOUNT':
+            # Calculate for total booking, not per passenger
+            fixed_amt_total = Decimal(str(adv_value))
+            if total_amount > 0:
+                pct = (fixed_amt_total / total_amount) * Decimal("100")
+                min_percentage = float(pct.quantize(Decimal("0.01")))
+                min_percentage = min(100.0, max(0.0, min_percentage))
+            else:
+                min_percentage = 100.0
+        else:
+            min_percentage = 100.0
+            
+        payment_percentage = max(min_percentage, payment_percentage)
+    else:
+        if not (35.0 <= payment_percentage <= 100.0):
+            raise HTTPException(status_code=400, detail="Payment percentage must be between 35% and 100%")
     
     tourist_amount_payable = (total_amount * Decimal(str(payment_percentage)) / Decimal("100")).quantize(Decimal("0.01"))
     
@@ -844,53 +918,27 @@ async def checkout(
 
     # user_phone and user_email extracted above
 
-    # Determine selected gateway (default: PHONEPE)
-    selected_gateway = (request.gateway or "PHONEPE").upper()
-    if selected_gateway not in ("PHONEPE", "CASHFREE"):
-        selected_gateway = "PHONEPE"
+    # Determine selected gateway (strictly PhonePe)
+    selected_gateway = "PHONEPE"
 
     # --- Gateway-specific order creation ---
-    checkout_response = {}
-
-    if selected_gateway == "CASHFREE":
-        from app.services.cashfree_client import cashfree_service
-        cashfree_return_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
-        cf_order = await cashfree_service.create_order(
-            order_id=merchant_txn_id,
-            amount=float(payable_amount),
-            customer_id=str(current_user.id) if current_user else "guest",
-            customer_name=user_name or "Customer",
-            customer_email=user_email or "noreply@tsboattourism.org",
-            customer_phone=user_phone or "9999999999",
-            return_url=cashfree_return_url,
-        )
-        checkout_response = {
-            "gateway": "CASHFREE",
-            "payment_session_id": cf_order.get("payment_session_id"),
-            "pg_transaction_id": merchant_txn_id,
-            "amount": int(float(payable_amount) * 100),  # in paise for consistency
-            "currency": "INR",
-            "mode": cashfree_service.env.lower(),
-        }
-    else:
-        # Default: PhonePe
-        callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-        redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
-        phonepe_order = await phonepe_service.create_payment_url(
-            amount=float(payable_amount),
-            transaction_id=merchant_txn_id,
-            user_id=str(current_user.id) if current_user else "guest",
-            redirect_url=redirect_url,
-            callback_url=callback_url,
-            phone_number=user_phone
-        )
-        checkout_response = {
-            "gateway": "PHONEPE",
-            "redirect_url": phonepe_order.get("redirect_url"),
-            "pg_transaction_id": merchant_txn_id,
-            "amount": phonepe_order.get("amount"),  # in paise
-            "currency": "INR",
-        }
+    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+    phonepe_order = await phonepe_service.create_payment_url(
+        amount=float(payable_amount),
+        transaction_id=merchant_txn_id,
+        user_id=str(current_user.id) if current_user else "guest",
+        redirect_url=redirect_url,
+        callback_url=callback_url,
+        phone_number=user_phone
+    )
+    checkout_response = {
+        "gateway": "PHONEPE",
+        "redirect_url": phonepe_order.get("redirect_url"),
+        "pg_transaction_id": merchant_txn_id,
+        "amount": phonepe_order.get("amount"),  # in paise
+        "currency": "INR",
+    }
 
     # --- Database Draft Persistence ---
     now = get_ist_now()
@@ -1359,6 +1407,41 @@ async def get_booking_details(
 
     room_address = row[7] if row[7] else None
     room_id = row[8]
+    room_map_url = None
+
+    if b.room_variant_id:
+        # Resolve dynamic hotel details from room slot inventory
+        s_start = None
+        s_end = None
+        if b.pricing_snapshot:
+            s_start = b.pricing_snapshot.get('slot_start')
+            s_end = b.pricing_snapshot.get('slot_end')
+        
+        from app.models.room import RoomSlotInventory
+        inv_stmt = select(RoomSlotInventory).where(
+            RoomSlotInventory.room_variant_id == b.room_variant_id,
+            RoomSlotInventory.date == b.travel_date
+        )
+        if s_start and s_end:
+            from datetime import datetime
+            try:
+                s_time = datetime.strptime(s_start, "%H:%M:%S").time()
+                e_time = datetime.strptime(s_end, "%H:%M:%S").time()
+                inv_stmt = inv_stmt.where(
+                    RoomSlotInventory.slot_start == s_time,
+                    RoomSlotInventory.slot_end == e_time
+                )
+            except Exception:
+                pass
+        inv_res = await db.execute(inv_stmt)
+        inv_row = inv_res.scalars().first()
+        if inv_row:
+            if inv_row.hotel_name:
+                package_title = inv_row.hotel_name
+            if inv_row.hotel_address:
+                room_address = inv_row.hotel_address
+            if inv_row.hotel_map_url:
+                room_map_url = inv_row.hotel_map_url
     
     room_checkout_date = None
     room_highlights = []
@@ -1553,6 +1636,7 @@ async def get_booking_details(
         "room_checkout": room_checkout,
         "room_checkout_date": room_checkout_date,
         "room_address": room_address,
+        "room_map_url": room_map_url,
         "room_highlights": room_highlights,
         "itinerary": itinerary,
         "passengers": [
@@ -1804,11 +1888,10 @@ async def process_balance_checkout(
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
-    Tourist balance checkout — supports PhonePe and Cashfree.
+    Tourist balance checkout — supports PhonePe.
     Generates a payment session for the remaining balance.
     """
     from app.services.phonepe_client import phonepe_service
-    from app.services.cashfree_client import cashfree_service
     from app.models.payment import Payment
     from app.models.enums import PaymentStatus, AccountStatus
     from app.core.config import settings
@@ -1874,10 +1957,7 @@ async def process_balance_checkout(
     else:
         payable_amount = float(booking.remaining_balance)
         
-    # Determine gateway from query param (default PhonePe)
-    gateway_param = fastapi_req.query_params.get("gateway", "PHONEPE").upper()
-    if gateway_param not in ("PHONEPE", "CASHFREE"):
-        gateway_param = "PHONEPE"
+    gateway_param = "PHONEPE"
 
     host = fastapi_req.headers.get('host')
     protocol = "https" if "localhost" not in host and "127.0.0.1" not in host else "http"
@@ -1886,57 +1966,26 @@ async def process_balance_checkout(
     if booking.passengers:
         user_phone = next((p.phone_number for p in booking.passengers if p.phone_number), None)
 
-    # Get customer info for Cashfree
-    customer_name = None
-    customer_email = None
-    if booking.passengers:
-        lead = next((p for p in booking.passengers if p.is_primary), booking.passengers[0])
-        customer_name = lead.full_name
-    if current_user and current_user.email:
-        customer_email = current_user.email
-
     import uuid
     merchant_txn_id = f"TXN_BAL_{str(uuid.uuid4())[:8].upper()}_{str(uuid.uuid4())[:4].upper()}"
 
-    balance_response = {}
-
-    if gateway_param == "CASHFREE":
-        cashfree_return_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=CASHFREE"
-        cf_order = await cashfree_service.create_order(
-            order_id=merchant_txn_id,
-            amount=payable_amount,
-            customer_id=str(current_user.id),
-            customer_name=customer_name or "Customer",
-            customer_email=customer_email or "noreply@tsboattourism.org",
-            customer_phone=user_phone or "9999999999",
-            return_url=cashfree_return_url,
-        )
-        balance_response = {
-            "gateway": "CASHFREE",
-            "payment_session_id": cf_order.get("payment_session_id"),
-            "pg_transaction_id": merchant_txn_id,
-            "amount": int(payable_amount * 100),
-            "currency": "INR",
-            "mode": cashfree_service.env.lower(),
-        }
-    else:
-        callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-        redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
-        phonepe_order = await phonepe_service.create_payment_url(
-            amount=payable_amount,
-            transaction_id=merchant_txn_id,
-            user_id=str(current_user.id),
-            redirect_url=redirect_url,
-            callback_url=callback_url,
-            phone_number=user_phone
-        )
-        balance_response = {
-            "gateway": "PHONEPE",
-            "redirect_url": phonepe_order.get("redirect_url"),
-            "pg_transaction_id": merchant_txn_id,
-            "amount": phonepe_order.get("amount"),
-            "currency": "INR",
-        }
+    callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
+    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+    phonepe_order = await phonepe_service.create_payment_url(
+        amount=payable_amount,
+        transaction_id=merchant_txn_id,
+        user_id=str(current_user.id),
+        redirect_url=redirect_url,
+        callback_url=callback_url,
+        phone_number=user_phone
+    )
+    balance_response = {
+        "gateway": "PHONEPE",
+        "redirect_url": phonepe_order.get("redirect_url"),
+        "pg_transaction_id": merchant_txn_id,
+        "amount": phonepe_order.get("amount"),
+        "currency": "INR",
+    }
 
     # Create CREATED payment ledger row to track this attempt
     payment = Payment(

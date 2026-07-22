@@ -13,14 +13,7 @@ import asyncio
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
-    from app.services.r2_storage import r2_service
-    try:
-        if r2_service.is_configured:
-            logger.info("Pre-warming R2 Storage Service Client...")
-            await r2_service.get_client()
-            logger.info("R2 Storage Service Client pre-warmed successfully!")
-    except Exception as e:
-        logger.error(f"Failed to pre-warm R2 Storage client during startup: {e}")
+    pass
 
     yield
 
@@ -37,7 +30,7 @@ from app.api.v1 import admin
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version="1.0.0",
-    description="Backend API for Papikondalu Tourism Booking Platform",
+    description="Backend API for TS Boat Tourism Booking Platform",
     docs_url=None if settings.ENVIRONMENT == "production" else "/docs",
     redoc_url=None if settings.ENVIRONMENT == "production" else "/redoc",
     lifespan=lifespan,

@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Numeric, Integer, Boolean, ForeignKey, UniqueConstraint, Table, Enum as SQLEnum, Date, CheckConstraint, BigInteger, Index, text
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel, SortableMixin, SEOMixin
-from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus, TransportOptionType
+from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus, TransportOptionType, AdvancePaymentType, MealType
 
 # Association table for Package -> Tags
 package_tags = Table(
@@ -34,8 +34,19 @@ class Package(BaseModel, SEOMixin):
     # Student Package support
     is_student_package = Column(Boolean, default=False, server_default="false", nullable=False)
     refreshment_student_price = Column(Numeric(10, 2), nullable=True)  # per-student refreshment cost
+    refreshments_min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
+
+    # Food / Meals Option fields (distinct from refreshments)
+    has_food_option = Column(Boolean, default=False, server_default="false", nullable=False)
+    food_adult_price = Column(Numeric(10, 2), nullable=True)
+    food_child_price = Column(Numeric(10, 2), nullable=True)
+    food_student_price = Column(Numeric(10, 2), nullable=True)
+
     is_featured = Column(Boolean, default=False, server_default="false", nullable=False)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
+    
+    advance_payment_type = Column(SQLEnum(AdvancePaymentType), default=AdvancePaymentType.FULL_PAYMENT, server_default="FULL_PAYMENT", nullable=False)
+    advance_payment_value = Column(Numeric(12, 2), default=0.00, server_default="0.00", nullable=False)
     status = Column(SQLEnum(PublishStatus), default=PublishStatus.DRAFT, server_default="DRAFT", nullable=False, index=True)
     min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
 
@@ -50,6 +61,8 @@ class Package(BaseModel, SEOMixin):
     boarding_points = relationship("PackageBoardingPoint", back_populates="package", cascade="all, delete-orphan", order_by="PackageBoardingPoint.sort_order")
     faqs = relationship("PackageFAQ", back_populates="package", cascade="all, delete-orphan", order_by="PackageFAQ.sort_order")
     policies = relationship("PackagePolicy", back_populates="package", cascade="all, delete-orphan", order_by="PackagePolicy.sort_order")
+    meals = relationship("PackageMealItem", back_populates="package", cascade="all, delete-orphan", order_by="PackageMealItem.sort_order")
+    extras = relationship("PackageExtra", back_populates="package", cascade="all, delete-orphan", order_by="PackageExtra.sort_order")
 
     __table_args__ = (
         Index("ix_packages_public_priority", "is_active", "deleted_at", "order_priority", "id"),
@@ -130,6 +143,31 @@ class PackagePolicy(BaseModel, SortableMixin):
     title = Column(String, nullable=False)
     description = Column(String, nullable=False)
     package = relationship("Package", back_populates="policies")
+
+class PackageMealItem(BaseModel, SortableMixin):
+    """Represents a single meal served during a package (e.g. Day-1 Lunch)."""
+    __tablename__ = "package_meal_items"
+    package_id = Column(ForeignKey("packages.id", ondelete="CASCADE"), nullable=False, index=True)
+    meal_type = Column(SQLEnum(MealType), nullable=False)         # BREAKFAST / LUNCH / DINNER / SNACKS
+    name = Column(String, nullable=False)                         # e.g. "Veg Biryani + Raita"
+    serving_time = Column(String, nullable=True)                  # e.g. "1:00 PM"
+    description = Column(String, nullable=True)                   # optional details
+    cost_per_person = Column(Numeric(10, 2), nullable=False, server_default="0.00")
+    is_vegetarian = Column(Boolean, default=True, server_default="true", nullable=False)
+    day_number = Column(Integer, nullable=True)                   # which day (for multi-day packages)
+    package = relationship("Package", back_populates="meals")
+
+class PackageExtra(BaseModel, SortableMixin):
+    """Represents a customizable add-on / extra for a package (e.g. Rajahmundry Drop, Special Transport, Guide)."""
+    __tablename__ = "package_extras"
+    package_id = Column(ForeignKey("packages.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, nullable=False)                         # e.g. "Rajahmundry Dropping Extra"
+    description = Column(String, nullable=True)                   # e.g. "Reaches Pattiseema revu, By road journey to Rajahmundry"
+    adult_price = Column(Numeric(10, 2), nullable=True)
+    child_price = Column(Numeric(10, 2), nullable=True)
+    student_price = Column(Numeric(10, 2), nullable=True)
+    min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
+    package = relationship("Package", back_populates="extras")
 
 class PackageVariant(BaseModel):
     __tablename__ = "package_variants"

@@ -172,15 +172,10 @@ async def get_packages(
                 ))
 
         # Map to DTOs
-        from app.services.r2_storage import r2_service
         import asyncio
 
         async def build_dto(pkg):
-            active_brochure_key = pkg.brochure_pdf_url or pkg.generated_brochure_url
-            brochure_url, gen_brochure_url = await asyncio.gather(
-                r2_service.get_public_url(active_brochure_key),
-                r2_service.get_public_url(pkg.generated_brochure_url)
-            )
+            active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
             return PackageListDTO(
                 id=pkg.id,
                 slug=pkg.slug,
@@ -189,8 +184,8 @@ async def get_packages(
                 duration=pkg.duration,
                 place=pkg.place,
                 region=pkg.region,
-                brochure_pdf_url=brochure_url,
-                generated_brochure_url=gen_brochure_url,
+                brochure_pdf_url=active_brochure_url,
+                generated_brochure_url=pkg.generated_brochure_url,
                 cover_image_url=pkg.cover_image_url,
                 is_active=pkg.is_active,
                 is_featured=pkg.is_featured,
@@ -257,7 +252,7 @@ async def get_package_detail(
             )
 
         import asyncio
-        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption
+        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption, PackageMealItem, PackageExtra
 
         # Fetch all relationships concurrently to eliminate sequential roundtrips
         async def fetch_rel(model, active_filter=None):
@@ -277,6 +272,8 @@ async def get_package_detail(
             fetch_rel(PackageFAQ),
             fetch_rel(PackagePolicy),
             fetch_rel(PackageTransportOption),
+            fetch_rel(PackageMealItem),
+            fetch_rel(PackageExtra),
         )
 
         pkg_variants = results[0]
@@ -293,6 +290,8 @@ async def get_package_detail(
         pkg_faqs = results[7]
         pkg_policies = results[8]
         pkg_transport_options = results[9]
+        pkg_meals = results[10]
+        pkg_extras = results[11]
             
         is_promo_user = False
         if current_user and (
@@ -308,10 +307,7 @@ async def get_package_detail(
         else:
             starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
         
-        from app.services.r2_storage import r2_service
-        active_brochure_key = pkg.brochure_pdf_url or pkg.generated_brochure_url
-        brochure_url = await r2_service.get_public_url(active_brochure_key)
-        gen_brochure_url = await r2_service.get_public_url(pkg.generated_brochure_url)
+        active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
         
         return PackageDetailDTO(
             id=pkg.id,
@@ -322,8 +318,8 @@ async def get_package_detail(
             place=pkg.place,
             region=pkg.region,
             description=pkg.description,
-            brochure_pdf_url=brochure_url,
-            generated_brochure_url=gen_brochure_url,
+            brochure_pdf_url=active_brochure_url,
+            generated_brochure_url=pkg.generated_brochure_url,
             cover_image_url=pkg.cover_image_url,
             is_active=pkg.is_active,
             is_featured=pkg.is_featured,
@@ -353,6 +349,11 @@ async def get_package_detail(
             refreshment_adult_price=pkg.refreshment_adult_price,
             refreshment_child_price=pkg.refreshment_child_price,
             refreshment_student_price=pkg.refreshment_student_price,
+            refreshments_min_passengers=pkg.refreshments_min_passengers or 1,
+            has_food_option=pkg.has_food_option or False,
+            food_adult_price=pkg.food_adult_price,
+            food_child_price=pkg.food_child_price,
+            food_student_price=pkg.food_student_price,
             meta_title=pkg.meta_title,
             meta_description=pkg.meta_description,
             og_image_url=pkg.og_image_url,
@@ -401,6 +402,14 @@ async def get_package_detail(
             policies=[
                 item for item in pkg_policies
                 if not item.deleted_at and has_text(item.title) and has_text(item.description)
+            ],
+            meals=[
+                item for item in pkg_meals
+                if not item.deleted_at and has_text(item.name)
+            ],
+            extras=[
+                item for item in pkg_extras
+                if not item.deleted_at and has_text(item.title)
             ]
         )
 

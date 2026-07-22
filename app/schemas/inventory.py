@@ -104,6 +104,11 @@ class RoomSlotCapacityRequest(AppBaseModel):
     slot_start: str
     slot_end: str
     total_rooms: int = Field(..., ge=0, le=10000)
+    hotel_name: Optional[str] = None
+    hotel_address: Optional[str] = None
+    hotel_map_url: Optional[str] = None
+    weekday_price: Optional[Decimal] = None
+    weekend_price: Optional[Decimal] = None
 
 
 class RoomInventoryGenerateRequest(AppBaseModel):
@@ -112,11 +117,21 @@ class RoomInventoryGenerateRequest(AppBaseModel):
     to_date: date
     override_total_rooms: Optional[int] = Field(None, ge=0, le=10000)
     slot_capacities: Optional[List[RoomSlotCapacityRequest]] = None
+    hotel_name: Optional[str] = None
+    hotel_address: Optional[str] = None
+    hotel_map_url: Optional[str] = None
+    weekday_price: Optional[Decimal] = None
+    weekend_price: Optional[Decimal] = None
 
 
 class RoomInventoryUpdateRequest(AppBaseModel):
     total_rooms: Optional[int] = Field(None, ge=0, le=10000)
     is_closed: Optional[bool] = None
+    hotel_name: Optional[str] = None
+    hotel_address: Optional[str] = None
+    hotel_map_url: Optional[str] = None
+    weekday_price: Optional[Decimal] = None
+    weekend_price: Optional[Decimal] = None
 
 
 class RoomInventoryRow(AppBaseModel):
@@ -129,6 +144,11 @@ class RoomInventoryRow(AppBaseModel):
     booked_rooms: int
     available_rooms: int
     is_closed: bool
+    hotel_name: Optional[str] = None
+    hotel_address: Optional[str] = None
+    hotel_map_url: Optional[str] = None
+    weekday_price: Optional[Decimal] = None
+    weekend_price: Optional[Decimal] = None
 
 
 class RoomInventoryGenerateResponse(AppBaseModel):

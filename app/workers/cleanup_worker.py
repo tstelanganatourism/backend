@@ -50,15 +50,6 @@ async def release_expired_drafts():
                                 gateway_payment_id = check_res.get("gateway_payment_id")
                         except Exception as pe_err:
                             logger.error(f"Failed to check PhonePe status for draft {draft.draft_id}: {pe_err}")
-                    elif draft.payment_gateway == "CASHFREE":
-                        try:
-                            from app.services.cashfree_client import cashfree_service
-                            check_res = await cashfree_service.get_order_status(draft.pg_transaction_id)
-                            if check_res.get("status") == "PAID":
-                                is_paid = True
-                                gateway_payment_id = check_res.get("pg_payment_id")
-                        except Exception as cf_err:
-                            logger.error(f"Failed to check Cashfree status for draft {draft.draft_id}: {cf_err}")
                 
                 if is_paid:
                     logger.info(f"Draft {draft.draft_id} was paid successfully. Finalizing instead of releasing.")
