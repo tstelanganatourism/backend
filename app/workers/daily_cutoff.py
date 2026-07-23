@@ -213,12 +213,12 @@ async def perform_daily_cutoff(ctx):
                     boarding_title = bp_snap
                     boarding_time = "7:30 AM"
                     boarding_landmark = "Near SBI ATM"
-                    boarding_phone = "9542069573"
+                    boarding_phone = "9951369573"
                 else:
                     boarding_title = bp_snap.get("title") or "Boarding Point"
                     boarding_time = bp_snap.get("departure_time") or "7:30 AM"
                     boarding_landmark = bp_snap.get("landmark") or "Near SBI ATM"
-                    boarding_phone = bp_snap.get("contact_number") or "9542069573"
+                    boarding_phone = bp_snap.get("contact_number") or "9951369573"
 
                 await send_travel_reminder_sms(
                     customer_name=cust_name,

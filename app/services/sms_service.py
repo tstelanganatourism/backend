@@ -214,7 +214,7 @@ async def send_travel_reminder_sms(
             "var4": boarding_title[:30] if boarding_title else "Boarding Point",
             "var5": boarding_time[:15] if boarding_time else "7:30 AM",
             "var6": boarding_landmark[:50] if boarding_landmark else "Near SBI ATM",
-            "var7": boarding_phone[:15] if boarding_phone else "9542069573",
+            "var7": boarding_phone[:15] if boarding_phone else "9951369573",
             "var8": public_id,
             "var9": public_id,
         },
@@ -237,7 +237,7 @@ async def send_room_reminder_sms(
             "var2": public_id,
             "var3": lodge_name[:30],
             "var4": checkin_detail,
-            "var5": "9542069573",  # Office contact number from DLT sample
+            "var5": "9951369573",  # Office contact number from DLT sample
             "var6": public_id,
         },
     )

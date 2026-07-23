@@ -50,6 +50,13 @@ if settings.SENTRY_DSN:
 
 setup_exception_handlers(app)
 
+from fastapi.middleware.gzip import GZipMiddleware
+
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=500,
+)
+
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=settings.ALLOWED_HOSTS,

@@ -69,7 +69,7 @@ class CashfreeService:
             "customer_details": {
                 "customer_id": customer_id[:50],  # Cashfree max 50 chars
                 "customer_name": customer_name[:50] if customer_name else "Customer",
-                "customer_email": customer_email or "noreply@tstelanganatourism.com",
+                "customer_email": customer_email or "tstelanganatourism@gmail.com",
                 "customer_phone": customer_phone or "9999999999",
             },
             "order_meta": {

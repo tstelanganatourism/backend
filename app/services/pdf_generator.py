@@ -292,8 +292,8 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             return
 
         # Build premium, email-client-safe HTML content.
-        office_phone = "+91 95420 69573"
-        office_address = "DR NO:4-1-78/1, KALYANA MANDAPAM ROAD OPP SBI ATM, BHADRACHALAM, BHADRADRI KOTHAGUDEM (DIST), TELANGANA-507111"
+        office_phone = "+91 99513 69573, +91 77801 19268"
+        office_address = "DOOR NO: 10-1-2/1, GROUND FLOOR, OM SHANTHI BUILDING SATARAM, BHADRACHALAM, BHADRADRI KOTHAGUDEM (DIST), TELANGANA-507111"
         office_maps_url = "https://maps.app.goo.gl/b9ZvxUvvFq6FgKVU8"
         # Recipient name is handled per-recipient in _generate_html
         safe_booking_id = escape(booking.public_id)

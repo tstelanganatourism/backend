@@ -106,7 +106,7 @@ class PhonePeService:
             "expireAfter": 900,
             "paymentFlow": {
                 "type": "PG_CHECKOUT",
-                "message": "Telangana Boat Tourism booking",
+                "message": "TS Boat Tourism booking",
                 "merchantUrls": {
                     "redirectUrl": redirect_url
                 }

@@ -1323,25 +1323,7 @@ async def get_tourist_bookings(
         
     return sanitized_items
 
-@router.get("/live-count")
-async def get_live_booking_count(db: AsyncSession = Depends(get_db)):
-    """
-    Returns the live booking count for the navbar.
-    Base count is 10000 + the actual number of successful bookings.
-    Uses L1/L2 cache to keep navbar loads under 1ms.
-    """
-    from app.utils.cache import ttl_cache_get_or_set
 
-    async def _fetch_count():
-        from sqlalchemy import func
-        query = select(func.count(Booking.id)).where(
-            Booking.status.in_([BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID])
-        )
-        result = await db.execute(query)
-        return result.scalar() or 0
-
-    count = await ttl_cache_get_or_set("bookings:live_count", 30, _fetch_count)
-    return {"count": 10000 + count}
 
 @router.get("/{public_id}")
 async def get_booking_details(

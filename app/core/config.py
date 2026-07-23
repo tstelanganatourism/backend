@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     BREVO_API_KEY_USER: Optional[str] = None
     BREVO_API_KEY_ADMIN: Optional[str] = None
     BREVO_API_KEY_BACKUP: Optional[str] = None
-    BREVO_FROM_EMAIL: str = "bookings@tstelanganatourism.com"
+    BREVO_FROM_EMAIL: str = "tstelanganatourism@gmail.com"
     BREVO_FROM_EMAIL_USER: Optional[str] = None
     BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
     BREVO_FROM_EMAIL_BACKUP: Optional[str] = None
