@@ -474,7 +474,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                         <tr>
                                             <td align="center">
-                                                <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #c8a45a; background-color:#ffffff; object-fit:cover;">
+                                                <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/tsboat_logo_apple_touch.png" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #c8a45a; background-color:#ffffff; object-fit:cover;">
                                             </td>
                                         </tr>
                                     </table>

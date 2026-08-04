@@ -216,7 +216,7 @@ def _build_otp_email_html(
                                 <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                     <tr>
                                         <td align="center">
-                                            <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784575768/ts_tours/branding/logo.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #ffffff; background-color:#ffffff; object-fit:cover;">
+                                            <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/tsboat_logo_apple_touch.png" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border-radius:38px; border:2px solid #ffffff; background-color:#ffffff; object-fit:cover;">
                                         </td>
                                     </tr>
                                 </table>
@@ -358,8 +358,12 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
 
     primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
     primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+    if not primary_from or primary_from == "bookings@tstelanganatourism.com":
+        primary_from = "tstelanganatourism@gmail.com"
     backup_key = settings.BREVO_API_KEY_BACKUP
     backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
+
+    logger.info(f"Sending Admin OTP to {email} with Sender: {primary_from}")
 
     if not primary_key and not backup_key:
         logger.warning("No BREVO_API_KEY_ADMIN, BREVO_API_KEY, or BREVO_API_KEY_BACKUP configured, skipping actual email send.")
@@ -395,7 +399,9 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
                     timeout=10.0,
                 )
                 if resp.status_code not in (200, 201):
+                    logger.error(f"Brevo API Error for {email}: {resp.status_code} - {resp.text}")
                     return False, f"Brevo API Error: {resp.status_code} - {resp.text}"
+                logger.info(f"Brevo API Success for {email}: {resp.status_code} - {resp.text}")
                 return True, ""
         except Exception as e:
             return False, f"Exception: {str(e)}"
