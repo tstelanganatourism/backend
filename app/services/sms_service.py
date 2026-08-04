@@ -29,6 +29,7 @@ PACKAGE_SHORT_NAMES = {
 TEMPLATES = {
     "TSBOAT_OTP":                  settings.MSG91_OTP_TEMPLATE_ID,
     "TSBOAT_ROOM_CONFIRM":         settings.MSG91_ROOM_CONFIRM_TEMPLATE_ID,
+    "TSBOAT_ROOM_CONFIRM_PARTIAL": getattr(settings, "MSG91_ROOM_CONFIRM_PARTIAL_TEMPLATE_ID", settings.MSG91_ROOM_CONFIRM_TEMPLATE_ID),
     "TSBOAT_ROOM_REMINDER":        settings.MSG91_ROOM_REMINDER_TEMPLATE_ID,
     "TSBOAT_CONFIRMATION_FULL":    settings.MSG91_CONFIRMATION_FULL_TEMPLATE_ID,
     "TSBOAT_CONFIRMATION_PARTIAL": settings.MSG91_CONFIRMATION_PARTIAL_TEMPLATE_ID,
@@ -101,7 +102,10 @@ async def send_otp_sms(phone: str, otp: str) -> bool:
     return await send_msg91_sms(
         mobile=phone,
         template_id=TEMPLATES["TSBOAT_OTP"],
-        variables={"var1": otp, "var2": "5"},  # var2 = expiry minutes
+        variables={
+            "var1": otp, "var2": "5",
+            "otp": otp, "expiry": "5",
+        },
     )
 
 
@@ -121,6 +125,7 @@ async def send_booking_confirmation_sms(
 ) -> bool:
     """Send booking confirmation SMS. Uses full or partial template."""
     short_name = get_short_package_name(package_title)
+    pax_val = passenger_count_str or str(passenger_count)
 
     if is_partial:
         remaining = f"{float(total_amount) - float(paid_amount):.2f}"
@@ -129,12 +134,12 @@ async def send_booking_confirmation_sms(
             mobile=customer_phone,
             template_id=TEMPLATES["TSBOAT_CONFIRMATION_PARTIAL"],
             variables={
-                "var1": customer_name,
-                "var2": public_id,
-                "var3": paid_fmt,
-                "var4": remaining,
-                "var5": travel_date_str,
-                "var6": public_id,
+                "var1": customer_name, "name": customer_name,
+                "var2": public_id, "pnr": public_id,
+                "var3": paid_fmt, "paid": paid_fmt,
+                "var4": remaining, "remaining": remaining,
+                "var5": travel_date_str, "date": travel_date_str,
+                "var6": public_id, "ticket_id": public_id,
                 "var7": public_id,
             },
         )
@@ -145,14 +150,14 @@ async def send_booking_confirmation_sms(
             mobile=customer_phone,
             template_id=TEMPLATES["TSBOAT_CONFIRMATION_FULL"],
             variables={
-                "var1": customer_name,
-                "var2": public_id,
-                "var3": short_name,
-                "var4": travel_date_str,
-                "var5": passenger_count_str or str(passenger_count),
-                "var6": paid_fmt,
-                "var7": total_fmt,
-                "var8": public_id,
+                "var1": customer_name, "name": customer_name,
+                "var2": public_id, "pnr": public_id,
+                "var3": short_name, "package": short_name,
+                "var4": travel_date_str, "date": travel_date_str,
+                "var5": pax_val, "pax": pax_val,
+                "var6": paid_fmt, "paid": paid_fmt,
+                "var7": total_fmt, "total": total_fmt,
+                "var8": public_id, "ticket_id": public_id,
                 "var9": public_id,
             },
         )
@@ -170,25 +175,44 @@ async def send_room_confirmation_sms(
     checkout_time_str: str,
     paid_amount_str: str,
     total_amount_str: str,
+    is_partial: bool = False,
 ) -> bool:
-    """Send room booking confirmation SMS using the approved DLT template."""
-    return await send_msg91_sms(
-        mobile=customer_phone,
-        template_id=TEMPLATES["TSBOAT_ROOM_CONFIRM"],
-        variables={
-            "var1": customer_name,
-            "var2": public_id,
-            "var3": lodge_name[:30],
-            "var4": room_name[:30],
-            "var5": checkin_date_str,
-            "var6": checkin_time_str,
-            "var7": checkout_date_str,
-            "var8": checkout_time_str,
-            "var9": paid_amount_str,
-            "var10": total_amount_str,
-            "var11": public_id,
-        },
-    )
+    """Send room booking confirmation SMS. Uses full or partial room advance template."""
+    if is_partial:
+        remaining = f"{float(total_amount_str) - float(paid_amount_str):.2f}"
+        return await send_msg91_sms(
+            mobile=customer_phone,
+            template_id=TEMPLATES.get("TSBOAT_ROOM_CONFIRM_PARTIAL", TEMPLATES["TSBOAT_ROOM_CONFIRM"]),
+            variables={
+                "var1": customer_name, "name": customer_name,
+                "var2": public_id, "pnr": public_id,
+                "var3": lodge_name[:30], "lodge": lodge_name[:30],
+                "var4": room_name[:30], "room": room_name[:30],
+                "var5": checkin_date_str, "checkin_date": checkin_date_str,
+                "var6": checkin_time_str, "checkin_time": checkin_time_str,
+                "var7": paid_amount_str, "paid": paid_amount_str,
+                "var8": remaining, "remaining": remaining,
+                "var9": public_id, "ticket_id": public_id,
+            },
+        )
+    else:
+        return await send_msg91_sms(
+            mobile=customer_phone,
+            template_id=TEMPLATES["TSBOAT_ROOM_CONFIRM"],
+            variables={
+                "var1": customer_name, "name": customer_name,
+                "var2": public_id, "pnr": public_id,
+                "var3": lodge_name[:30], "lodge": lodge_name[:30],
+                "var4": room_name[:30], "room": room_name[:30],
+                "var5": checkin_date_str, "checkin_date": checkin_date_str,
+                "var6": checkin_time_str, "checkin_time": checkin_time_str,
+                "var7": checkout_date_str, "checkout_date": checkout_date_str,
+                "var8": checkout_time_str, "checkout_time": checkout_time_str,
+                "var9": paid_amount_str, "paid": paid_amount_str,
+                "var10": total_amount_str, "total": total_amount_str,
+                "var11": public_id, "ticket_id": public_id,
+            },
+        )
 
 
 # ─── Travel Day Reminder SMS ─────────────────────────────────────────────────
@@ -204,18 +228,24 @@ async def send_travel_reminder_sms(
     boarding_phone: str,
 ) -> bool:
     """Send a travel-day reminder SMS for a package booking using the approved DLT template."""
+    b_title = boarding_title[:30] if boarding_title else "Boarding Point"
+    b_time = boarding_time[:15] if boarding_time else "7:30 AM"
+    b_landmark = boarding_landmark[:50] if boarding_landmark else "Near SBI ATM"
+    b_phone = boarding_phone[:15] if boarding_phone else "9951369573"
+    pkg_short = get_short_package_name(package_title)
+
     return await send_msg91_sms(
         mobile=customer_phone,
         template_id=TEMPLATES["TSBOAT_TRAVEL_REMINDER"],
         variables={
-            "var1": customer_name,
-            "var2": public_id,
-            "var3": get_short_package_name(package_title),
-            "var4": boarding_title[:30] if boarding_title else "Boarding Point",
-            "var5": boarding_time[:15] if boarding_time else "7:30 AM",
-            "var6": boarding_landmark[:50] if boarding_landmark else "Near SBI ATM",
-            "var7": boarding_phone[:15] if boarding_phone else "9951369573",
-            "var8": public_id,
+            "var1": customer_name, "name": customer_name,
+            "var2": public_id, "pnr": public_id,
+            "var3": pkg_short, "package": pkg_short,
+            "var4": b_title, "boarding": b_title,
+            "var5": b_time, "departure_time": b_time,
+            "var6": b_landmark, "landmark": b_landmark,
+            "var7": b_phone, "helpline": b_phone,
+            "var8": public_id, "ticket_id": public_id,
             "var9": public_id,
         },
     )
@@ -233,12 +263,12 @@ async def send_room_reminder_sms(
         mobile=customer_phone,
         template_id=TEMPLATES["TSBOAT_ROOM_REMINDER"],
         variables={
-            "var1": customer_name,
-            "var2": public_id,
-            "var3": lodge_name[:30],
-            "var4": checkin_detail,
-            "var5": "9951369573",  # Office contact number from DLT sample
-            "var6": public_id,
+            "var1": customer_name, "name": customer_name,
+            "var2": public_id, "pnr": public_id,
+            "var3": lodge_name[:30], "lodge": lodge_name[:30],
+            "var4": checkin_detail, "checkin_detail": checkin_detail,
+            "var5": "9951369573", "helpline": "9951369573",
+            "var6": public_id, "ticket_id": public_id,
         },
     )
 
@@ -414,6 +444,7 @@ async def get_booking_sms_payload(
                 "checkout_time_str": booking.room_checkout or "10:00 AM",
                 "paid_amount_str": paid_str,
                 "total_amount_str": total_str,
+                "is_partial": is_partial,
             }
 
         else:
@@ -476,6 +507,7 @@ async def dispatch_sms_payload(ctx, payload: dict) -> bool:
                 checkout_time_str=payload["checkout_time_str"],
                 paid_amount_str=payload["paid_amount_str"],
                 total_amount_str=payload["total_amount_str"],
+                is_partial=payload.get("is_partial", False),
             )
 
         else:

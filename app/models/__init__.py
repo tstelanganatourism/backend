@@ -22,6 +22,7 @@ from app.models.add_on import AddOn
 from app.models.promotion import Promotion
 from app.models.coupon import Coupon
 from app.models.settings import SystemSettings, AuditLog
+from app.models.activity_log import CheckoutFunnelLog
 
 # Expose all models for Alembic
 __all__ = [
@@ -35,5 +36,5 @@ __all__ = [
     "PackageInclusion", "PackageExclusion", "PackageBoardingPoint",
     "PackageFAQ", "PackagePolicy", "PackageTransportOption", "PackageTransportInventory",
     "Booking", "BookingStayDate", "BookingPassenger", "CancellationRequest", "PostponeRequest", "Payment", "AddOn",
-    "Promotion", "Coupon", "SystemSettings", "AuditLog"
+    "Promotion", "Coupon", "SystemSettings", "AuditLog", "CheckoutFunnelLog"
 ]

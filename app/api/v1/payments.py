@@ -223,6 +223,13 @@ async def _finalize_draft(
     if draft.target_type == 'room':
         snapshot["slot_start"] = draft.checkout_payload.get('slot_start')
         snapshot["slot_end"] = draft.checkout_payload.get('slot_end')
+        if 'inv' in locals() and inv:
+            if inv.hotel_name and "hotel_name" not in snapshot:
+                snapshot["hotel_name"] = inv.hotel_name
+            if inv.hotel_address and "hotel_address" not in snapshot:
+                snapshot["hotel_address"] = inv.hotel_address
+            if inv.hotel_map_url and "hotel_map_url" not in snapshot:
+                snapshot["hotel_map_url"] = inv.hotel_map_url
 
     # 4. Increment coupon usage
     if draft.coupon_applied:
@@ -363,6 +370,19 @@ async def _finalize_draft(
         collected_by_type=payment_source,
     )
     db.add(payment_record)
+
+    # Update Checkout Funnel Activity log to PAYMENT_COMPLETED
+    try:
+        from app.models.activity_log import CheckoutFunnelLog
+        f_res = await db.execute(select(CheckoutFunnelLog).where(
+            (CheckoutFunnelLog.booking_public_id == draft.draft_id) |
+            (CheckoutFunnelLog.booking_public_id == draft.pg_transaction_id)
+        ))
+        f_log = f_res.scalars().first()
+        if f_log:
+            f_log.funnel_stage = "PAYMENT_COMPLETED"
+    except Exception as log_err:
+        logger.warning(f"Could not update funnel log to PAYMENT_COMPLETED: {log_err}")
 
     # 6. Persist Stay Dates (if room)
     if draft.target_type == 'room':

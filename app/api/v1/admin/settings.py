@@ -80,3 +80,32 @@ async def update_settings(
     await db.commit() # Commit the log
     
     return settings_record
+
+
+class MessagingTestRequestDTO(BaseModel):
+    phone: str = "9951369573"
+    email: str = "tsboattourismservices@gmail.com"
+    channel: str = "ALL"  # "ALL", "SMS", "EMAIL"
+    dry_run: bool = False
+
+
+@router.post("/test-messaging")
+async def test_all_messaging_endpoint(
+    body: MessagingTestRequestDTO,
+    current_admin: User = Depends(require_admin)
+):
+    """Trigger live tests for MSG91 SMS templates and Brevo email channels."""
+    from app.services.messaging_tester import MessagingTester
+    tester = MessagingTester(phone=body.phone, email=body.email, dry_run=body.dry_run)
+    if body.channel in ["ALL", "SMS"]:
+        await tester.test_sms_templates()
+    if body.channel in ["ALL", "EMAIL"]:
+        await tester.test_email_channels()
+    return {
+        "success": True,
+        "phone": body.phone,
+        "email": body.email,
+        "dry_run": body.dry_run,
+        "results": tester.results
+    }
+

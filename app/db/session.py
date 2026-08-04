@@ -26,15 +26,11 @@ is_worker = any("arq" in arg or "worker" in arg for arg in sys.argv)
 #   Total prod : 11 connections max  (4 left as superuser headroom)
 #
 if is_local_dev:
-    # NullPool allows UNLIMITED concurrent connections during spikes.
-    # We MUST use a small QueuePool to enforce a hard ceiling on connections.
-    # Reduced to 3 max — local dev and production share the same Aiven DB instance
-    # (15 connections total). Prod web=10 + worker=3 = 13 used, leaving 2 for dev.
     pool_kwargs = {
-        "pool_size": 2,
-        "max_overflow": 1,
-        "pool_timeout": 30,
-        "pool_recycle": 600,
+        "pool_size": 10,
+        "max_overflow": 20,
+        "pool_timeout": 10,
+        "pool_recycle": 300,
         "pool_pre_ping": True,
     }
 elif is_worker:

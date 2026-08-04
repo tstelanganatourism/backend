@@ -822,6 +822,18 @@ async def checkout(
         if request.slot_end:
             pricing_snapshot["slot_end"] = str(request.slot_end)
         
+        first_inv = locked_inventories[0] if 'locked_inventories' in locals() and locked_inventories else None
+        h_name = (first_inv.hotel_name if first_inv and first_inv.hotel_name else None) or (room_obj.lodge_name if room_obj else None)
+        h_addr = (first_inv.hotel_address if first_inv and first_inv.hotel_address else None) or (room_obj.address if room_obj else None)
+        h_map = (first_inv.hotel_map_url if first_inv and first_inv.hotel_map_url else None) or (room_obj.map_url if room_obj else None)
+        
+        if h_name:
+            pricing_snapshot["hotel_name"] = h_name
+        if h_addr:
+            pricing_snapshot["hotel_address"] = h_addr
+        if h_map:
+            pricing_snapshot["hotel_map_url"] = h_map
+        
     # --- Payment Gateway Order Generation ---
     payment_percentage = request.payment_percentage if request.payment_percentage is not None else 100.0
     
@@ -965,6 +977,53 @@ async def checkout(
     )
     db.add(draft)
     await db.flush()
+
+    # Log Checkout Funnel Activity and Dispatch Admin Email Alert
+    try:
+        from app.models.activity_log import CheckoutFunnelLog
+        from app.services.abandoned_lead_service import send_admin_abandoned_lead_notification
+
+        header_sess = fastapi_req.headers.get("x-session-id")
+        session_id = header_sess or f"sess_{draft_id}"
+        
+        target_title_val = "Tour Package"
+        if request.target_type.lower() == 'package' and 'parent_package' in locals() and parent_package:
+            target_title_val = parent_package.title
+        elif request.target_type.lower() == 'room' and 'room_obj' in locals() and room_obj:
+            target_title_val = room_obj.lodge_name
+
+        variant_title_val = None
+        if request.target_type.lower() == 'package' and 'variant' in locals() and variant:
+            variant_title_val = variant.variant_name
+
+        funnel_log = CheckoutFunnelLog(
+            session_id=session_id,
+            user_id=current_user.id if current_user else None,
+            funnel_stage="CHECKOUT_INITIATED",
+            target_type=request.target_type,
+            target_id=target_id,
+            target_title=target_title_val,
+            variant_title=variant_title_val,
+            travel_date=str(request.travel_date),
+            adult_count=adult_count if 'adult_count' in locals() else request.quantity,
+            child_count=child_count if 'child_count' in locals() else 0,
+            student_count=student_count if 'student_count' in locals() else 0,
+            total_amount=total_amount,
+            coupon_code=coupon_applied,
+            customer_name=user_name,
+            customer_email=user_email,
+            customer_phone=user_phone,
+            passengers_data=[p.model_dump() for p in request.passengers] if request.passengers else None,
+            booking_public_id=draft_id,
+            payment_gateway=selected_gateway,
+            ip_address=fastapi_req.client.host if fastapi_req.client else None,
+            user_agent=fastapi_req.headers.get("user-agent"),
+        )
+        db.add(funnel_log)
+        await db.flush()
+        await send_admin_abandoned_lead_notification(funnel_log, db)
+    except Exception as f_err:
+        logger.warning(f"Backend checkout funnel logging error: {f_err}")
 
     import time
     from app.utils.sse import sse_manager
@@ -1424,6 +1483,13 @@ async def get_booking_details(
                 room_address = inv_row.hotel_address
             if inv_row.hotel_map_url:
                 room_map_url = inv_row.hotel_map_url
+        if b.pricing_snapshot:
+            if b.pricing_snapshot.get('hotel_name'):
+                package_title = b.pricing_snapshot.get('hotel_name')
+            if b.pricing_snapshot.get('hotel_address'):
+                room_address = b.pricing_snapshot.get('hotel_address')
+            if b.pricing_snapshot.get('hotel_map_url'):
+                room_map_url = b.pricing_snapshot.get('hotel_map_url')
     
     room_checkout_date = None
     room_highlights = []

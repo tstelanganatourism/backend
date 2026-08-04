@@ -27,6 +27,14 @@ from app.api.v1 import public_packages, public_rooms
 from app.api.v1 import promotions
 from app.api.v1 import admin
 
+import os
+from fastapi.staticfiles import StaticFiles
+
+# Create local static uploads directory
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+uploads_dir = os.path.join(static_dir, "uploads")
+os.makedirs(uploads_dir, exist_ok=True)
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version="1.0.0",
@@ -35,6 +43,8 @@ app = FastAPI(
     redoc_url=None if settings.ENVIRONMENT == "production" else "/redoc",
     lifespan=lifespan,
 )
+
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Initialize structured logging and error handlers
 setup_logging()
@@ -128,11 +138,19 @@ app.include_router(
     prefix="/api/v1"
 )
 from app.api.v1 import documents
+from app.api.v1 import activity
 
 # ─── Documents Routes (Phase-3) ───────────────────────────────────────────────────
 app.include_router(
     documents.router,
     prefix="/api/v1",
+)
+
+# ─── Activity Funnel Routes ───────────────────────────────────────────────────
+app.include_router(
+    activity.router,
+    prefix="/api/v1/activity",
+    tags=["User Activity & Funnel Tracking"],
 )
 
 # ─── Admin Routes (Phase-3) ───────────────────────────────────────────────────

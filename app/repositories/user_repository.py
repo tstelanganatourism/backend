@@ -133,14 +133,24 @@ async def get_or_create_tourist_by_phone(db: AsyncSession, phone: str) -> User:
     """
     Find a tourist by phone number, or create a new minimal account.
     Used by the phone OTP login flow — no password required.
+    Default name format: User_DD_MM_YYYY_serial (e.g. User_27_07_2026_001)
     """
     user = await get_user_by_phone(db, phone)
     if user:
         return user
 
-    last4 = phone[-4:] if len(phone) >= 4 else phone
+    from datetime import datetime
+    from sqlalchemy import select, func
+
+    # Calculate serial number from total user count
+    count_stmt = select(func.count(User.id))
+    total_count = (await db.execute(count_stmt)).scalar() or 0
+    serial_num = f"{total_count + 1:03d}"
+    date_str = datetime.now().strftime("%d_%m_%Y")
+    default_name = f"User_{date_str}_{serial_num}"
+
     new_user = User(
-        full_name=f"Guest {last4}",
+        full_name=default_name,
         phone_number=phone,
         email=None,
         password_hash=None,

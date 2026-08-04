@@ -39,31 +39,36 @@ def _mem_delete_prefix(prefix: str) -> None:
         _mem_cache.pop(k, None)
 
 
-# ─── Main Cache Utility ───────────────────────────────────────────────────────
+_redis_circuit_until: float = 0.0
 
 async def ttl_cache_get_or_set(
     key: str,
     ttl_seconds: int,
     factory: Callable[[], Awaitable[T]],
 ) -> T:
+    global _redis_circuit_until
+
     # 1. L1 fast path: in-process memory cache (no network, < 1ms)
     cached = _mem_get(key)
     if cached is not None:
         return cached
 
-    # 2. L2: Try Redis with short timeout
+    # 2. L2: Try Redis with circuit breaker & 50ms fast-fail timeout
     redis_available = False
-    try:
-        from app.services.redis_client import get_redis_raw
-        redis = get_redis_raw()
-        cached_data = await asyncio.wait_for(redis.get(key), timeout=0.8)
-        if cached_data:
-            value = pickle.loads(cached_data)
-            _mem_set(key, value, ttl_seconds)
-            return value
-        redis_available = True
-    except Exception:
-        redis_available = False
+    now = time.monotonic()
+    if now >= _redis_circuit_until:
+        try:
+            from app.services.redis_client import get_redis_raw
+            redis = get_redis_raw()
+            cached_data = await asyncio.wait_for(redis.get(key), timeout=0.05)
+            if cached_data:
+                value = pickle.loads(cached_data)
+                _mem_set(key, value, ttl_seconds)
+                return value
+            redis_available = True
+        except Exception:
+            _redis_circuit_until = time.monotonic() + 30.0
+            redis_available = False
 
     # 3. Cache miss: Execute factory (DB query)
     value = await factory()
