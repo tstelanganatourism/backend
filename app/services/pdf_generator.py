@@ -140,7 +140,7 @@ async def generate_package_brochure_task(ctx, package_id: int):
             await db.commit()
             
             if settings.ENVIRONMENT == "development":
-                frontend_url = "https://localhost:3000"
+                frontend_url = "http://localhost:3000"
             else:
                 frontend_url = settings.FRONTEND_URL.rstrip('/')
             print_url = f"{frontend_url}/print/package/{package.slug}"
