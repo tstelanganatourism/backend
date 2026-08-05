@@ -214,6 +214,23 @@ async def _finalize_draft(
             if inv:
                 inv.reserved_rooms = max(0, inv.reserved_rooms - required_rooms)
                 inv.booked_rooms += required_rooms
+                
+                if sse_payloads is not None:
+                    import time
+                    from app.core.timezone import get_ist_now
+                    sse_payloads.append({
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "room_id": rv.room_id,
+                        "travel_date": str(stay_date),
+                        "available": inv.total_rooms - (inv.booked_rooms + inv.reserved_rooms),
+                        "reserved": inv.reserved_rooms,
+                        "booked": inv.booked_rooms,
+                        "is_closed": inv.is_closed,
+                        "variant_id": inv.room_variant_id,
+                        "slot_start": str(inv.slot_start),
+                        "slot_end": str(inv.slot_end)
+                    })
 
     # 3. Prepare pricing snapshot
     snapshot = draft.pricing_snapshot
@@ -262,7 +279,7 @@ async def _finalize_draft(
         from app.models.room import RoomVariant, Room
         from app.models.booking import generate_pnr_prefix
         room_res = await db.execute(
-            select(Room.title)
+            select(Room.lodge_name)
             .join(RoomVariant, RoomVariant.room_id == Room.id)
             .where(RoomVariant.id == draft.room_variant_id)
         )
@@ -394,10 +411,19 @@ async def _finalize_draft(
         try:
             from app.worker import get_arq_pool
             arq_pool = await get_arq_pool()
-            await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
-            logger.info(f"Successfully enqueued post-booking documents task for booking {p_id}")
+            if arq_pool:
+                await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
+                logger.info(f"Enqueued post-booking documents task to ARQ for booking {p_id}")
         except Exception as arq_err:
-            logger.warning(f"Failed to enqueue post-booking documents background task: {arq_err}")
+            logger.warning(f"ARQ enqueue skipped for booking {p_id}: {arq_err}")
+
+        # Direct in-process fallback to guarantee email & PDF document delivery
+        try:
+            from app.services.pdf_generator import process_post_booking_documents_task
+            await process_post_booking_documents_task(None, b_id, is_fully_paid=is_fully_paid)
+            logger.info(f"Successfully sent confirmation emails and generated PDFs for booking {p_id}")
+        except Exception as doc_err:
+            logger.error(f"Error in direct document/email generation for booking {p_id}: {doc_err}")
 
     if background_tasks:
         background_tasks.add_task(_enqueue_documents_task_safe, booking.id, booking.public_id, booking.status == BookingStatus.FULLY_PAID)
@@ -515,9 +541,16 @@ async def verify_status(
                 try:
                     from app.worker import get_arq_pool
                     arq_pool = await get_arq_pool()
-                    await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
+                    if arq_pool:
+                        await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
                 except Exception as arq_err:
-                    logger.warning(f"Failed to enqueue post-booking documents task for balance payment: {arq_err}")
+                    logger.warning(f"ARQ enqueue skipped for balance payment: {arq_err}")
+
+                try:
+                    from app.services.pdf_generator import process_post_booking_documents_task
+                    await process_post_booking_documents_task(None, b_id, is_fully_paid=is_fully_paid)
+                except Exception as doc_err:
+                    logger.error(f"Error in direct document/email generation for balance payment: {doc_err}")
 
             if payment.status == PaymentStatus.CAPTURED:
                 background_tasks.add_task(_enqueue_bal_task, booking.id, booking.status == BookingStatus.FULLY_PAID)
@@ -535,13 +568,31 @@ async def verify_status(
     if draft.target_type == 'package':
         clear_cache_prefix("packages:list:")
         clear_cache_prefix("packages:detail:")
+        
+        # Invalidate packages availability Redis cache
+        from app.services.redis_client import invalidate_cached_availability
+        import asyncio
+        if draft.variant_id:
+            from app.models.package import Package, PackageVariant
+            pkg_res = await db.execute(
+                select(Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
+                    PackageVariant.id == draft.variant_id
+                )
+            )
+            pkg_slug = pkg_res.scalar_one_or_none()
+            if pkg_slug:
+                asyncio.create_task(invalidate_cached_availability(pkg_slug))
+                
     elif draft.target_type == 'room':
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
 
     from app.utils.sse import sse_manager
     for p in sse_payloads:
-        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+        if "package_id" in p:
+            await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+        elif "room_id" in p:
+            await sse_manager.broadcast_event("room", str(p["room_id"]), "INVENTORY_UPDATE", p)
 
     return {"status": "success", "booking_id": public_id}
 
@@ -614,13 +665,31 @@ async def phonepe_webhook(
                 if target_type == 'package':
                     clear_cache_prefix("packages:list:")
                     clear_cache_prefix("packages:detail:")
+                    
+                    # Invalidate packages availability Redis cache
+                    from app.services.redis_client import invalidate_cached_availability
+                    import asyncio
+                    if draft.variant_id:
+                        from app.models.package import Package, PackageVariant
+                        pkg_res = await db.execute(
+                            select(Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
+                                PackageVariant.id == draft.variant_id
+                            )
+                        )
+                        pkg_slug = pkg_res.scalar_one_or_none()
+                        if pkg_slug:
+                            asyncio.create_task(invalidate_cached_availability(pkg_slug))
+                            
                 elif target_type == 'room':
                     clear_cache_prefix("rooms:list:")
                     clear_cache_prefix("rooms:detail:")
 
                 from app.utils.sse import sse_manager
                 for p in sse_payloads:
-                    await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                    if "package_id" in p:
+                        await sse_manager.broadcast_event("package", str(p["package_id"]), "INVENTORY_UPDATE", p)
+                    elif "room_id" in p:
+                        await sse_manager.broadcast_event("room", str(p["room_id"]), "INVENTORY_UPDATE", p)
 
                 finalized_booking = await db.execute(
                     select(Booking).where(Booking.public_id == public_id).limit(1)

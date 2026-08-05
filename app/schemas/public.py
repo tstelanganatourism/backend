@@ -84,6 +84,8 @@ class PackageListDTO(AppBaseModel):
     is_student_package: bool = False
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
+    advance_payment_type: Optional[str] = "FULL_PAYMENT"
+    advance_payment_value: Optional[Decimal] = Decimal("0.00")
     transport_info: Optional[str] = None
     min_passengers: int = 1
     variants: List[PackageVariantPublicDTO] = Field(default_factory=list)

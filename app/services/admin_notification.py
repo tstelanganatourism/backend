@@ -77,16 +77,59 @@ async def send_admin_booking_notification(
     is_room = booking.room_variant_id is not None
     booking_type_label = "Accommodation / Room" if is_room else "Package / Tour"
 
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    secret = _booking_hash(booking.public_id)
+    ticket_url   = f"{frontend_url}/print/ticket/{booking.public_id}?secret={secret}"
+    invoice_url  = f"{frontend_url}/print/invoice/{booking.public_id}?secret={secret}"
+    form_url     = f"{frontend_url}/print/form/{booking.public_id}?secret={secret}" if not is_room else ""
+    dashboard_url = f"{frontend_url}/admin/bookings"
+
     target_name = "—"
     target_label = "Booked Room" if is_room else "Booked Package"
+    hotel_address_admin = None
+    hotel_map_url_admin = None
     if db:
         try:
             if is_room:
-                from app.models.room import RoomVariant, Room
-                res = await db.execute(select(Room.lodge_name, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
+                from app.models.room import RoomVariant, Room, RoomSlotInventory
+                res = await db.execute(select(Room.lodge_name, Room.address, Room.map_url, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
                 room_data = res.first()
+                pricing = booking.pricing_snapshot or {}
+                
+                # Try to get hotel name from inventory or snapshot
+                inv_hotel_name = pricing.get("hotel_name")
                 if room_data:
-                    target_name = f"{room_data[0]} ({room_data[1]})"
+                    target_name = f"{inv_hotel_name or room_data[0]} ({room_data[3]})"
+                    hotel_address_admin = pricing.get("hotel_address") or room_data[1]
+                    hotel_map_url_admin = pricing.get("hotel_map_url") or room_data[2]
+                
+                # Also try fetching from RoomSlotInventory for slot-specific hotel data
+                try:
+                    slot_start = pricing.get("slot_start")
+                    slot_end = pricing.get("slot_end")
+                    inv_stmt = select(RoomSlotInventory).where(
+                        RoomSlotInventory.room_variant_id == booking.room_variant_id,
+                        RoomSlotInventory.date == booking.travel_date
+                    )
+                    if slot_start and slot_end:
+                        from datetime import datetime as _dt2
+                        s_t = _dt2.strptime(slot_start, "%H:%M:%S").time()
+                        e_t = _dt2.strptime(slot_end, "%H:%M:%S").time()
+                        inv_stmt = inv_stmt.where(
+                            RoomSlotInventory.slot_start == s_t,
+                            RoomSlotInventory.slot_end == e_t
+                        )
+                    inv_res = await db.execute(inv_stmt)
+                    inv_row = inv_res.scalars().first()
+                    if inv_row:
+                        if inv_row.hotel_name and room_data:
+                            target_name = f"{inv_row.hotel_name} ({room_data[3]})"
+                        if inv_row.hotel_address:
+                            hotel_address_admin = inv_row.hotel_address
+                        if inv_row.hotel_map_url:
+                            hotel_map_url_admin = inv_row.hotel_map_url
+                except Exception:
+                    pass
             else:
                 from app.models.package import PackageVariant, Package
                 res = await db.execute(select(Package.title).join(PackageVariant).where(PackageVariant.id == booking.variant_id))
@@ -95,13 +138,6 @@ async def send_admin_booking_notification(
                     target_name = pkg_data[0]
         except Exception as e:
             logger.warning(f"Could not fetch target name for booking {booking.public_id}: {e}")
-
-    frontend_url = settings.FRONTEND_URL.rstrip("/")
-    secret = _booking_hash(booking.public_id)
-    ticket_url   = f"{frontend_url}/print/ticket/{booking.public_id}?secret={secret}"
-    invoice_url  = f"{frontend_url}/print/invoice/{booking.public_id}?secret={secret}"
-    form_url     = f"{frontend_url}/print/form/{booking.public_id}?secret={secret}" if not is_room else ""
-    dashboard_url = f"{frontend_url}/admin/bookings"
 
     # ── 2. Primary contact ────────────────────────────────────────────────────
     primary_name  = "Guest"
@@ -595,6 +631,8 @@ async def send_admin_booking_notification(
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">{target_label}</td>
                 <td style="padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;">{target_name}</td>
               </tr>
+              {"<tr><td style='padding:5px 0;font-size:13px;color:#64748b;'>Property Address</td><td style='padding:5px 0;font-size:13px;color:#0f172a;font-weight:600;'>" + hotel_address_admin + "</td></tr>" if hotel_address_admin else ""}
+              {"<tr><td style='padding:5px 0;font-size:13px;color:#64748b;'>Google Maps</td><td style='padding:5px 0;font-size:13px;'><a href='" + hotel_map_url_admin + "' target='_blank' style='color:#1a6b7a;font-weight:700;'>📍 Open Google Maps</a></td></tr>" if hotel_map_url_admin else ""}
               <tr>
                 <td style="padding:5px 0;font-size:13px;color:#64748b;">Payment Gateway</td>
                 <td style="padding:5px 0;font-size:13px;color:#059669;font-weight:600;">{pm_label}</td>

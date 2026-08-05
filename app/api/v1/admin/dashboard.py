@@ -54,7 +54,7 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
             booking_title = pkg_res.scalar_one_or_none()
         elif b.room_variant_id:
             rm_res = await db.execute(
-                select(Room.title)
+                select(Room.lodge_name)
                 .join(RoomVariant, RoomVariant.room_id == Room.id)
                 .where(RoomVariant.id == b.room_variant_id)
             )

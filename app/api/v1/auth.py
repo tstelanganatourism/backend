@@ -92,7 +92,7 @@ REFRESH_COOKIE_NAME = "refresh_token"
 COOKIE_SECURE = settings.ENVIRONMENT == "production"
 COOKIE_SAMESITE = "lax"
 AP_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358705/b66b077a-69fa-4625-8b49-9a168efde88f.png"
-TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png"
+TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg"
 
 
 from datetime import datetime, timezone, timedelta
@@ -216,7 +216,7 @@ def _build_otp_email_html(
                                 <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                     <tr>
                                         <td align="center">
-                                            <img class="logo-img" src="https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border:0; outline:none; text-decoration:none; margin:0 auto;">
+                                            <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border:0; outline:none; text-decoration:none; margin:0 auto; border-radius:50%; object-fit:cover;">
                                         </td>
                                     </tr>
                                 </table>

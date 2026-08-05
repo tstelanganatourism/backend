@@ -418,6 +418,8 @@ async def get_package_detail(
             is_featured=pkg.is_featured,
             tags=[tag.name for tag in pkg_tags if tag.is_active],
             starting_price=starting_price,
+            advance_payment_type=pkg.advance_payment_type.value if hasattr(pkg.advance_payment_type, 'value') else str(pkg.advance_payment_type or "FULL_PAYMENT"),
+            advance_payment_value=pkg.advance_payment_value or Decimal("0.00"),
             min_passengers=pkg.min_passengers or 1,
             # Transport & Refreshments
             is_student_package=pkg.is_student_package or False,

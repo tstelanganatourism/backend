@@ -350,7 +350,7 @@ async def get_room_availability(
     - Dates with no inventory row → NO_INVENTORY (disabled in calendar).
     """
     from app.core.timezone import get_ist_now
-    set_public_cache_headers(response)
+    set_no_store_headers(response)
     now_ist = get_ist_now()
     today = now_ist.date()
     is_after_6am = now_ist.hour >= 6

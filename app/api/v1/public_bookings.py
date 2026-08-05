@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, Response, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import date, time, timedelta, datetime, timezone
@@ -99,6 +99,7 @@ class CheckoutRequest(BaseModel):
 async def checkout(
     request: CheckoutRequest,
     fastapi_req: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
@@ -178,6 +179,8 @@ async def checkout(
     package_variant_id = None
     parent_package = None
     _room_stay_dates = []  # Populated for room bookings with multi-day stays
+    target_id = None
+    transport_options_to_broadcast = []
     
     # Start inventory validation scope under SELECT FOR UPDATE
     commissionable_base = Decimal("0.00")
@@ -253,6 +256,7 @@ async def checkout(
             raise HTTPException(status_code=400, detail="Package variant not found")
             
         parent_package = variant.package
+        target_id = parent_package.id
         
         # ── Agent Quota Enforcement ──────────────────────────────────────────
         is_agent = current_user is not None and current_user.role == UserRole.AGENT
@@ -621,6 +625,7 @@ async def checkout(
 
         room_variant_id = variant.id
         room_obj = variant.room
+        target_id = room_obj.id
 
         # 2. Calculate required rooms
         from app.services.room_calculation import calculate_required_rooms
@@ -935,7 +940,13 @@ async def checkout(
 
     # --- Gateway-specific order creation ---
     callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+    referer = fastapi_req.headers.get("referer")
+    origin_url = settings.FRONTEND_URL
+    if referer:
+        from urllib.parse import urlparse
+        parsed = urlparse(referer)
+        origin_url = f"{parsed.scheme}://{parsed.netloc}"
+    redirect_url = f"{origin_url}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
     phonepe_order = await phonepe_service.create_payment_url(
         amount=float(payable_amount),
         transaction_id=merchant_txn_id,
@@ -1021,7 +1032,7 @@ async def checkout(
         )
         db.add(funnel_log)
         await db.flush()
-        await send_admin_abandoned_lead_notification(funnel_log, db)
+        background_tasks.add_task(send_admin_abandoned_lead_notification, funnel_log, None)
     except Exception as f_err:
         logger.warning(f"Backend checkout funnel logging error: {f_err}")
 
@@ -1061,8 +1072,9 @@ async def checkout(
     await db.refresh(draft)
 
     from app.utils.sse import broadcast_transport_update
-    for opt_id in transport_options_to_broadcast:
-        await broadcast_transport_update(db, opt_id, request.travel_date)
+    if request.target_type.lower() == 'package':
+        for opt_id in transport_options_to_broadcast:
+            await broadcast_transport_update(db, opt_id, request.travel_date)
 
     for p in sse_payloads:
         target_channel = "package" if request.target_type.lower() == 'package' else "room"
@@ -1449,6 +1461,7 @@ async def get_booking_details(
     room_address = row[7] if row[7] else None
     room_id = row[8]
     room_map_url = None
+    hotel_name = package_title  # Default to original Lodge Name
 
     if b.room_variant_id:
         # Resolve dynamic hotel details from room slot inventory
@@ -1476,16 +1489,21 @@ async def get_booking_details(
                 pass
         inv_res = await db.execute(inv_stmt)
         inv_row = inv_res.scalars().first()
+        
+        # Keep package_title as original Lodge Name
+        package_title = row[3] or "Godavari Riverside Bamboo Huts"
+        hotel_name = package_title
+
         if inv_row:
             if inv_row.hotel_name:
-                package_title = inv_row.hotel_name
+                hotel_name = inv_row.hotel_name
             if inv_row.hotel_address:
                 room_address = inv_row.hotel_address
             if inv_row.hotel_map_url:
                 room_map_url = inv_row.hotel_map_url
         if b.pricing_snapshot:
             if b.pricing_snapshot.get('hotel_name'):
-                package_title = b.pricing_snapshot.get('hotel_name')
+                hotel_name = b.pricing_snapshot.get('hotel_name')
             if b.pricing_snapshot.get('hotel_address'):
                 room_address = b.pricing_snapshot.get('hotel_address')
             if b.pricing_snapshot.get('hotel_map_url'):
@@ -1672,6 +1690,7 @@ async def get_booking_details(
         "created_at": b.created_at.isoformat() if b.created_at else None,
         "package_title": package_title,
         "variant_title": variant_title,
+        "hotel_name": hotel_name,
         "package_type": package_type.value if hasattr(package_type, 'value') else str(package_type) if package_type else None,
         "boarding_point": {
             "title": boarding_point.title,
@@ -2018,7 +2037,13 @@ async def process_balance_checkout(
     merchant_txn_id = f"TXN_BAL_{str(uuid.uuid4())[:8].upper()}_{str(uuid.uuid4())[:4].upper()}"
 
     callback_url = f"{protocol}://{host}/api/v1/payments/webhook/phonepe"
-    redirect_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
+    referer = fastapi_req.headers.get("referer")
+    origin_url = settings.FRONTEND_URL
+    if referer:
+        from urllib.parse import urlparse
+        parsed = urlparse(referer)
+        origin_url = f"{parsed.scheme}://{parsed.netloc}"
+    redirect_url = f"{origin_url}/payment-status?merchantTransactionId={merchant_txn_id}&gateway=PHONEPE"
     phonepe_order = await phonepe_service.create_payment_url(
         amount=payable_amount,
         transaction_id=merchant_txn_id,

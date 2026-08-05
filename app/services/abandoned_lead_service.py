@@ -11,8 +11,31 @@ async def send_admin_abandoned_lead_notification(
     db: Optional[AsyncSession] = None,
 ) -> bool:
     """
-    Sends an instant, rich, production-grade HTML notification email to the Admin
-    whenever a user fills details, reaches checkout, or abandons payment.
+    Wrapper to handle background execution safely by opening a new session if db is None.
+    """
+    if db is None:
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as local_db:
+            from sqlalchemy import select
+            log_res = await local_db.execute(
+                select(CheckoutFunnelLog).where(CheckoutFunnelLog.id == log.id)
+            )
+            local_log = log_res.scalar_one_or_none()
+            if not local_log:
+                return False
+            res = await _send_admin_abandoned_lead_notification_core(local_log, local_db)
+            await local_db.commit()
+            return res
+    else:
+        return await _send_admin_abandoned_lead_notification_core(log, db)
+
+
+async def _send_admin_abandoned_lead_notification_core(
+    log: CheckoutFunnelLog,
+    db: AsyncSession,
+) -> bool:
+    """
+    Sends an instant, rich, production-grade HTML notification email to the Admin.
     """
     if log.admin_email_sent:
         logger.info(f"Skipping admin abandoned lead email for session {log.session_id} - already sent.")

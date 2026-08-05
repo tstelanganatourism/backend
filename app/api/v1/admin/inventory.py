@@ -288,7 +288,7 @@ async def get_variant_calendar(
         rows = result.scalars().all()
         return [_compute_row(r) for r in rows]
 
-    return await ttl_cache_get_or_set(cache_key, 60, _fetch)
+    return await _fetch()
 
 
 # ─── Update a single date ─────────────────────────────────────────────────────
@@ -808,7 +808,7 @@ async def get_room_calendar(
         )
         return [_compute_room_row(r) for r in result.scalars().all()]
 
-    return await ttl_cache_get_or_set(cache_key, 60, _fetch)
+    return await _fetch()
 
 
 # ─── Update a single room variant date ────────────────────────────────────────

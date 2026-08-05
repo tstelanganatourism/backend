@@ -54,7 +54,7 @@ from app.utils.cache import clear_cache_prefix
 logger = logging.getLogger(__name__)
 
 AP_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358705/b66b077a-69fa-4625-8b49-9a168efde88f.png"
-TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png"
+TS_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg"
 
 async def generate_pdf_from_url(url: str) -> bytes:
     """
@@ -71,7 +71,7 @@ async def generate_pdf_from_url(url: str) -> bytes:
             context = await browser.new_context(ignore_https_errors=True)
             page = await context.new_page()
             logger.info(f"Navigating to {url} for brochure PDF generation")
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             if not response or not response.ok:
                 status = response.status if response else "no response"
@@ -305,6 +305,10 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         safe_office_maps_url = escape(office_maps_url, quote=True)
 
         target_name = "—"
+        hotel_address = None
+        hotel_map_url = None
+        room_checkin_time = None
+        room_checkout_time = None
         try:
             if is_room_booking:
                 from app.models.room import RoomVariant, Room, RoomSlotInventory
@@ -332,13 +336,40 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 inv_res = await db.execute(inv_stmt)
                 inv_row = inv_res.scalars().first()
                 
-                res = await db.execute(select(Room.lodge_name, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
+                res = await db.execute(select(Room.lodge_name, Room.address, Room.map_url, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
                 room_data = res.first()
                 if inv_row and inv_row.hotel_name:
-                    target_name = f"{inv_row.hotel_name} — {room_data[0]} ({room_data[1]})" if room_data else inv_row.hotel_name
+                    target_name = f"{inv_row.hotel_name} — {room_data[0]} ({room_data[3]})" if room_data else inv_row.hotel_name
+                    hotel_address = inv_row.hotel_address or (room_data[1] if room_data else None)
+                    hotel_map_url = inv_row.hotel_map_url or (room_data[2] if room_data else None)
                 else:
                     if room_data:
-                        target_name = f"{room_data[0]} ({room_data[1]})"
+                        target_name = f"{room_data[0]} ({room_data[3]})"
+                        hotel_address = room_data[1]
+                        hotel_map_url = room_data[2]
+                
+                # Also pull from pricing_snapshot as fallback
+                if not hotel_address and booking.pricing_snapshot:
+                    hotel_address = booking.pricing_snapshot.get("hotel_address")
+                if not hotel_map_url and booking.pricing_snapshot:
+                    hotel_map_url = booking.pricing_snapshot.get("hotel_map_url")
+                
+                # Resolve checkin/checkout times from snapshot or inventory
+                from datetime import datetime as _dt
+                if slot_start:
+                    try:
+                        room_checkin_time = _dt.strptime(slot_start, "%H:%M:%S").strftime("%I:%M %p")
+                    except Exception:
+                        room_checkin_time = slot_start
+                if slot_end:
+                    try:
+                        room_checkout_time = _dt.strptime(slot_end, "%H:%M:%S").strftime("%I:%M %p")
+                    except Exception:
+                        room_checkout_time = slot_end
+                if not room_checkin_time and inv_row and inv_row.slot_start:
+                    room_checkin_time = inv_row.slot_start.strftime("%I:%M %p")
+                if not room_checkout_time and inv_row and inv_row.slot_end:
+                    room_checkout_time = inv_row.slot_end.strftime("%I:%M %p")
             else:
                 from app.models.package import PackageVariant, Package
                 res = await db.execute(select(Package.title).join(PackageVariant).where(PackageVariant.id == booking.variant_id))
@@ -352,21 +383,55 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
 
         if is_room_booking:
             preview_text = "Your TS Boat Tourism booking documents are ready. Download your ticket before the link expires."
-            next_steps_section = """
+            # Build hotel info section for email if available
+            hotel_info_section = ""
+            if hotel_address or hotel_map_url:
+                safe_hotel_addr = escape(hotel_address) if hotel_address else ""
+                safe_hotel_map = escape(hotel_map_url, quote=True) if hotel_map_url else ""
+                checkin_row = f"<strong>Check-in:</strong> {room_checkin_time}" if room_checkin_time else ""
+                checkout_row = f"&nbsp;&nbsp;|&nbsp;&nbsp;<strong>Check-out:</strong> {room_checkout_time}" if room_checkout_time else ""
+                map_btn = f'<br><a href="{safe_hotel_map}" target="_blank" style="display:inline-block; margin-top:12px; background-color:#1a6b7a; border-radius:10px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:18px; font-weight:800; padding:10px 16px; text-decoration:none;">📍 Open Google Maps</a>' if safe_hotel_map else ""
+                hotel_info_section = f"""
+                                    <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:20px 0 0 0; background-color:#f0f9f9; border:1px solid #b2d8d8; border-radius:14px; overflow:hidden;">
+                                        <tr>
+                                            <td style="padding:16px 20px;">
+                                                <div style="color:#0a5a6b; font-size:10px; line-height:14px; font-weight:900; text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">🏨 Property Address</div>
+                                                <div style="color:#102f3a; font-size:13px; line-height:20px; font-weight:600;">{safe_hotel_addr}</div>
+                                                <div style="color:#415865; font-size:12px; line-height:18px; margin-top:8px;">{checkin_row}{checkout_row}</div>
+                                                {map_btn}
+                                            </td>
+                                        </tr>
+                                    </table>
+                """.strip()
+            next_steps_section = f"""
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
                                         <tr>
                                             <td style="padding:0;">
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:8px;">Next steps</div>
-                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:12px;">Next steps</div>
+                                                <!-- Step 1: VISIT OFFICE FIRST — highlighted box -->
+                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:14px; background-color:#fff3e0; border:2px solid #e8913a; border-radius:14px; overflow:hidden;">
                                                     <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">1.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket.</td>
-                                                    </tr>
-                                                    <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry printed ticket during your journey.</td>
+                                                        <td style="padding:14px 16px;">
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:900; color:#b85c00; text-transform:uppercase; letter-spacing:1.2px; margin-bottom:4px;">⚠️ MANDATORY FIRST STEP</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#7a3900; line-height:22px; margin-bottom:8px;">Visit our Bhadrachalam office before check-in to confirm your booking and collect your room keys / entry authorisation.</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:#8a4b00; line-height:18px; margin-bottom:6px;">📍 DOOR NO: 10-1-2/1, Ground Floor, Om Shanthi Building Sataram,<br>Bhadrachalam, Bhadradri Kothagudem (Dist), Telangana – 507 111</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:#8a4b00; margin-bottom:10px;">📞 +91 99513 69573 &nbsp;|&nbsp; +91 77801 19268</div>
+                                                            <a href="{safe_office_maps_url}" target="_blank" style="display:inline-block; background-color:#e8913a; border-radius:8px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:800; padding:8px 14px; text-decoration:none;">📍 Open Google Maps</a>
+                                                        </td>
                                                     </tr>
                                                 </table>
+                                                <!-- Steps 2 & 3 -->
+                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket — carry it to the office.</td>
+                                                    </tr>
+                                                    <tr>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">3.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry your printed ticket throughout your entire stay.</td>
+                                                    </tr>
+                                                </table>
+                                                {hotel_info_section}
                                             </td>
                                         </tr>
                                     </table>
@@ -380,34 +445,47 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                         </tr>
                                     </table>
             """.strip()
-            mandatory_notice_section = """
+            mandatory_notice_section = f"""
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:4px 0 22px 0;">
                                         <tr>
-                                            <td style="background-color:#fff7df; border:1px solid #f0d998; border-radius:12px; padding:14px 16px; color:#8a4b00; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
-                                                Mandatory: bring printed tickets for verification before boarding.
+                                            <td style="background-color:#fff3e0; border:2px solid #e8913a; border-radius:12px; padding:14px 16px; color:#7a3900; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
+                                                ⚠️ IMPORTANT: You MUST visit our Bhadrachalam office FIRST to collect your room keys — bring your printed ticket &amp; valid ID proofs for all guests.
                                             </td>
                                         </tr>
                                     </table>
             """.strip()
         else:
             preview_text = "Your TS Boat Tourism booking documents are ready. Download your ticket and passenger form before the links expire."
-            next_steps_section = """
+            next_steps_section = f"""
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:28px 0 20px 0;">
                                         <tr>
                                             <td style="padding:0;">
-                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:8px;">Next steps</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#102f3a; font-size:18px; line-height:24px; font-weight:800; margin-bottom:12px;">Next steps</div>
+                                                <!-- Step 1: VISIT OFFICE FIRST — highlighted box -->
+                                                <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin-bottom:14px; background-color:#fff3e0; border:2px solid #e8913a; border-radius:14px; overflow:hidden;">
+                                                    <tr>
+                                                        <td style="padding:14px 16px;">
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:11px; font-weight:900; color:#b85c00; text-transform:uppercase; letter-spacing:1.2px; margin-bottom:4px;">⚠️ MANDATORY FIRST STEP BEFORE DEPARTURE</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:800; color:#7a3900; line-height:22px; margin-bottom:8px;">Visit our Bhadrachalam office with your printed ticket &amp; filled passenger form to collect your manual boarding pass — without this you CANNOT board.</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:#8a4b00; line-height:18px; margin-bottom:6px;">📍 DOOR NO: 10-1-2/1, Ground Floor, Om Shanthi Building Sataram,<br>Bhadrachalam, Bhadradri Kothagudem (Dist), Telangana – 507 111</div>
+                                                            <div style="font-family:Arial, Helvetica, sans-serif; font-size:12px; color:#8a4b00; margin-bottom:10px;">📞 +91 99513 69573 &nbsp;|&nbsp; +91 77801 19268</div>
+                                                            <a href="{safe_office_maps_url}" target="_blank" style="display:inline-block; background-color:#e8913a; border-radius:8px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:800; padding:8px 14px; text-decoration:none;">📍 Open Google Maps</a>
+                                                        </td>
+                                                    </tr>
+                                                </table>
+                                                <!-- Steps 2, 3, 4 -->
                                                 <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0">
                                                     <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">1.</td>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
                                                         <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download and print your ticket.</td>
                                                     </tr>
                                                     <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">2.</td>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">3.</td>
                                                         <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Download, fill, and print the passenger form.</td>
                                                     </tr>
                                                     <tr>
-                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">3.</td>
-                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry both printed documents during your journey.</td>
+                                                        <td valign="top" width="26" style="padding:4px 0 0 0; color:#078a81; font-size:14px; font-family:Arial, Helvetica, sans-serif; font-weight:800;">4.</td>
+                                                        <td style="padding:4px 0; color:#415865; font-size:14px; line-height:21px; font-family:Arial, Helvetica, sans-serif;">Carry both printed documents to the office and throughout your journey.</td>
                                                     </tr>
                                                 </table>
                                             </td>
@@ -426,11 +504,11 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                         </tr>
                                     </table>
             """.strip()
-            mandatory_notice_section = """
+            mandatory_notice_section = f"""
                                     <table role="presentation" width="100%" border="0" cellpadding="0" cellspacing="0" style="margin:4px 0 22px 0;">
                                         <tr>
-                                            <td style="background-color:#fff7df; border:1px solid #f0d998; border-radius:12px; padding:14px 16px; color:#8a4b00; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
-                                                Mandatory: bring printed forms and tickets for verification before boarding.
+                                            <td style="background-color:#fff3e0; border:2px solid #e8913a; border-radius:12px; padding:14px 16px; color:#7a3900; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; font-weight:800; text-align:center;">
+                                                ⚠️ IMPORTANT: You MUST visit our Bhadrachalam office FIRST — bring your printed ticket + filled form to collect your boarding pass. Without it, boarding is NOT allowed.
                                             </td>
                                         </tr>
                                     </table>
@@ -474,7 +552,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
                                         <tr>
                                             <td align="center">
-                                                <img class="logo-img" src="https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358643/22175967-f7df-420e-adcd-b4a37725fd5f.png" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border:0; outline:none; text-decoration:none; margin:0 auto;">
+                                                <img class="logo-img" src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="76" height="76" alt="TS Boat Tourism" style="display:block; width:76px; height:76px; border:0; outline:none; text-decoration:none; margin:0 auto; border-radius:50%; object-fit:cover;">
                                             </td>
                                         </tr>
                                     </table>

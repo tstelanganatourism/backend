@@ -755,7 +755,7 @@ async def admin_create_booking(
         from app.models.room import RoomVariant, Room
         from app.models.booking import generate_pnr_prefix
         room_res = await db.execute(
-            select(Room.title)
+            select(Room.lodge_name)
             .join(RoomVariant, RoomVariant.room_id == Room.id)
             .where(RoomVariant.id == room_variant_id_val)
         )

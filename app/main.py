@@ -10,14 +10,33 @@ import sqlalchemy
 import asyncio
 
 
+async def _periodic_draft_cleanup():
+    """Runs every 60 seconds to release inventory for expired payment drafts automatically."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            from app.workers.inventory_cleanup import cleanup_expired_drafts
+            await cleanup_expired_drafts(None)
+        except asyncio.CancelledError:
+            break
+        except Exception as err:
+            logger.warning(f"Background draft cleanup error: {err}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
-    pass
+    cleanup_task = asyncio.create_task(_periodic_draft_cleanup())
+    logger.info("Automatic 60s inventory draft cleanup background loop started.")
 
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
     from app.db.session import engine
     await engine.dispose()
     logger.info("Database connection pool disposed gracefully.")
