@@ -8,13 +8,13 @@ from sqlalchemy.orm import selectinload, joinedload
 
 from app.core.timezone import ist_date_today
 from app.db.session import get_db
-from app.models.package import Package, PackageVariant, PackageVariantInventory, package_tags
+from app.models.package import Package, PackageVariant, PackageVariantInventory, package_tags, PackageCategory, package_category_assignments
 from app.models.tag import Tag
 from app.models.enums import PackageType, RegionType, PublishStatus, BookingStatus, UserRole
 from app.models.booking import Booking
 from app.models.user import User
 from app.middleware.auth import get_current_user_optional
-from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO, TransportOptionPublicDTO
+from app.schemas.public import PaginatedResponse, PackageListDTO, PackageDetailDTO, PackageVariantPublicDTO, TransportOptionPublicDTO, PackageCategoryPublicDTO, PackageCategoryDetailPublicDTO
 from app.schemas.inventory import PublicDateAvailability, PublicPackageAvailabilityResponse
 from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
 from app.utils.pricing import get_effective_package_prices
@@ -212,6 +212,99 @@ async def get_packages(
         )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_packages)
+
+
+# ── Public Package Category Endpoints (must be BEFORE /{slug} route) ─────────────
+
+@router.get("/categories", response_model=List[PackageCategoryPublicDTO], tags=["Public Discovery - Package Categories"])
+async def list_package_categories(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns all active package categories, ordered by sort_order.
+    Used on the /packages landing page to show the category grid.
+    """
+    set_no_store_headers(response)
+    result = await db.execute(
+        select(PackageCategory)
+        .where(
+            PackageCategory.is_active == True,
+            PackageCategory.deleted_at.is_(None)
+        )
+        .options(selectinload(PackageCategory.packages))
+        .order_by(PackageCategory.sort_order, PackageCategory.id)
+    )
+    categories = result.scalars().all()
+    out = []
+    for cat in categories:
+        active_pkgs = [
+            p for p in cat.packages
+            if p.is_active and p.status == PublishStatus.PUBLISHED and not p.deleted_at
+        ]
+        pkg_count = len(active_pkgs)
+        prices = [p.starting_price for p in active_pkgs if p.starting_price and p.starting_price > 0]
+        min_price = float(min(prices)) if prices else None
+        
+        out.append(PackageCategoryPublicDTO(
+            id=cat.id, name=cat.name, slug=cat.slug,
+            description=cat.description, cover_image_url=cat.cover_image_url,
+            icon=cat.icon, sort_order=cat.sort_order, package_count=pkg_count,
+            min_price=min_price, rating=4.9,
+        ))
+    return out
+
+@router.get("/categories/{cat_slug}", response_model=PackageCategoryDetailPublicDTO, tags=["Public Discovery - Package Categories"])
+async def get_package_category(
+    cat_slug: str,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns a single package category with its packages.
+    Used on /packages/categories/{slug}.
+    """
+    set_no_store_headers(response)
+    result = await db.execute(
+        select(PackageCategory)
+        .where(
+            PackageCategory.slug == cat_slug,
+            PackageCategory.is_active == True,
+            PackageCategory.deleted_at.is_(None)
+        )
+        .options(
+            selectinload(PackageCategory.packages).selectinload(Package.variants),
+            selectinload(PackageCategory.packages).selectinload(Package.tags),
+        )
+    )
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    packages_dto = []
+    for pkg in cat.packages:
+        if not (pkg.is_active and pkg.status == PublishStatus.PUBLISHED and not pkg.deleted_at):
+            continue
+        active_variants = [v for v in pkg.variants if v.is_active and not v.deleted_at]
+        packages_dto.append(PackageListDTO(
+            id=pkg.id, slug=pkg.slug, title=pkg.title, type=pkg.type,
+            duration=pkg.duration, place=pkg.place, region=pkg.region,
+            cover_image_url=pkg.cover_image_url, is_active=pkg.is_active,
+            is_featured=pkg.is_featured,
+            is_student_package=getattr(pkg, 'is_student_package', False),
+            tags=[t.name for t in pkg.tags], starting_price=pkg.starting_price,
+            variants=[PackageVariantPublicDTO(
+                id=v.id, title=v.title, adult_price=v.adult_price, child_price=v.child_price,
+                weekend_adult_price=v.weekend_adult_price, weekend_child_price=v.weekend_child_price,
+                student_price=v.student_price, weekend_student_price=v.weekend_student_price,
+            ) for v in active_variants],
+        ))
+    packages_dto.sort(key=lambda p: (not p.is_featured, p.starting_price or 0))
+    return PackageCategoryDetailPublicDTO(
+        id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
+        cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
+        package_count=len(packages_dto), packages=packages_dto,
+    )
+
 
 @router.get("/{slug}", response_model=PackageDetailDTO)
 async def get_package_detail(

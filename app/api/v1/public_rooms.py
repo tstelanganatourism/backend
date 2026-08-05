@@ -8,9 +8,9 @@ from pydantic import BaseModel
 from decimal import Decimal
 
 from app.db.session import get_db
-from app.models.room import Room, RoomVariant, RoomSlotInventory
-from app.schemas.public import PaginatedResponse, RoomListDTO, RoomDetailDTO, RoomVariantPublicDTO
-from app.utils.cache import set_public_cache_headers, ttl_cache_get_or_set
+from app.models.room import Room, RoomVariant, RoomSlotInventory, RoomCategory
+from app.schemas.public import PaginatedResponse, RoomListDTO, RoomDetailDTO, RoomVariantPublicDTO, RoomCategoryPublicDTO, RoomCategoryDetailPublicDTO
+from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
 from app.models.enums import PublishStatus
 from app.middleware.auth import get_current_user_optional
 from app.models.user import User
@@ -144,6 +144,74 @@ async def get_rooms(
         )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_rooms)
+
+
+# ── Public Room Category Endpoints (must be BEFORE /{slug} route) ─────────────
+
+@router.get("/categories", response_model=List[RoomCategoryPublicDTO], tags=["Public Discovery - Room Categories"])
+async def list_room_categories(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns all active room categories for /stays landing page."""
+    set_no_store_headers(response)
+    result = await db.execute(
+        select(RoomCategory)
+        .where(RoomCategory.is_active == True, RoomCategory.deleted_at.is_(None))
+        .options(selectinload(RoomCategory.rooms))
+        .order_by(RoomCategory.sort_order, RoomCategory.id)
+    )
+    categories = result.scalars().all()
+    out = []
+    for cat in categories:
+        room_count = sum(
+            1 for r in cat.rooms
+            if r.is_active and r.status == PublishStatus.PUBLISHED and not r.deleted_at
+        )
+        out.append(RoomCategoryPublicDTO(
+            id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
+            cover_image_url=cat.cover_image_url, icon=cat.icon,
+            sort_order=cat.sort_order, room_count=room_count,
+        ))
+    return out
+
+@router.get("/categories/{cat_slug}", response_model=RoomCategoryDetailPublicDTO, tags=["Public Discovery - Room Categories"])
+async def get_room_category(
+    cat_slug: str,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns a single room category with its rooms for /stays/categories/{slug}."""
+    set_no_store_headers(response)
+    result = await db.execute(
+        select(RoomCategory)
+        .where(
+            RoomCategory.slug == cat_slug,
+            RoomCategory.is_active == True,
+            RoomCategory.deleted_at.is_(None)
+        )
+        .options(selectinload(RoomCategory.rooms).selectinload(Room.variants))
+    )
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Room category not found")
+    rooms_dto = []
+    for room in cat.rooms:
+        if not (room.is_active and room.status == PublishStatus.PUBLISHED and not room.deleted_at):
+            continue
+        rooms_dto.append(RoomListDTO(
+            id=room.id, slug=room.slug, lodge_name=room.lodge_name,
+            cover_image_url=room.cover_image_url, is_featured=room.is_featured,
+            starting_price=room.starting_price, starting_weekend_price=room.starting_weekend_price,
+            address=room.address, map_url=room.map_url, facilities=room.facilities or [],
+        ))
+    rooms_dto.sort(key=lambda r: (not r.is_featured, r.starting_price or 0))
+    return RoomCategoryDetailPublicDTO(
+        id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
+        cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
+        room_count=len(rooms_dto), rooms=rooms_dto,
+    )
+
 
 @router.get("/{slug}", response_model=RoomDetailDTO)
 async def get_room_detail(
@@ -397,4 +465,3 @@ async def get_room_availability(
         month=month,
         dates=availability,
     )
-

@@ -11,6 +11,36 @@ package_tags = Table(
     Column('tag_id', BigInteger, ForeignKey('tags.id', ondelete='CASCADE'), primary_key=True)
 )
 
+# Association table for PackageCategory -> Package (many-to-many)
+package_category_assignments = Table(
+    'package_category_assignments',
+    BaseModel.metadata,
+    Column('category_id', BigInteger, ForeignKey('package_categories.id', ondelete='CASCADE'), primary_key=True),
+    Column('package_id', BigInteger, ForeignKey('packages.id', ondelete='CASCADE'), primary_key=True)
+)
+
+class PackageCategory(BaseModel, SortableMixin):
+    """
+    A top-level grouping for packages (e.g. 'Papikondalu Packages', 'Bhadrachalam Packages').
+    Users first see categories on the /packages page, then drill into a category to see packages.
+    """
+    __tablename__ = "package_categories"
+
+    name = Column(String, nullable=False)
+    slug = Column(String, unique=True, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    cover_image_url = Column(String, nullable=True)
+    icon = Column(String, nullable=True)  # optional emoji or icon name
+    is_active = Column(Boolean, default=True, server_default='true', nullable=False, index=True)
+
+    # Many-to-many: packages in this category
+    packages = relationship(
+        'Package',
+        secondary=package_category_assignments,
+        back_populates='categories',
+        lazy='selectin',
+    )
+
 class Package(BaseModel, SEOMixin):
     __tablename__ = "packages"
 
@@ -51,6 +81,7 @@ class Package(BaseModel, SEOMixin):
     min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
 
     tags = relationship("Tag", secondary=package_tags)
+    categories = relationship("PackageCategory", secondary=package_category_assignments, back_populates="packages")
     variants = relationship("PackageVariant", back_populates="package", cascade="all, delete-orphan")
     transport_options = relationship("PackageTransportOption", back_populates="package", cascade="all, delete-orphan", order_by="PackageTransportOption.id")
     gallery = relationship("PackageGalleryImage", back_populates="package", cascade="all, delete-orphan", order_by="PackageGalleryImage.sort_order")

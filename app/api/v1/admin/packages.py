@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, text
+from sqlalchemy import select, func, or_, text, delete
 from typing import List, Optional
+from pathlib import Path
+import uuid
+import logging
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.package import (
     Package,
@@ -16,22 +20,68 @@ from app.models.package import (
     PackagePolicy,
     PackageTransportOption,
     PackageMealItem,
-    PackageExtra
+    PackageExtra,
+    PackageCategory,
+    package_category_assignments,
 )
-from app.schemas.package import PackageCreate, PackageUpdate, PackageDetailResponse, PackageResponse, PackagePaginatedResponse
+from app.schemas.package import PackageCreate, PackageUpdate, PackageDetailResponse, PackageResponse, PackagePaginatedResponse, PackageCategoryCreate, PackageCategoryUpdate, PackageCategoryResponse, PackageCategoryDetailResponse, PackageCategoryAssignRequest
 from app.middleware.auth import require_admin
 from app.models.user import User
 from app.utils.audit import log_action
-from app.utils.cache import clear_cache_prefix
+from app.utils.cache import clear_cache_prefix, clear_cache_prefix_async
 import re
 
 from sqlalchemy.orm import selectinload
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/packages",
     tags=["Admin - Package CMS"],
     dependencies=[Depends(require_admin)]
 )
+
+@router.post("/upload-image")
+async def upload_admin_image(
+    file: UploadFile = File(...),
+    current_admin: User = Depends(require_admin)
+):
+    """Upload an image file to Cloudinary (or local static fallback) and return secure URL."""
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, WEBP, and GIF images are allowed.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty image file.")
+
+    if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloudinary.config(
+                cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+                api_key=settings.CLOUDINARY_API_KEY,
+                api_secret=settings.CLOUDINARY_API_SECRET,
+                secure=True
+            )
+            upload_result = cloudinary.uploader.upload(
+                contents,
+                folder="ts_boat_tourism/cms",
+                resource_type="image"
+            )
+            return {"url": upload_result.get("secure_url")}
+        except Exception as e:
+            logger.warning(f"Cloudinary upload failed: {e}")
+
+    # Local fallback
+    upload_dir = Path("app/static/uploads")
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"cms_{uuid.uuid4().hex[:8]}_{file.filename}"
+    filepath = upload_dir / filename
+    with open(filepath, "wb") as f:
+        f.write(contents)
+    return {"url": f"/static/uploads/{filename}"}
 
 def slugify(text: str) -> str:
     text = text.lower().strip()
@@ -97,6 +147,7 @@ async def list_packages(
 
     query = base_query.options(
         selectinload(Package.tags),
+        selectinload(Package.categories),
         selectinload(Package.variants),
         selectinload(Package.transport_options)
     )
@@ -133,6 +184,7 @@ async def list_packages(
 def full_package_options():
     return (
         selectinload(Package.tags),
+        selectinload(Package.categories),
         selectinload(Package.variants),
         selectinload(Package.transport_options),
         selectinload(Package.gallery),
@@ -146,6 +198,168 @@ def full_package_options():
         selectinload(Package.meals),
         selectinload(Package.extras),
     )
+
+
+# ── Admin Package Categories Sub-Router (MUST be before /{package_id}) ──────────
+
+category_router = APIRouter(
+    prefix="/categories",
+    tags=["Admin - Package Categories"],
+    dependencies=[Depends(require_admin)]
+)
+
+@category_router.get("", response_model=List[PackageCategoryDetailResponse])
+async def list_package_categories(db: AsyncSession = Depends(get_db)):
+    """List all package categories with their packages."""
+    result = await db.execute(
+        select(PackageCategory)
+        .where(PackageCategory.deleted_at.is_(None))
+        .options(selectinload(PackageCategory.packages).selectinload(Package.variants))
+        .order_by(PackageCategory.sort_order, PackageCategory.id)
+    )
+    categories = result.scalars().all()
+    return [
+        PackageCategoryDetailResponse(
+            id=cat.id,
+            name=cat.name,
+            slug=cat.slug,
+            description=cat.description,
+            cover_image_url=cat.cover_image_url,
+            icon=cat.icon,
+            sort_order=cat.sort_order,
+            is_active=cat.is_active,
+            package_count=len([p for p in cat.packages if not p.deleted_at]),
+            packages=[PackageResponse(
+                id=p.id,
+                title=p.title,
+                slug=p.slug,
+                type=p.type,
+                status=p.status,
+                is_active=p.is_active,
+                is_featured=p.is_featured,
+                region=p.region,
+                place=p.place,
+                duration=p.duration,
+                cover_image_url=p.cover_image_url,
+                starting_price=p.starting_price,
+                order_priority=p.order_priority,
+                created_at=p.created_at,
+                updated_at=p.updated_at,
+                variants=[],
+                tags=[],
+            ) for p in cat.packages if not p.deleted_at],
+        )
+        for cat in categories
+    ]
+
+@category_router.post("", response_model=PackageCategoryResponse, status_code=201)
+async def create_package_category(
+    body: PackageCategoryCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new package category."""
+    slug = body.slug or slugify(body.name)
+    existing = await db.execute(select(PackageCategory).where(PackageCategory.slug == slug, PackageCategory.deleted_at.is_(None)))
+    if existing.scalar_one_or_none():
+        import time as _time
+        slug = f"{slug.split('-')[0]}-{int(_time.time())}"
+    cat = PackageCategory(
+        name=body.name,
+        slug=slug,
+        description=body.description,
+        cover_image_url=body.cover_image_url,
+        icon=body.icon,
+        sort_order=body.sort_order,
+        is_active=body.is_active,
+    )
+    db.add(cat)
+    await db.commit()
+    await db.refresh(cat)
+    await clear_cache_prefix_async("packages:")
+    return PackageCategoryResponse(
+        id=cat.id, name=cat.name, slug=cat.slug,
+        description=cat.description, cover_image_url=cat.cover_image_url,
+        icon=cat.icon, sort_order=cat.sort_order, is_active=cat.is_active,
+        package_count=0,
+    )
+
+@category_router.patch("/{category_id}", response_model=PackageCategoryResponse)
+async def update_package_category(
+    category_id: int,
+    body: PackageCategoryUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a package category."""
+    result = await db.execute(select(PackageCategory).where(PackageCategory.id == category_id, PackageCategory.deleted_at.is_(None)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    for key, val in body.model_dump(exclude_none=True).items():
+        setattr(cat, key, val)
+    await db.commit()
+    await db.refresh(cat)
+    await clear_cache_prefix_async("packages:")
+    return PackageCategoryResponse(
+        id=cat.id, name=cat.name, slug=cat.slug,
+        description=cat.description, cover_image_url=cat.cover_image_url,
+        icon=cat.icon, sort_order=cat.sort_order, is_active=cat.is_active,
+        package_count=0,
+    )
+
+@category_router.delete("/{category_id}", status_code=204)
+async def delete_package_category(
+    category_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Soft-delete a package category."""
+    result = await db.execute(select(PackageCategory).where(PackageCategory.id == category_id, PackageCategory.deleted_at.is_(None)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    from datetime import datetime, timezone
+    cat.deleted_at = datetime.now(timezone.utc)
+    await db.commit()
+    await clear_cache_prefix_async("packages:")
+
+@category_router.post("/{category_id}/packages", status_code=200)
+async def assign_packages_to_category(
+    category_id: int,
+    body: PackageCategoryAssignRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Assign (add) packages to a category."""
+    result = await db.execute(select(PackageCategory).where(PackageCategory.id == category_id, PackageCategory.deleted_at.is_(None)).options(selectinload(PackageCategory.packages)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    pkgs_result = await db.execute(select(Package).where(Package.id.in_(body.package_ids), Package.deleted_at.is_(None)))
+    pkgs = pkgs_result.scalars().all()
+    existing_ids = {p.id for p in cat.packages}
+    for pkg in pkgs:
+        if pkg.id not in existing_ids:
+            cat.packages.append(pkg)
+    await db.commit()
+    await clear_cache_prefix_async("packages:")
+    return {"assigned": len(pkgs)}
+
+@category_router.delete("/{category_id}/packages/{package_id}", status_code=200)
+async def remove_package_from_category(
+    category_id: int,
+    package_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove a specific package from a category."""
+    result = await db.execute(select(PackageCategory).where(PackageCategory.id == category_id, PackageCategory.deleted_at.is_(None)).options(selectinload(PackageCategory.packages)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    cat.packages = [p for p in cat.packages if p.id != package_id]
+    await db.commit()
+    await clear_cache_prefix_async("packages:")
+    return {"removed": package_id}
+
+router.include_router(category_router)
+
 
 @router.get("/{package_id}", response_model=PackageDetailResponse)
 async def get_package(
@@ -766,3 +980,7 @@ async def get_future_bookings(
         }
         for b in bookings
     ]
+
+
+# ── Admin Package Category CRUD ───────────────────────────────────────────────
+

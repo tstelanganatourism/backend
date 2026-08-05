@@ -211,3 +211,43 @@ class RoomDetailDTO(RoomListDTO, SEOSchema):
     highlights: List[HighlightDTO] = Field(default_factory=list)
     faqs: List[FAQDTO] = Field(default_factory=list)
     policies: List[PolicyDTO] = Field(default_factory=list)
+
+
+# ── Category Public DTOs ──────────────────────────────────────────────────────
+
+class PackageCategoryPublicDTO(AppBaseModel):
+    """Public-facing category card shown on the /packages page."""
+    id: int
+    name: str
+    slug: str
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int
+    package_count: int = 0
+    min_price: Optional[float] = None
+    rating: float = 4.8
+
+
+class PackageCategoryDetailPublicDTO(PackageCategoryPublicDTO):
+    """Category detail page: category info + its packages."""
+    packages: List[PackageListDTO] = Field(default_factory=list)
+
+
+class RoomCategoryPublicDTO(AppBaseModel):
+    """Public-facing category card shown on the /stays page."""
+    id: int
+    name: str
+    slug: str
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int
+    room_count: int = 0
+    min_price: Optional[float] = None
+    rating: float = 4.8
+
+
+class RoomCategoryDetailPublicDTO(RoomCategoryPublicDTO):
+    """Category detail page: category info + its rooms."""
+    rooms: List[RoomListDTO] = Field(default_factory=list)

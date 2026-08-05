@@ -12,6 +12,36 @@ room_tags = Table(
     Column("tag_id", BigInteger, ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True)
 )
 
+# Association table for RoomCategory -> Room (many-to-many)
+room_category_assignments = Table(
+    'room_category_assignments',
+    BaseModel.metadata,
+    Column('category_id', BigInteger, ForeignKey('room_categories.id', ondelete='CASCADE'), primary_key=True),
+    Column('room_id', BigInteger, ForeignKey('rooms.id', ondelete='CASCADE'), primary_key=True)
+)
+
+class RoomCategory(BaseModel, SortableMixin):
+    """
+    A top-level grouping for rooms/stays (e.g. 'Bhadrachalam Huts', 'Papikondalu Forest Stays').
+    Users first see categories on the /stays page, then drill into a category to see rooms.
+    """
+    __tablename__ = "room_categories"
+
+    name = Column(String, nullable=False)
+    slug = Column(String, unique=True, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    cover_image_url = Column(String, nullable=True)
+    icon = Column(String, nullable=True)  # optional emoji or icon name
+    is_active = Column(Boolean, default=True, server_default='true', nullable=False, index=True)
+
+    # Many-to-many: rooms in this category
+    rooms = relationship(
+        'Room',
+        secondary=room_category_assignments,
+        back_populates='categories',
+        lazy='selectin',
+    )
+
 class Room(BaseModel, SEOMixin):
     """
     Represents the Lodge or Property.
@@ -54,6 +84,7 @@ class Room(BaseModel, SEOMixin):
 
     # Relationships
     tags = relationship("Tag", secondary=room_tags)
+    categories = relationship("RoomCategory", secondary=room_category_assignments, back_populates="rooms")
     variants = relationship("RoomVariant", back_populates="room", cascade="all, delete-orphan")
     gallery = relationship("RoomGalleryImage", back_populates="room", cascade="all, delete-orphan", order_by="RoomGalleryImage.sort_order")
     highlights = relationship("RoomHighlight", back_populates="room", cascade="all, delete-orphan", order_by="RoomHighlight.sort_order")

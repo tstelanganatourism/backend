@@ -1,21 +1,23 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, text
+from sqlalchemy import select, func, or_, text, delete
 from typing import List, Optional
 from datetime import time
 
 from app.db.session import get_db
 from app.models.room import (
-    Room, RoomVariant, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy
+    Room, RoomVariant, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy,
+    RoomCategory, room_category_assignments,
 )
 from app.schemas.room import (
     RoomBase, RoomResponse, RoomDetailResponse, RoomCreate, RoomBookingSlotSchema,
-    RoomVariantInput, RoomGalleryImageInput, RoomHighlightInput, RoomFAQInput, RoomPolicyInput, RoomPaginatedResponse
+    RoomVariantInput, RoomGalleryImageInput, RoomHighlightInput, RoomFAQInput, RoomPolicyInput, RoomPaginatedResponse,
+    RoomCategoryCreate, RoomCategoryUpdate, RoomCategoryResponse, RoomCategoryDetailResponse, RoomCategoryAssignRequest,
 )
 from app.middleware.auth import require_admin
 from app.models.user import User
 from app.utils.audit import log_action
-from app.utils.cache import clear_cache_prefix
+from app.utils.cache import clear_cache_prefix, clear_cache_prefix_async
 from pydantic import BaseModel, ConfigDict
 import re
 
@@ -119,7 +121,10 @@ async def list_rooms(
     total_result = await db.execute(count_query)
     total_count = total_result.scalar_one()
 
-    query = base_query.options(selectinload(Room.variants))
+    query = base_query.options(
+        selectinload(Room.variants),
+        selectinload(Room.categories)
+    )
     query = query.order_by(Room.order_priority.desc(), Room.created_at.desc()).limit(limit).offset(offset)
     
     result = await db.execute(query)
@@ -153,11 +158,178 @@ async def list_rooms(
 def full_room_options():
     return (
         selectinload(Room.variants),
+        selectinload(Room.categories),
         selectinload(Room.gallery),
         selectinload(Room.highlights),
         selectinload(Room.faqs),
         selectinload(Room.policies)
     )
+
+
+# ── Admin Room Categories Sub-Router (MUST be before /{room_id}) ──────────────
+
+room_category_router = APIRouter(
+    prefix="/categories",
+    tags=["Admin - Room Categories"],
+    dependencies=[Depends(require_admin)]
+)
+
+@room_category_router.get("", response_model=List[RoomCategoryDetailResponse])
+async def list_room_categories(db: AsyncSession = Depends(get_db)):
+    """List all room categories with their rooms."""
+    result = await db.execute(
+        select(RoomCategory)
+        .where(RoomCategory.deleted_at.is_(None))
+        .options(selectinload(RoomCategory.rooms).selectinload(Room.variants))
+        .order_by(RoomCategory.sort_order, RoomCategory.id)
+    )
+    categories = result.scalars().all()
+    return [
+        RoomCategoryDetailResponse(
+            id=cat.id,
+            name=cat.name,
+            slug=cat.slug,
+            description=cat.description,
+            cover_image_url=cat.cover_image_url,
+            icon=cat.icon,
+            sort_order=cat.sort_order,
+            is_active=cat.is_active,
+            room_count=len([r for r in cat.rooms if not r.deleted_at]),
+            rooms=[RoomResponse(
+                id=r.id,
+                lodge_name=r.lodge_name,
+                slug=r.slug,
+                description=r.description,
+                address=r.address,
+                facilities=r.facilities or [],
+                starting_price=r.starting_price,
+                starting_weekend_price=r.starting_weekend_price,
+                total_rooms=r.total_rooms,
+                slot_start=r.slot_start,
+                slot_end=r.slot_end,
+                is_featured=r.is_featured,
+                is_active=r.is_active,
+                status=r.status,
+                order_priority=r.order_priority,
+                cover_image_url=r.cover_image_url,
+                advance_payment_type=r.advance_payment_type,
+                advance_payment_value=r.advance_payment_value,
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+                variants=[],
+            ) for r in cat.rooms if not r.deleted_at],
+        )
+        for cat in categories
+    ]
+
+@room_category_router.post("", response_model=RoomCategoryResponse, status_code=201)
+async def create_room_category(
+    body: RoomCategoryCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new room category."""
+    slug = body.slug or slugify(body.name)
+    existing = await db.execute(select(RoomCategory).where(RoomCategory.slug == slug, RoomCategory.deleted_at.is_(None)))
+    if existing.scalar_one_or_none():
+        import time as _time
+        slug = f"{slug}-{int(_time.time())}"
+    cat = RoomCategory(
+        name=body.name,
+        slug=slug,
+        description=body.description,
+        cover_image_url=body.cover_image_url,
+        icon=body.icon,
+        sort_order=body.sort_order,
+        is_active=body.is_active,
+    )
+    db.add(cat)
+    await db.commit()
+    await db.refresh(cat)
+    await clear_cache_prefix_async("rooms:")
+    return RoomCategoryResponse(
+        id=cat.id, name=cat.name, slug=cat.slug,
+        description=cat.description, cover_image_url=cat.cover_image_url,
+        icon=cat.icon, sort_order=cat.sort_order, is_active=cat.is_active,
+        room_count=0,
+    )
+
+@room_category_router.patch("/{category_id}", response_model=RoomCategoryResponse)
+async def update_room_category(
+    category_id: int,
+    body: RoomCategoryUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update a room category."""
+    result = await db.execute(select(RoomCategory).where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Room category not found")
+    for key, val in body.model_dump(exclude_none=True).items():
+        setattr(cat, key, val)
+    await db.commit()
+    await db.refresh(cat)
+    await clear_cache_prefix_async("rooms:")
+    return RoomCategoryResponse(
+        id=cat.id, name=cat.name, slug=cat.slug,
+        description=cat.description, cover_image_url=cat.cover_image_url,
+        icon=cat.icon, sort_order=cat.sort_order, is_active=cat.is_active,
+        room_count=0,
+    )
+
+@room_category_router.delete("/{category_id}", status_code=204)
+async def delete_room_category(
+    category_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Soft-delete a room category."""
+    result = await db.execute(select(RoomCategory).where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Room category not found")
+    from datetime import datetime, timezone
+    cat.deleted_at = datetime.now(timezone.utc)
+    await db.commit()
+    await clear_cache_prefix_async("rooms:")
+
+@room_category_router.post("/{category_id}/rooms", status_code=200)
+async def assign_rooms_to_category(
+    category_id: int,
+    body: RoomCategoryAssignRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Assign (add) rooms to a category."""
+    result = await db.execute(select(RoomCategory).where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None)).options(selectinload(RoomCategory.rooms)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Room category not found")
+    rooms_result = await db.execute(select(Room).where(Room.id.in_(body.room_ids), Room.deleted_at.is_(None)))
+    rooms = rooms_result.scalars().all()
+    existing_ids = {r.id for r in cat.rooms}
+    for room in rooms:
+        if room.id not in existing_ids:
+            cat.rooms.append(room)
+    await db.commit()
+    await clear_cache_prefix_async("rooms:")
+    return {"assigned": len(rooms)}
+
+@room_category_router.delete("/{category_id}/rooms/{room_id}", status_code=200)
+async def remove_room_from_category(
+    category_id: int,
+    room_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove a specific room from a category."""
+    result = await db.execute(select(RoomCategory).where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None)).options(selectinload(RoomCategory.rooms)))
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Room category not found")
+    cat.rooms = [r for r in cat.rooms if r.id != room_id]
+    await db.commit()
+    await clear_cache_prefix_async("rooms:")
+    return {"removed": room_id}
+
+router.include_router(room_category_router)
+
 
 @router.get("/{room_id}", response_model=RoomDetailResponse)
 async def get_room(
@@ -437,3 +609,7 @@ async def get_future_bookings(
         }
         for b in bookings
     ]
+
+
+# ── Admin Room Category CRUD ──────────────────────────────────────────────────
+

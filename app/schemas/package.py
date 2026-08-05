@@ -279,11 +279,18 @@ class PackageBase(AppBaseModel):
     status: PublishStatus = PublishStatus.DRAFT
     min_passengers: int = 1
 
+class PackageCategorySlimDTO(AppBaseModel):
+    id: int
+    name: str
+    slug: str
+    icon: Optional[str] = None
+
 class PackageResponse(PackageBase):
     id: int
     created_at: datetime
     updated_at: datetime
     tags: List[TagResponse] = []
+    categories: List[PackageCategorySlimDTO] = []
     variants: List[PackageVariantResponse] = []
     transport_options: List[PackageTransportOptionResponse] = []
     active_booking_count: Optional[int] = 0
@@ -369,3 +376,48 @@ class PackagePaginatedResponse(AppBaseModel):
     total: int
     page: int
     size: int
+
+
+# ── Package Category Schemas ──────────────────────────────────────────────────
+
+class PackageCategoryCreate(AppBaseModel):
+    name: str
+    slug: Optional[str] = None  # auto-generated from name if not provided
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int = 0
+    is_active: bool = True
+
+class PackageCategoryUpdate(AppBaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+class PackageCategorySlimDTO(AppBaseModel):
+    """Minimal representation used inside CategoryResponse to avoid circular nesting."""
+    id: int
+    slug: str
+    title: str
+    cover_image_url: Optional[str] = None
+
+class PackageCategoryResponse(AppBaseModel):
+    id: int
+    name: str
+    slug: str
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int
+    is_active: bool
+    package_count: int = 0  # computed at query time
+
+class PackageCategoryDetailResponse(PackageCategoryResponse):
+    packages: List[PackageResponse] = []
+
+class PackageCategoryAssignRequest(AppBaseModel):
+    package_ids: List[int]

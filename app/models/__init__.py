@@ -8,13 +8,15 @@ from app.models.enums import (
 from app.models.user import User, AgentPackageQuota
 from app.models.tag import Tag
 from app.models.room import (
-    Room, RoomSlotInventory, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy, room_tags
+    Room, RoomSlotInventory, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy, room_tags,
+    RoomCategory, room_category_assignments,
 )
 from app.models.package import (
     Package, PackageVariant, PackageVariantInventory, package_tags,
     PackageGalleryImage, PackageItineraryDay, PackageHighlight,
     PackageInclusion, PackageExclusion, PackageBoardingPoint,
-    PackageFAQ, PackagePolicy, PackageTransportOption, PackageTransportInventory
+    PackageFAQ, PackagePolicy, PackageTransportOption, PackageTransportInventory,
+    PackageCategory, package_category_assignments,
 )
 from app.models.booking import Booking, BookingStayDate, BookingPassenger, CancellationRequest, PostponeRequest
 from app.models.payment import Payment
@@ -30,11 +32,14 @@ __all__ = [
     "UserRole", "AccountStatus", "GenderType", "BookingSource", "BookingStatus",
     "PaymentStatus", "PackageType", "RegionType", "CancellationStatus", "PolicyType",
     "PromotionType", "PromotionTarget", "PromotionBadge", "PublishStatus",
-    "User", "AgentPackageQuota", "Tag", "Room", "RoomSlotInventory", "RoomGalleryImage", "RoomHighlight", "RoomFAQ", "RoomPolicy", "room_tags",
+    "User", "AgentPackageQuota", "Tag",
+    "Room", "RoomSlotInventory", "RoomGalleryImage", "RoomHighlight", "RoomFAQ", "RoomPolicy", "room_tags",
+    "RoomCategory", "room_category_assignments",
     "Package", "PackageVariant", "PackageVariantInventory", "package_tags",
     "PackageGalleryImage", "PackageItineraryDay", "PackageHighlight",
     "PackageInclusion", "PackageExclusion", "PackageBoardingPoint",
     "PackageFAQ", "PackagePolicy", "PackageTransportOption", "PackageTransportInventory",
+    "PackageCategory", "package_category_assignments",
     "Booking", "BookingStayDate", "BookingPassenger", "CancellationRequest", "PostponeRequest", "Payment", "AddOn",
     "Promotion", "Coupon", "SystemSettings", "AuditLog", "CheckoutFunnelLog"
 ]

@@ -115,9 +115,16 @@ class RoomCreate(RoomBase):
     faqs: List[RoomFAQInput] = []
     policies: List[RoomPolicyInput] = []
 
+class RoomCategorySlimDTO(AppBaseModel):
+    id: int
+    name: str
+    slug: str
+    icon: Optional[str] = None
+
 class RoomResponse(RoomBase, TimestampSchema):
     id: int
     variants: List[RoomVariantResponse] = []
+    categories: List[RoomCategorySlimDTO] = []
     starting_price: Optional[Decimal] = None
     starting_weekend_price: Optional[Decimal] = None
 
@@ -133,3 +140,41 @@ class RoomPaginatedResponse(AppBaseModel):
     total: int
     page: int
     size: int
+
+
+# ── Room Category Schemas ─────────────────────────────────────────────────────
+
+class RoomCategoryCreate(AppBaseModel):
+    name: str
+    slug: Optional[str] = None  # auto-generated from name if not provided
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int = 0
+    is_active: bool = True
+
+class RoomCategoryUpdate(AppBaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+class RoomCategoryResponse(AppBaseModel):
+    id: int
+    name: str
+    slug: str
+    description: Optional[str] = None
+    cover_image_url: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: int
+    is_active: bool
+    room_count: int = 0  # computed at query time
+
+class RoomCategoryDetailResponse(RoomCategoryResponse):
+    rooms: List[RoomResponse] = []
+
+class RoomCategoryAssignRequest(AppBaseModel):
+    room_ids: List[int]
