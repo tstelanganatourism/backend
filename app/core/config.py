@@ -10,7 +10,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     PROJECT_NAME: str = "TS Boat Tourism Booking API"
-    CORS_ORIGINS: list[str] = ["https://tstelanganatourism.com", "https://www.tstelanganatourism.com"]
+    CORS_ORIGINS: list[str] = [
+        "https://tstelanganatourism.com",
+        "https://www.tstelanganatourism.com",
+        "https://frontend-six-art-92.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
     ALLOWED_HOSTS: list[str] = ["*"]
     
     # Security
