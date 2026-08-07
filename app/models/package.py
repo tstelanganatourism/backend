@@ -98,6 +98,7 @@ class Package(BaseModel, SEOMixin):
     __table_args__ = (
         Index("ix_packages_public_priority", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_packages_public_featured", "is_featured", "is_active", "deleted_at", "order_priority", "id"),
+        Index("ix_packages_status_deleted_priority", "status", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_packages_admin_listing", "deleted_at", "status", "order_priority", "created_at"),
         # Partial exact filters for storefront
         Index("ix_packages_type_region", "type", "region", "is_active", "order_priority", postgresql_where=text("deleted_at IS NULL")),

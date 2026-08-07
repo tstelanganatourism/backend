@@ -95,6 +95,7 @@ class Room(BaseModel, SEOMixin):
         Index('ix_rooms_facilities_gin', 'facilities', postgresql_using='gin'),
         Index("ix_rooms_public_priority", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_rooms_public_featured", "is_featured", "is_active", "deleted_at", "order_priority", "id"),
+        Index("ix_rooms_status_deleted_priority", "status", "is_active", "deleted_at", "order_priority", "id"),
         Index("ix_rooms_admin_listing", "deleted_at", "status", "order_priority", "created_at"),
     )
 

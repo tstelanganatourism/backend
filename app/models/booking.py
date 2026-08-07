@@ -23,6 +23,8 @@ class Booking(BaseModel):
             name="chk_booking_target"
         ),
         Index("ix_bookings_created_at", "created_at"),
+        Index("ix_bookings_user_status", "user_id", "status", "created_at"),
+        Index("ix_bookings_status_travel", "status", "travel_date"),
     )
 
     travel_date = Column(Date, nullable=False, index=True)
