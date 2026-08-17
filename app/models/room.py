@@ -61,6 +61,7 @@ class Room(BaseModel, SEOMixin):
     advance_payment_value = Column(Numeric(12, 2), default=0.00, server_default="0.00", nullable=False)
     
     cover_image_url = Column(String, nullable=True)
+    video_url = Column(String, nullable=True)  # Primary highlight video URL (Cloudinary)
     brochure_pdf_url = Column(String, nullable=True)
     generated_brochure_url = Column(String, nullable=True)
     brochure_generation_status = Column(SQLEnum(DocumentGenerationStatus), default=DocumentGenerationStatus.MISSING, server_default="MISSING", nullable=False)
@@ -105,6 +106,7 @@ class RoomGalleryImage(BaseModel, SortableMixin):
     image_url = Column(String, nullable=False)
     alt_text = Column(String, nullable=True)
     is_cover = Column(Boolean, default=False, server_default="false")
+    media_type = Column(String, nullable=False, server_default="image", default="image")  # 'image' or 'video'
     room = relationship("Room", back_populates="gallery")
 
 class RoomHighlight(BaseModel, SortableMixin):

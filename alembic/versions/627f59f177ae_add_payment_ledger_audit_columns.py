@@ -21,10 +21,10 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     """Upgrade schema."""
     # 1. Add nullable first so existing rows don't violate NOT NULL immediately
-    op.add_column('payments', sa.Column('payment_reference_id', sa.String(), nullable=True))
-    op.add_column('payments', sa.Column('collected_by_type', sa.String(length=50), server_default='RAZORPAY', nullable=False))
-    op.add_column('payments', sa.Column('collected_by_user_id', sa.BigInteger(), nullable=True))
-    op.add_column('payments', sa.Column('collected_by_label', sa.String(length=255), nullable=True))
+    op.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_reference_id VARCHAR")
+    op.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS collected_by_type VARCHAR(length=50)")
+    op.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS collected_by_user_id INTEGER")
+    op.execute("ALTER TABLE payments ADD COLUMN IF NOT EXISTS collected_by_label VARCHAR(length=255)")
 
     # 2. Backfill: existing rows all have razorpay_order_id — use that as reference
     op.execute("""

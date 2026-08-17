@@ -1,5 +1,5 @@
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -149,10 +149,10 @@ async def track_funnel_event(
     except Exception as e:
         logger.error(f"Error tracking funnel event: {e}")
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to log funnel event: {str(e)}"
-        )
+        return {
+            "status": "ignored",
+            "message": str(e)
+        }
 
 @router.get("/admin/leads")
 async def get_admin_leads(

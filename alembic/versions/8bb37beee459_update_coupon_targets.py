@@ -28,7 +28,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
-    op.add_column('coupons', sa.Column('package_id', sa.INTEGER(), autoincrement=False, nullable=True))
+    op.execute("ALTER TABLE coupons ADD COLUMN IF NOT EXISTS package_id TEXT")
     op.create_foreign_key('coupons_package_id_fkey', 'coupons', 'packages', ['package_id'], ['id'], ondelete='SET NULL')
     op.drop_column('coupons', 'applicable_room_ids')
     op.drop_column('coupons', 'applicable_package_ids')

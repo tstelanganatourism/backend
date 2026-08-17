@@ -79,6 +79,7 @@ class PackageListDTO(AppBaseModel):
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None  # Primary highlight video (Cloudinary)
     is_active: bool = True
     is_featured: bool
     is_student_package: bool = False
@@ -175,6 +176,11 @@ class PackageDetailDTO(PackageListDTO, SEOSchema):
     policies: List[PolicyDTO] = Field(default_factory=list)
     meals: List[PackageMealItemPublicDTO] = Field(default_factory=list)
     extras: List[PackageExtraPublicDTO] = Field(default_factory=list)
+    agent_commission_type: Optional[str] = None
+    agent_commission_percentage: Optional[Decimal] = None
+    agent_commission_fixed_amount: Optional[Decimal] = None
+    agent_daily_quota: Optional[int] = None
+    agent_is_allowed: Optional[bool] = None
 
 class RoomVariantPublicDTO(AppBaseModel):
     id: int
@@ -193,6 +199,7 @@ class RoomListDTO(AppBaseModel):
     slug: str
     lodge_name: str
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None  # Primary highlight video (Cloudinary)
     is_featured: bool
     starting_price: Optional[Decimal] = None
     starting_weekend_price: Optional[Decimal] = None

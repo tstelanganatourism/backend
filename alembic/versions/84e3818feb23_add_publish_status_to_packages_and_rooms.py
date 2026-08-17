@@ -25,9 +25,9 @@ def upgrade() -> None:
     publishstatus = sa.Enum('DRAFT', 'PUBLISHED', 'ARCHIVED', name='publishstatus')
     publishstatus.create(op.get_bind(), checkfirst=True)
 
-    op.add_column('packages', sa.Column('status', sa.Enum('DRAFT', 'PUBLISHED', 'ARCHIVED', name='publishstatus'), server_default='DRAFT', nullable=False))
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS status TEXT")
     op.create_index(op.f('ix_packages_status'), 'packages', ['status'], unique=False)
-    op.add_column('rooms', sa.Column('status', sa.Enum('DRAFT', 'PUBLISHED', 'ARCHIVED', name='publishstatus'), server_default='DRAFT', nullable=False))
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS status TEXT")
     op.create_index(op.f('ix_rooms_status'), 'rooms', ['status'], unique=False)
     # ### end Alembic commands ###
 

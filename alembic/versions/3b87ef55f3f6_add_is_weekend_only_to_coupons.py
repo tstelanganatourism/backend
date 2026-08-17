@@ -20,7 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
-    op.add_column('coupons', sa.Column('is_weekend_only', sa.Boolean(), server_default='false', nullable=False))
+    op.execute("ALTER TABLE coupons ADD COLUMN IF NOT EXISTS is_weekend_only BOOLEAN DEFAULT 'false' NOT NULL")
 
 
 def downgrade() -> None:

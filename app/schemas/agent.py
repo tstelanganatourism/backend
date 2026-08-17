@@ -139,10 +139,27 @@ class AgentQuotaResponse(AppBaseModel):
     package_title: str
     daily_quota: int
     is_allowed: bool
+    commission_type: Optional[str] = "PERCENTAGE"
+    commission_percentage: Optional[Decimal] = None
+    commission_fixed_amount: Optional[Decimal] = None
 
 
 class AgentQuotaUpdate(AppBaseModel):
     package_id: int
     daily_quota: int = Field(default=10, ge=0)
     is_allowed: bool = Field(default=True)
+    commission_type: Optional[str] = None  # PERCENTAGE or FIXED_AMOUNT
+    commission_percentage: Optional[Decimal] = Field(None, ge=0, le=100)
+    commission_fixed_amount: Optional[Decimal] = Field(None, ge=0)
+
+    @field_validator("commission_type")
+    @classmethod
+    def validate_commission_type(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v_upper = v.upper()
+        if v_upper not in ("PERCENTAGE", "FIXED_AMOUNT"):
+            raise ValueError("commission_type must be PERCENTAGE or FIXED_AMOUNT")
+        return v_upper
+
 

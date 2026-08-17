@@ -45,8 +45,8 @@ class EmailService:
             primary_key = settings.BREVO_API_KEY_USER
             primary_from = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL
 
-        if not primary_from or primary_from == "bookings@tstelanganatourism.com":
-            primary_from = "tstelanganatourism@gmail.com"
+        if not primary_from:
+            primary_from = "bookings@tstelanganatourism.com"
 
         # 2. Smart Brevo Rotation: Check daily sent count using the PASSED-IN session.
         # Never open a new connection here — that causes a deadlock in the ARQ worker.

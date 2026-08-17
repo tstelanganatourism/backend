@@ -48,7 +48,13 @@ async def run_migration():
             ALTER TABLE users 
             ADD COLUMN IF NOT EXISTS commission_fixed_amount NUMERIC(10,2);
         """))
-        print("[OK] P3: users.commission_type and commission_fixed_amount columns added")
+        await conn.execute(text("""
+            ALTER TABLE agent_package_quotas
+            ADD COLUMN IF NOT EXISTS commission_type VARCHAR(16),
+            ADD COLUMN IF NOT EXISTS commission_percentage NUMERIC(5, 2),
+            ADD COLUMN IF NOT EXISTS commission_fixed_amount NUMERIC(10, 2);
+        """))
+        print("[OK] P3: users & agent_package_quotas commission columns added")
 
     # P4: Add ADMIN_DIRECT to bookingsource enum - must be outside transaction for Postgres
     async with engine.connect() as conn:

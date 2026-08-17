@@ -24,7 +24,7 @@ def upgrade() -> None:
     op.drop_index(op.f('ix_package_inventory_variant_date'), table_name='package_variant_inventory')
     op.drop_index(op.f('ix_packages_fts'), table_name='packages', postgresql_using='gin')
     op.create_index('ix_packages_fts', 'packages', [sa.literal_column("to_tsvector('english'::regconfig, title || ' ' || coalesce(description, ''))")], unique=False, postgresql_using='gin')
-    op.add_column('room_slot_inventory', sa.Column('is_closed', sa.Boolean(), server_default='false', nullable=False))
+    op.execute("ALTER TABLE room_slot_inventory ADD COLUMN IF NOT EXISTS is_closed BOOLEAN DEFAULT 'false' NOT NULL")
     op.drop_index(op.f('ix_room_slot_inventory_room_date'), table_name='room_slot_inventory')
     op.drop_index(op.f('ix_rooms_fts'), table_name='rooms', postgresql_using='gin')
     op.create_index('ix_rooms_fts', 'rooms', [sa.literal_column("to_tsvector('english'::regconfig, lodge_name || ' ' || coalesce(address, '') || ' ' || coalesce(description, ''))")], unique=False, postgresql_using='gin')

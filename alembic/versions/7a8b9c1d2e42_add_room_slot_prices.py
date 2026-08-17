@@ -16,8 +16,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('room_slot_inventory', sa.Column('weekday_price', sa.Numeric(10, 2), nullable=True))
-    op.add_column('room_slot_inventory', sa.Column('weekend_price', sa.Numeric(10, 2), nullable=True))
+    op.execute("ALTER TABLE room_slot_inventory ADD COLUMN IF NOT EXISTS weekday_price NUMERIC(10, 2)")
+    op.execute("ALTER TABLE room_slot_inventory ADD COLUMN IF NOT EXISTS weekend_price NUMERIC(10, 2)")
 
 
 def downgrade() -> None:

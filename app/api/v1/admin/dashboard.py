@@ -4,8 +4,8 @@ from sqlalchemy import select, func
 from app.db.session import get_db
 from app.models.user import User
 from app.models.booking import Booking
-from app.models.package import Package
-from app.models.room import Room
+from app.models.package import Package, PackageCategory
+from app.models.room import Room, RoomCategory, RoomVariant
 from app.middleware.auth import require_admin
 
 router = APIRouter(
@@ -23,17 +23,17 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(
             select(func.count()).select_from(Package).where(Package.deleted_at.is_(None)).scalar_subquery(),
-            select(func.count()).select_from(Room).where(Room.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(PackageCategory).where(PackageCategory.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(RoomCategory).where(RoomCategory.deleted_at.is_(None)).scalar_subquery(),
+            select(func.count()).select_from(RoomVariant).where(RoomVariant.deleted_at.is_(None)).scalar_subquery(),
             select(func.count()).select_from(Booking).where(Booking.deleted_at.is_(None)).scalar_subquery(),
             select(func.count()).select_from(User).where(User.deleted_at.is_(None)).scalar_subquery(),
         )
     )
-    packages_count, rooms_count, bookings_count, users_count = result.one()
+    packages_count, package_categories_count, room_categories_count, room_variants_count, bookings_count, users_count = result.one()
 
     # Get recent bookings
-    from app.models.package import Package, PackageVariant
-    from app.models.room import Room, RoomVariant
-    from sqlalchemy.orm import selectinload
+    from app.models.package import PackageVariant
     
     recent_result = await db.execute(
         select(Booking)
@@ -41,28 +41,41 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         .order_by(Booking.created_at.desc())
         .limit(5)
     )
+    raw_recent = recent_result.scalars().all()
+
+    # Collect variant IDs for batch lookup
+    variant_ids = [b.variant_id for b in raw_recent if b.variant_id]
+    room_variant_ids = [b.room_variant_id for b in raw_recent if b.room_variant_id]
+
+    pkg_titles = {}
+    if variant_ids:
+        pkg_res = await db.execute(
+            select(PackageVariant.id, Package.title)
+            .join(Package, PackageVariant.package_id == Package.id)
+            .where(PackageVariant.id.in_(variant_ids))
+        )
+        pkg_titles = {v_id: title for v_id, title in pkg_res.all()}
+
+    room_titles = {}
+    if room_variant_ids:
+        rm_res = await db.execute(
+            select(RoomVariant.id, Room.lodge_name)
+            .join(Room, RoomVariant.room_id == Room.id)
+            .where(RoomVariant.id.in_(room_variant_ids))
+        )
+        room_titles = {rv_id: name for rv_id, name in rm_res.all()}
+
     recent_bookings = []
-    
-    for b in recent_result.scalars().all():
+    for b in raw_recent:
         booking_title = None
         if b.variant_id:
-            pkg_res = await db.execute(
-                select(Package.title)
-                .join(PackageVariant, PackageVariant.package_id == Package.id)
-                .where(PackageVariant.id == b.variant_id)
-            )
-            booking_title = pkg_res.scalar_one_or_none()
+            booking_title = pkg_titles.get(b.variant_id)
         elif b.room_variant_id:
-            rm_res = await db.execute(
-                select(Room.lodge_name)
-                .join(RoomVariant, RoomVariant.room_id == Room.id)
-                .where(RoomVariant.id == b.room_variant_id)
-            )
-            booking_title = rm_res.scalar_one_or_none()
-            
+            booking_title = room_titles.get(b.room_variant_id)
+
         if not booking_title:
             booking_title = "Package Booking" if b.variant_id else ("Room Booking" if b.room_variant_id else "Booking")
-            
+
         recent_bookings.append({
             "id": b.id,
             "public_id": b.public_id,
@@ -94,7 +107,9 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
 
     return {
         "packages": packages_count,
-        "rooms": rooms_count,
+        "package_categories": package_categories_count,
+        "room_categories": room_categories_count,
+        "room_types": room_variants_count,
         "bookings": bookings_count,
         "users": users_count,
         "total_revenue": total_revenue,

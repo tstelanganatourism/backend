@@ -54,6 +54,7 @@ class PackageGalleryImageResponse(AppBaseModel):
     alt_text: Optional[str] = None
     is_cover: bool
     category: Optional[str] = None
+    media_type: str = "image"
     sort_order: int
 
 class PackageItineraryDayResponse(AppBaseModel):
@@ -166,6 +167,7 @@ class PackageGalleryImageInput(AppBaseModel):
     alt_text: Optional[str] = None
     is_cover: bool = False
     category: Optional[str] = None
+    media_type: str = "image"
     sort_order: int = 0
 
 class PackageItineraryDayInput(AppBaseModel):
@@ -253,6 +255,7 @@ class PackageBase(AppBaseModel):
     duration: Optional[str] = None
     place: Optional[str] = None
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
     brochure_generation_status: DocumentGenerationStatus = DocumentGenerationStatus.MISSING
@@ -330,6 +333,7 @@ class PackageUpdate(AppBaseModel):
     duration: Optional[str] = None
     place: Optional[str] = None
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None
     brochure_pdf_url: Optional[str] = None
     generated_brochure_url: Optional[str] = None
     order_priority: Optional[int] = None

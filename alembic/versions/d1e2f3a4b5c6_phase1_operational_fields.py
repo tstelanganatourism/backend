@@ -21,22 +21,22 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # --- Package: generated_brochure_url ---
-    op.add_column('packages', sa.Column('generated_brochure_url', sa.String(), nullable=True))
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS generated_brochure_url VARCHAR")
 
     # --- PackageBoardingPoint: operational reporting fields ---
-    op.add_column('package_boarding_points', sa.Column('landmark', sa.String(), nullable=True))
-    op.add_column('package_boarding_points', sa.Column('contact_number', sa.String(), nullable=True))
-    op.add_column('package_boarding_points', sa.Column('pickup_instructions', sa.String(), nullable=True))
-    op.add_column('package_boarding_points', sa.Column('return_drop_info', sa.String(), nullable=True))
+    op.execute("ALTER TABLE package_boarding_points ADD COLUMN IF NOT EXISTS landmark VARCHAR")
+    op.execute("ALTER TABLE package_boarding_points ADD COLUMN IF NOT EXISTS contact_number VARCHAR")
+    op.execute("ALTER TABLE package_boarding_points ADD COLUMN IF NOT EXISTS pickup_instructions VARCHAR")
+    op.execute("ALTER TABLE package_boarding_points ADD COLUMN IF NOT EXISTS return_drop_info VARCHAR")
 
     # --- PackageItineraryDay: journey stop fields ---
-    op.add_column('package_itinerary_days', sa.Column('timing', sa.String(), nullable=True))
-    op.add_column('package_itinerary_days', sa.Column('duration_at_stop', sa.String(), nullable=True))
-    op.add_column('package_itinerary_days', sa.Column('image_url', sa.String(), nullable=True))
-    op.add_column('package_itinerary_days', sa.Column('meal_included', sa.Boolean(), server_default='false', nullable=False))
+    op.execute("ALTER TABLE package_itinerary_days ADD COLUMN IF NOT EXISTS timing VARCHAR")
+    op.execute("ALTER TABLE package_itinerary_days ADD COLUMN IF NOT EXISTS duration_at_stop VARCHAR")
+    op.execute("ALTER TABLE package_itinerary_days ADD COLUMN IF NOT EXISTS image_url VARCHAR")
+    op.execute("ALTER TABLE package_itinerary_days ADD COLUMN IF NOT EXISTS meal_included BOOLEAN DEFAULT 'false' NOT NULL")
 
     # --- PackageGalleryImage: categorization ---
-    op.add_column('package_gallery_images', sa.Column('category', sa.String(), nullable=True))
+    op.execute("ALTER TABLE package_gallery_images ADD COLUMN IF NOT EXISTS category VARCHAR")
 
     # --- Expand PolicyType enum with new tourism-specific values ---
     # For PostgreSQL, we need to add values to the existing enum type

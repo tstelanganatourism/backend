@@ -16,10 +16,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('packages', sa.Column('has_food_option', sa.Boolean(), nullable=False, server_default='false'))
-    op.add_column('packages', sa.Column('food_adult_price', sa.Numeric(10, 2), nullable=True))
-    op.add_column('packages', sa.Column('food_child_price', sa.Numeric(10, 2), nullable=True))
-    op.add_column('packages', sa.Column('food_student_price', sa.Numeric(10, 2), nullable=True))
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS has_food_option BOOLEAN DEFAULT 'false' NOT NULL")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS food_adult_price NUMERIC(10, 2)")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS food_child_price NUMERIC(10, 2)")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS food_student_price NUMERIC(10, 2)")
 
 
 def downgrade() -> None:

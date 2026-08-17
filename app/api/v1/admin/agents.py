@@ -386,7 +386,7 @@ async def _get_agent_or_404(db: AsyncSession, agent_id: int) -> User:
 
 async def _compute_agent_metrics(db: AsyncSession, agent_id: int) -> AgentBookingMetrics:
     """Compute real booking metrics for an agent via SQL aggregation."""
-    paid_statuses = (BookingStatus.FULLY_PAID,)
+    paid_statuses = (BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID)
     result = await db.execute(
         select(
             func.count(Booking.id).label("total"),
@@ -473,11 +473,18 @@ async def get_agent_quotas(
     response = []
     for pkg in packages:
         quota = quotas.get(pkg.id)
+        comm_type = quota.commission_type if (quota and quota.commission_type) else (agent.commission_type or "PERCENTAGE")
+        comm_pct = quota.commission_percentage if (quota and quota.commission_percentage is not None) else agent.commission_percentage
+        comm_fixed = quota.commission_fixed_amount if (quota and quota.commission_fixed_amount is not None) else agent.commission_fixed_amount
+
         response.append(AgentQuotaResponse(
             package_id=pkg.id,
             package_title=pkg.title,
             daily_quota=quota.daily_quota if quota else 10,
-            is_allowed=quota.is_allowed if quota else True
+            is_allowed=quota.is_allowed if quota else True,
+            commission_type=comm_type,
+            commission_percentage=comm_pct,
+            commission_fixed_amount=comm_fixed,
         ))
     return response
 
@@ -488,7 +495,7 @@ async def update_agent_quota(
     payload: AgentQuotaUpdate,
     db: AsyncSession = Depends(get_db)
 ):
-    """Update or create quota settings for a package for this agent."""
+    """Update or create quota & commission settings for a package for this agent."""
     # Verify agent exists
     agent = await db.get(User, id)
     if not agent or agent.role != UserRole.AGENT or agent.deleted_at is not None:
@@ -507,20 +514,32 @@ async def update_agent_quota(
     quota_res = await db.execute(quota_query)
     quota = quota_res.scalar_one_or_none()
 
+    comm_type = payload.commission_type or "PERCENTAGE"
+
     if not quota:
         quota = AgentPackageQuota(
             agent_id=id,
             package_id=payload.package_id,
             daily_quota=payload.daily_quota,
-            is_allowed=payload.is_allowed
+            is_allowed=payload.is_allowed,
+            commission_type=comm_type,
+            commission_percentage=payload.commission_percentage,
+            commission_fixed_amount=payload.commission_fixed_amount,
         )
         db.add(quota)
     else:
         quota.daily_quota = payload.daily_quota
         quota.is_allowed = payload.is_allowed
+        quota.commission_type = comm_type
+        quota.commission_percentage = payload.commission_percentage
+        quota.commission_fixed_amount = payload.commission_fixed_amount
 
     await db.commit()
     await db.refresh(quota)
+
+    # Invalidate package cache so agent gets the fresh commission and quota rules instantly
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix(f"packages:detail:{package.slug}")
 
     # Broadcast real-time quota update to the specific package channel
     from app.utils.sse import sse_manager
@@ -535,7 +554,10 @@ async def update_agent_quota(
             "agent_id": id,
             "package_id": payload.package_id,
             "daily_quota": quota.daily_quota,
-            "is_allowed": quota.is_allowed
+            "is_allowed": quota.is_allowed,
+            "commission_type": quota.commission_type,
+            "commission_percentage": float(quota.commission_percentage or 0) if quota.commission_percentage is not None else None,
+            "commission_fixed_amount": float(quota.commission_fixed_amount or 0) if quota.commission_fixed_amount is not None else None,
         }
     )
 
@@ -543,7 +565,10 @@ async def update_agent_quota(
         package_id=quota.package_id,
         package_title=package.title,
         daily_quota=quota.daily_quota,
-        is_allowed=quota.is_allowed
+        is_allowed=quota.is_allowed,
+        commission_type=quota.commission_type or "PERCENTAGE",
+        commission_percentage=quota.commission_percentage,
+        commission_fixed_amount=quota.commission_fixed_amount,
     )
 
 

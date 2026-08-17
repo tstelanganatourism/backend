@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_
@@ -390,16 +391,20 @@ class AdminCreateBookingRequest(BaseModel):
     passengers: List[AdminPassengerInput] = []
     # Transport
     transport_selections: Optional[List] = None  # List[{option_id, quantity}]
-    # Refreshments
+    # Refreshments & Extras
     include_refreshments: Optional[bool] = False
     include_food_option: Optional[bool] = False
     has_food_addon: Optional[bool] = False
+    extra_ids: Optional[List[int]] = None
+    selected_extras: Optional[List] = None
     # Room-specific
     departure_date: Optional[str] = None
     slot_start: Optional[str] = None
     slot_end: Optional[str] = None
     # Payment
     amount_paid: Optional[float] = None
+    paid_amount: Optional[float] = None
+    payment_method: Optional[str] = None
     # Booking mode: QUICK = only lead passenger details, rest auto-filled
     quick_booking: Optional[bool] = False
 
@@ -612,6 +617,35 @@ async def admin_create_booking(
                     food_cost = Decimal(str(adult_count)) * Decimal(str(f_adult)) + Decimal(str(child_count)) * Decimal(str(f_child))
                 subtotal_amount += food_cost
                 food_subtotal = food_cost
+
+        # Package Extras calculation
+        extras_subtotal = Decimal("0.00")
+        selected_extras_items = []
+        raw_extras = getattr(request, 'extra_ids', None) or getattr(request, 'selected_extras', None) or []
+        if raw_extras and isinstance(raw_extras, list):
+            ext_ids = []
+            for item in raw_extras:
+                if isinstance(item, int):
+                    ext_ids.append(item)
+                elif isinstance(item, dict) and 'id' in item:
+                    ext_ids.append(item['id'])
+            if ext_ids:
+                from app.models.package import PackageExtra
+                ext_res = await db.execute(select(PackageExtra).where(PackageExtra.id.in_(ext_ids)))
+                ext_list = ext_res.scalars().all()
+                for ext in ext_list:
+                    if is_student_pkg:
+                        ext_cost = Decimal(str(total_passengers)) * Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
+                    else:
+                        ext_cost = Decimal(str(adult_count)) * Decimal(str(ext.adult_price or Decimal("0.00"))) + Decimal(str(child_count)) * Decimal(str(ext.child_price or Decimal("0.00")))
+                    extras_subtotal += ext_cost
+                    selected_extras_items.append({
+                        "id": ext.id,
+                        "title": ext.title,
+                        "description": ext.description,
+                        "item_total": float(ext_cost)
+                    })
+                subtotal_amount += extras_subtotal
         
         # Admin direct bookings occupy package inventory, increment booked_count
         if inv.booked_count + total_passengers > inv.total_capacity:
@@ -671,11 +705,8 @@ async def admin_create_booking(
                     is_closed=False,
                 )
                 db.add(room_inv)
-            elif room_inv.is_closed:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Rooms are closed/unavailable on {sd.isoformat()}."
-                )
+            # Admin direct booking: ignore is_closed status
+            pass
 
             if room_inv.booked_rooms + required_rooms > room_inv.total_rooms:
                 room_inv.total_rooms = room_inv.booked_rooms + room_inv.reserved_rooms + required_rooms
@@ -712,8 +743,6 @@ async def admin_create_booking(
     paid_amount_val = Decimal(str(request.amount_paid)).quantize(Decimal("0.01")) if request.amount_paid is not None else total_amount
     if paid_amount_val < Decimal("0.00"):
         raise HTTPException(status_code=400, detail="Amount paid cannot be negative")
-    if paid_amount_val > total_amount + Decimal("0.01"):
-        raise HTTPException(status_code=400, detail=f"Amount paid cannot exceed total amount {total_amount}")
     paid_amount_val = min(paid_amount_val, total_amount)
     remaining_balance_val = max(Decimal("0.00"), total_amount - paid_amount_val)
 
@@ -723,6 +752,8 @@ async def admin_create_booking(
         "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
         "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
         "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
+        "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
+        "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
         "coupon_discount": "0.00",
         "coupon_applied": None,
         "gst_amount": str(gst_amount),
@@ -752,7 +783,6 @@ async def admin_create_booking(
         seq_val = seq_res.scalar()
         
         # Get room title prefix
-        from app.models.room import RoomVariant, Room
         from app.models.booking import generate_pnr_prefix
         room_res = await db.execute(
             select(Room.lodge_name)
@@ -768,7 +798,6 @@ async def admin_create_booking(
     else:
         # Determine if Boat Ride (TOUR) or Sightseeing (TRIP)
         from app.models.enums import PackageType
-        from app.models.package import PackageVariant, Package
         from app.models.booking import generate_pnr_prefix
         pkg_res = await db.execute(
             select(Package.type, Package.title)
@@ -818,8 +847,6 @@ async def admin_create_booking(
             BookingStatus.FULLY_PAID
             if remaining_balance_val <= Decimal("0.01")
             else BookingStatus.PARTIAL_PAID
-            if paid_amount_val > Decimal("0.00")
-            else BookingStatus.PENDING
         ),
         pricing_snapshot=pricing_snapshot,
     )
@@ -876,6 +903,22 @@ async def admin_create_booking(
         for sd in stay_dates:
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
+    # Record initial payment in payments ledger if paid_amount / amount_paid > 0
+    effective_paid_amount = getattr(request, 'paid_amount', None) or getattr(request, 'amount_paid', None)
+    if effective_paid_amount and Decimal(str(effective_paid_amount)) > 0:
+        from app.models.payment import Payment
+        from app.models.enums import PaymentStatus
+        init_payment = Payment(
+            booking_id=booking.id,
+            amount=Decimal(str(effective_paid_amount)),
+            payment_method=getattr(request, 'payment_method', None) or "ADMIN_MANUAL",
+            status=PaymentStatus.CAPTURED,
+            collected_by_type="ADMIN_MANUAL",
+            collected_by_label=f"Admin ({current_admin.full_name or 'Staff'})",
+            payment_reference_id=f"ADMIN_{booking.public_id}_{int(asyncio.get_event_loop().time()*1000)}"
+        )
+        db.add(init_payment)
+
     # Extract phone and name for SMS before commit
     sms_phone = None
     sms_cust_name = "Customer"
@@ -919,32 +962,32 @@ async def admin_create_booking(
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
 
-    # Trigger ticket/invoice generation and notifications asynchronously
-    try:
-        from app.worker import get_arq_pool
+    # Trigger ticket/invoice generation and notifications asynchronously (non-blocking)
+    async def _bg_enqueue(b_id: int, p_id: str):
         from loguru import logger
-        arq_pool = await get_arq_pool()
-        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True)
-        logger.info(f"Queued post-booking documents task for admin direct booking {booking.public_id}")
-    except Exception as e:
-        from loguru import logger
-        logger.error(f"Failed to queue post-booking documents task for admin booking: {e}")
+        # 1. Process documents, PDF & Email notification
+        try:
+            from app.services.pdf_generator import process_post_booking_documents_task
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                await process_post_booking_documents_task({"db": bg_db}, b_id, is_fully_paid=True)
+            logger.info(f"Successfully generated documents and dispatched emails for admin booking {p_id}")
+        except Exception as e:
+            logger.error(f"Error processing post-booking documents and emails for {p_id}: {e}")
 
-    # Enqueue confirmation SMS via arq (Zero-DB background task)
-    # get_booking_sms_payload queries the DB NOW while the session is open.
-    # dispatch_sms_payload is stored in Redis and only sends the HTTP request.
-    try:
-        from app.services.sms_service import get_booking_sms_payload
-        from app.worker import get_arq_pool
-        sms_payload = await get_booking_sms_payload(booking.id, db)
-        if sms_payload:
-            arq_pool = await get_arq_pool()
-            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
-            from loguru import logger
-            logger.info(f"Enqueued confirmation SMS for admin direct booking {booking.public_id}")
-    except Exception as _sms_err:
-        from loguru import logger
-        logger.warning(f"Could not enqueue confirmation SMS for admin booking {booking.public_id}: {_sms_err}")
+        # 2. Dispatch SMS payload
+        try:
+            from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                sms_payload = await get_booking_sms_payload(b_id, bg_db)
+                if sms_payload:
+                    await dispatch_sms_payload(None, sms_payload)
+                    logger.info(f"Dispatched confirmation SMS for admin direct booking {p_id}")
+        except Exception as _sms_err:
+            logger.warning(f"Could not dispatch confirmation SMS for admin booking {p_id}: {_sms_err}")
+
+    asyncio.create_task(_bg_enqueue(booking.id, booking.public_id))
 
     return {
         "status": "success",

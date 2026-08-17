@@ -277,13 +277,15 @@ async def send_admin_booking_notification(
     # ── 5. Financial line items ───────────────────────────────────────────────
     subtotal_base   = Decimal(str(pricing.get("subtotal_amount", "0.00")))
     refreshment_sub = Decimal(str(pricing.get("refreshment_subtotal", "0.00")))
+    food_sub        = Decimal(str(pricing.get("food_amount", pricing.get("catering_amount", "0.00"))))
+    extras_sub      = Decimal(str(pricing.get("extras_amount", pricing.get("extras_subtotal", "0.00"))))
     gst_amount      = Decimal(str(pricing.get("gst_amount", "0.00")))
     gateway_fee     = Decimal(str(pricing.get("gateway_fee", "0.00")))
     tourist_total   = Decimal(str(pricing.get("tourist_total", "0.00")))
     coupon_discount = Decimal(str(pricing.get("coupon_discount", "0.00")))
     payment_pct     = pricing.get("payment_percentage", "100")
 
-    # Base fare = subtotal minus refreshment and transport (snap)
+    # Base fare = subtotal minus refreshment, food, extras, and transport
     transport_cost = Decimal("0.00")
     transport_rows_html = ""
     if pricing.get("transport_selections"):
@@ -303,7 +305,7 @@ async def send_admin_booking_notification(
               <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:600;">₹{float(cost):,.2f}</td>
             </tr>"""
 
-    base_fare = subtotal_base - refreshment_sub - transport_cost
+    base_fare = subtotal_base - refreshment_sub - food_sub - extras_sub - transport_cost
 
     fin_rows = f"""
     <tr>
@@ -322,8 +324,22 @@ async def send_admin_booking_notification(
     if float(refreshment_sub) > 0:
         fin_rows += f"""
     <tr>
-      <td style="padding:6px 0;font-size:13px;color:#475569;">Refreshments</td>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Refreshments (AC Room Access)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(refreshment_sub):,.2f}</td>
+    </tr>"""
+
+    if float(food_sub) > 0:
+        fin_rows += f"""
+    <tr>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Catering &amp; Meals Package</td>
+      <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(food_sub):,.2f}</td>
+    </tr>"""
+
+    if float(extras_sub) > 0:
+        fin_rows += f"""
+    <tr>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Additional Package Extras</td>
+      <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(extras_sub):,.2f}</td>
     </tr>"""
 
     if float(coupon_discount) > 0:

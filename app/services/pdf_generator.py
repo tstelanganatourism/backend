@@ -381,6 +381,80 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         safe_target_name = escape(target_name)
         safe_target_label = "Booked Room" if is_room_booking else "Booked Package"
 
+        # Fetch boarding point & reporting time for packages
+        boarding_title = "Bhadrachalam Office"
+        reporting_time = "07:00 AM (IST)"
+        if not is_room_booking:
+            try:
+                from app.models.package import PackageVariant, PackageBoardingPoint
+                res_v = await db.execute(select(PackageVariant).where(PackageVariant.id == booking.variant_id))
+                variant = res_v.scalar_one_or_none()
+                if variant:
+                    bp_stmt = select(PackageBoardingPoint).where(
+                        PackageBoardingPoint.package_id == variant.package_id,
+                        PackageBoardingPoint.deleted_at.is_(None)
+                    ).order_by(PackageBoardingPoint.sort_order.asc())
+                    bp_res = await db.execute(bp_stmt)
+                    boarding_point = bp_res.scalars().first()
+                    if boarding_point:
+                        boarding_title = boarding_point.title
+                        reporting_time = boarding_point.departure_time
+            except Exception as e:
+                logger.warning(f"Failed to fetch boarding point: {e}")
+
+        # Derive travel date and reporting details
+        travel_date_str = booking.travel_date.strftime("%d %B %Y")
+        reporting_str = room_checkin_time if is_room_booking else reporting_time
+        location_label = "Lodge / Stay Address" if is_room_booking else "Boarding Point"
+        location_val = hotel_name if is_room_booking else boarding_title
+
+        # Passenger summary
+        pax_summary_list = [p.full_name for p in booking.passengers]
+        pax_str = ", ".join(pax_summary_list)
+        if len(pax_str) > 60:
+            pax_str = pax_str[:57] + "..."
+
+        # Transport summary
+        transport_summary = ""
+        if booking.pricing_snapshot and booking.pricing_snapshot.get("transport_selections"):
+            trans_list = booking.pricing_snapshot.get("transport_selections")
+            trans_names = [t.get("title") for t in trans_list if t.get("title")]
+            if trans_names:
+                transport_summary = ", ".join(trans_names)
+
+        transport_row = ""
+        if transport_summary:
+            transport_row = f"""
+                                        <tr>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">🚗 Selected Transport</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#0a2351; font-size:13px; line-height:18px; font-weight:750;">{escape(transport_summary)}</div>
+                                            </td>
+                                        </tr>
+            """
+
+        ticket_details_html = f"""
+                                        <tr>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">📅 Travel Date</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#0a2351; font-size:14px; line-height:20px; font-weight:800;">{travel_date_str}</div>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">📍 {location_label}</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#0a2351; font-size:14px; line-height:20px; font-weight:800;">{escape(location_val)} (Reporting: {reporting_str})</div>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td style="padding:16px 20px; border-bottom:1px solid #e2e8f0;">
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#64748b; font-size:10px; line-height:14px; font-weight:800; text-transform:uppercase; letter-spacing:1px; margin-bottom:2px;">👥 Passengers ({len(booking.passengers)})</div>
+                                                <div style="font-family:Arial, Helvetica, sans-serif; color:#0a2351; font-size:13px; line-height:18px; font-weight:750;">{escape(pax_str)}</div>
+                                            </td>
+                                        </tr>
+                                        {transport_row}
+        """.strip()
+
         if is_room_booking:
             preview_text = "Your TS Boat Tourism booking documents are ready. Download your ticket before the link expires."
             # Build hotel info section for email if available
@@ -580,6 +654,7 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                                                 <div style="color:#0a2351; font-size:15px; line-height:20px; font-weight:800;">{safe_target_name}</div>
                                             </td>
                                         </tr>
+                                        {ticket_details_html}
                                         {financial_details}
                                     </table>
 
@@ -690,18 +765,19 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 booking_id=safe_booking_id,
                 safe_target_label=safe_target_label,
                 safe_target_name=safe_target_name,
+                ticket_details_html=ticket_details_html,
                 financial_details=financial_details,
                 logo1_url=safe_logo1_url,
-            logo2_url=safe_logo2_url,
-            office_phone=office_phone,
-            office_phone_tel=office_phone.replace(" ", ""),
-            office_address=safe_office_address,
-            office_maps_url=safe_office_maps_url,
-            preview_text=preview_text,
-            next_steps_section=next_steps_section,
-            action_buttons_section=action_buttons_section,
-            mandatory_notice_section=mandatory_notice_section
-        )
+                logo2_url=safe_logo2_url,
+                office_phone=office_phone,
+                office_phone_tel=office_phone.replace(" ", ""),
+                office_address=safe_office_address,
+                office_maps_url=safe_office_maps_url,
+                preview_text=preview_text,
+                next_steps_section=next_steps_section,
+                action_buttons_section=action_buttons_section,
+                mandatory_notice_section=mandatory_notice_section
+            )
 
 
         # Check existing successful emails to prevent duplicates on ARQ retry

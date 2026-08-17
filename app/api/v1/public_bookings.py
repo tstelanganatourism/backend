@@ -81,6 +81,8 @@ class CheckoutRequest(BaseModel):
     student_count: Optional[int] = None  # for student packages
     has_refreshment_addon: Optional[bool] = False
     has_food_addon: Optional[bool] = False
+    extra_ids: Optional[List[int]] = None
+    selected_extras: Optional[List] = None
 
     # Passenger manifest
     passengers: Optional[List[PassengerInput]] = None
@@ -113,11 +115,11 @@ async def checkout(
     from app.core.timezone import get_ist_now
     from app.utils.verhoeff import is_valid_aadhaar
     from app.core.config import settings
-    from app.models.enums import AccountStatus
+    from app.models.enums import AccountStatus, UserRole
     
+    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
     if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
         raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
-
     # Development hook removed to prevent invoice math corruption.
 
     # Derive adult, child, and student counts safely
@@ -130,7 +132,6 @@ async def checkout(
         raise HTTPException(status_code=400, detail="Passenger details must be provided for all guests")
     
     # ── Passenger validation ──────────────────────────────────────────────────
-    from app.models.enums import UserRole
     is_student_pkg = False
     if request.target_type == 'package' and request.variant_id:
         from app.models.package import PackageVariant, Package
@@ -190,7 +191,6 @@ async def checkout(
         now_ist = get_ist_now()
         today = now_ist.date()
         is_after_6am = now_ist.hour >= 6
-        is_admin = current_user is not None and current_user.role == UserRole.ADMIN
         
         if not is_admin and (request.travel_date < today or (request.travel_date == today and is_after_6am)):
             raise HTTPException(status_code=400, detail="Bookings for today are closed after 6:00 AM IST")
@@ -486,21 +486,17 @@ async def checkout(
                 )
 
                 if inv_row is None:
-                    if is_admin:
-                        inv_row = PackageTransportInventory(
-                            transport_option_id=sel.option_id,
-                            date=travel_date_obj,
-                            available_count=9999,
-                            booked_count=0,
-                            is_closed=False,
-                        )
-                        db.add(inv_row)
-                        await db.flush()
-                    else:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Transport option '{t_opt.title}' is not available on {travel_date_obj}. The admin has not opened this transport for this date."
-                        )
+                    t_type_str = t_opt.type.value if hasattr(t_opt.type, 'value') else str(t_opt.type)
+                    default_avail = 9999 if is_admin else (10 if t_type_str == 'SEPARATE_VEHICLE' else max(1, t_opt.capacity or 50))
+                    inv_row = PackageTransportInventory(
+                        transport_option_id=sel.option_id,
+                        date=travel_date_obj,
+                        available_count=default_avail,
+                        booked_count=0,
+                        is_closed=False,
+                    )
+                    db.add(inv_row)
+                    await db.flush()
 
                 if inv_row.is_closed and not is_admin:
                     raise HTTPException(
@@ -558,7 +554,35 @@ async def checkout(
                 f_child = parent_package.food_child_price or Decimal("0.00")
                 food_subtotal = Decimal(str(adult_count)) * f_adult + Decimal(str(child_count)) * f_child
 
-        subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal + food_subtotal
+        # Extras calculation
+        extras_subtotal = Decimal("0.00")
+        selected_extras_items = []
+        raw_extras = getattr(request, 'extra_ids', None) or getattr(request, 'selected_extras', None) or []
+        if raw_extras and isinstance(raw_extras, list):
+            ext_ids = []
+            for item in raw_extras:
+                if isinstance(item, int):
+                    ext_ids.append(item)
+                elif isinstance(item, dict) and 'id' in item:
+                    ext_ids.append(item['id'])
+            if ext_ids:
+                from app.models.package import PackageExtra
+                ext_res = await db.execute(select(PackageExtra).where(PackageExtra.id.in_(ext_ids)))
+                ext_list = ext_res.scalars().all()
+                for ext in ext_list:
+                    if is_student_pkg:
+                        ext_cost = Decimal(str(student_count)) * Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
+                    else:
+                        ext_cost = Decimal(str(adult_count)) * Decimal(str(ext.adult_price or Decimal("0.00"))) + Decimal(str(child_count)) * Decimal(str(ext.child_price or Decimal("0.00")))
+                    extras_subtotal += ext_cost
+                    selected_extras_items.append({
+                        "id": ext.id,
+                        "title": ext.title,
+                        "description": ext.description,
+                        "item_total": float(ext_cost)
+                    })
+
+        subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal + food_subtotal + extras_subtotal
         
         # Hook removed.
             
@@ -678,14 +702,14 @@ async def checkout(
                     detail=f"Rooms unavailable on {stay_date.isoformat()}"
                 )
 
-            if inv.is_closed:
+            if inv.is_closed and not is_admin:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Rooms unavailable on {stay_date.isoformat()}"
                 )
 
             available = inv.total_rooms - (inv.booked_rooms + inv.reserved_rooms)
-            if available < required_rooms:
+            if available < required_rooms and not is_admin:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Rooms unavailable on {stay_date.isoformat()}"
@@ -773,12 +797,29 @@ async def checkout(
         agent_id = current_user.id
         agent_name = current_user.full_name
         source = BookingSource.AGENT
-        commission_percentage = Decimal(str(current_user.commission_percentage or 0))
+
+        # Check package-specific commission override if target is package
+        comm_type = None
+        comm_pct = None
+        comm_fixed = None
+        if request.target_type == 'package' and 'quota' in locals() and quota:
+            comm_type = quota.commission_type
+            comm_pct = quota.commission_percentage
+            comm_fixed = quota.commission_fixed_amount
+
+        commission_type = comm_type or getattr(current_user, 'commission_type', 'PERCENTAGE') or 'PERCENTAGE'
         
-        commission_type = getattr(current_user, 'commission_type', 'PERCENTAGE') or 'PERCENTAGE'
+        if comm_pct is not None:
+            commission_percentage = Decimal(str(comm_pct))
+        else:
+            commission_percentage = Decimal(str(current_user.commission_percentage or 0))
+            
+        if comm_fixed is not None:
+            fixed_amount = Decimal(str(comm_fixed))
+        else:
+            fixed_amount = Decimal(str(current_user.commission_fixed_amount or 0))
         
         if commission_type == 'FIXED_AMOUNT':
-            fixed_amount = Decimal(str(current_user.commission_fixed_amount or 0))
             agent_discount = min(fixed_amount, commissionable_base, total_amount).quantize(Decimal("0.01"))
         else:
             # PERCENTAGE type
@@ -799,6 +840,8 @@ async def checkout(
         "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
         "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
         "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
+        "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
+        "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
@@ -818,7 +861,9 @@ async def checkout(
         pricing_snapshot["agent_metadata"] = {
             "agent_id": current_user.id,
             "agent_name": current_user.full_name,
+            "commission_type": commission_type,
             "commission_percentage": str(commission_percentage),
+            "commission_fixed_amount": str(fixed_amount) if commission_type == 'FIXED_AMOUNT' else None,
         }
         
     if request.target_type == 'room':
@@ -912,13 +957,7 @@ async def checkout(
     else:
         payable_amount = tourist_amount_payable
 
-    # Developer test bypass (only active in development/staging environments)
-    if settings.ENVIRONMENT != "production" and (user_email == '2024eb01987@online.bits-pilani.ac.in' or user_phone == '8886154275'):
-        payable_amount = Decimal("1.00")
-        total_amount = Decimal("1.00")
-        tourist_amount_payable = Decimal("1.00")
-        pricing_snapshot["tourist_total"] = "1.00"
-        pricing_snapshot["tourist_amount_payable"] = "1.00"
+
 
     pricing_snapshot["payment_percentage"] = str(payment_percentage)
     pricing_snapshot["tourist_amount_payable"] = str(tourist_amount_payable)
@@ -926,6 +965,246 @@ async def checkout(
 
     if request.expected_amount is not None:
         pass  # Frontend sends expected_amount but we process checkout with realtime calculated price.
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AGENT DIRECT BOOKING PATH
+    # ═══════════════════════════════════════════════════════════════════════════
+    # When the logged-in user is an AGENT, we skip the payment gateway entirely.
+    # The agent's commission is automatically applied as their "payment".
+    # The booking is created immediately with PARTIAL_PAID status:
+    #   - paid_amount    = agent_commission (agent's share — already settled)
+    #   - remaining_balance = agent_payable (tourist pays this at the office)
+    # Ticket is generated and SMS is sent immediately.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if is_agent:
+        from app.models.booking import generate_pnr_prefix
+        from app.models.package import Package, PackageVariant as PV
+        from app.models.enums import PackageType
+        from app.models.payment import Payment
+        from app.models.enums import PaymentStatus
+        from app.core.security import AadharCryptography, AadharHashing
+        from sqlalchemy import text as sa_text
+        from app.models.room import Room as RoomModel
+
+        now = get_ist_now()
+
+        # ── 1. Generate PNR / public_id ──────────────────────────────────────
+        if request.target_type == 'room':
+            seq_res = await db.execute(sa_text("SELECT nextval('booking_seq_ac')"))
+            seq_val = seq_res.scalar()
+            r_title = room_obj.lodge_name if room_obj else "ROOM"
+            prefix = generate_pnr_prefix(r_title)
+            date_str = request.travel_date.strftime("%d%m%Y")
+            public_id_val = f"TSBOAT_{prefix}_{date_str}_{seq_val:04d}"
+        else:
+            pkg_type_res = await db.execute(
+                select(Package.type, Package.title)
+                .join(PV, PV.package_id == Package.id)
+                .where(PV.id == package_variant_id)
+            )
+            pkg_row = pkg_type_res.first()
+            pkg_type_val = pkg_row[0] if pkg_row else None
+            pkg_title_val = pkg_row[1] if pkg_row else "PACKAGE"
+            prefix = generate_pnr_prefix(pkg_title_val)
+            date_str = request.travel_date.strftime("%d%m%Y")
+            if pkg_type_val == PackageType.TRIP:
+                seq_res = await db.execute(sa_text("SELECT nextval('booking_seq_ss')"))
+            else:
+                seq_res = await db.execute(sa_text("SELECT nextval('booking_seq_bt')"))
+            seq_val = seq_res.scalar()
+            public_id_val = f"TSBOAT_{prefix}_{date_str}_{seq_val:04d}"
+
+        # ── 2. Compute booking financials ────────────────────────────────────
+        # agent_discount  = commission the agent earns (their share)
+        # agent_payable   = what the tourist owes at the office
+        # paid_amount     = agent_discount (commission already "paid" via agency agreement)
+        # remaining_balance = agent_payable
+        paid_amount_agent = agent_discount  # commission = agent's settled portion
+        remaining_balance_agent = agent_payable  # tourist pays this at office
+
+        # Determine booking status based on whether commission covers full amount
+        if remaining_balance_agent <= Decimal("0.01"):
+            booking_status_agent = BookingStatus.FULLY_PAID
+            remaining_balance_agent = Decimal("0.00")
+        else:
+            booking_status_agent = BookingStatus.PARTIAL_PAID
+
+        # Add agent booking metadata to pricing snapshot
+        pricing_snapshot["payment_method"] = "AGENT_COMMISSION"
+        pricing_snapshot["agent_direct_booking"] = True
+        pricing_snapshot["tourist_due_at_office"] = str(agent_payable)
+        pricing_snapshot["payment_percentage"] = "100"
+        pricing_snapshot["tourist_amount_payable"] = str(total_amount)
+        pricing_snapshot["actual_paid_advance"] = str(paid_amount_agent)
+
+        # ── 3. Convert reserved inventory → booked ──────────────────────────
+        if request.target_type == 'package':
+            inventory.reserved_count = max(0, inventory.reserved_count - request.quantity)
+            inventory.booked_count += request.quantity
+        else:  # room
+            for inv_item in locked_inventories:
+                inv_item.reserved_rooms = max(0, inv_item.reserved_rooms - required_rooms)
+                inv_item.booked_rooms += required_rooms
+
+        # ── 4. Create Booking ────────────────────────────────────────────────
+        booking = Booking(
+            public_id=public_id_val,
+            user_id=current_user.id,
+            agent_id=current_user.id,
+            source=BookingSource.AGENT,
+            customer_email=request.customer_email or current_user.email,
+            variant_id=package_variant_id,
+            room_variant_id=room_variant_id,
+            travel_date=request.travel_date,
+            adult_count=adult_count if 'adult_count' in locals() else request.quantity,
+            child_count=child_count if 'child_count' in locals() else 0,
+            student_count=student_count if 'student_count' in locals() else 0,
+            has_refreshment_addon=bool(pricing_snapshot.get('has_refreshment_addon', False)),
+            has_food_addon=bool(pricing_snapshot.get('has_food_addon', False)),
+            subtotal_amount=subtotal_amount,
+            coupon_discount=coupon_discount,
+            coupon_applied=coupon_applied,
+            gst_amount=gst_amount,
+            gateway_fee=gateway_fee,
+            total_amount=total_amount,
+            paid_amount=paid_amount_agent,
+            remaining_balance=remaining_balance_agent,
+            agent_commission=agent_discount,
+            status=booking_status_agent,
+            pricing_snapshot=pricing_snapshot,
+        )
+        db.add(booking)
+        await db.flush()
+
+        # ── 5. Persist Passengers ────────────────────────────────────────────
+        crypto = AadharCryptography()
+        if request.passengers:
+            for p in request.passengers:
+                gender_enum = None
+                if p.gender:
+                    try:
+                        from app.models.enums import GenderType
+                        gender_enum = GenderType(p.gender.upper())
+                    except (ValueError, KeyError):
+                        pass
+                raw_aadhaar = (p.aadhaar or '').strip()
+                encrypted_aadhaar = crypto.encrypt(raw_aadhaar) if raw_aadhaar else None
+                hashed_aadhaar = AadharHashing.hash_aadhar(raw_aadhaar) if raw_aadhaar else None
+                db.add(BookingPassenger(
+                    booking_id=booking.id,
+                    full_name=p.full_name,
+                    age=p.age or 0,
+                    gender=gender_enum,
+                    phone_number=p.phone,
+                    relationship_to_lead=p.relationship,
+                    is_primary=bool(p.is_primary),
+                    aadhar_encrypted=encrypted_aadhaar,
+                    aadhar_hash=hashed_aadhaar,
+                    student_class=p.student_class or None,
+                ))
+
+        # ── 5b. Persist Stay Dates (if room booking) ─────────────────────────
+        if request.target_type == 'room' and '_room_stay_dates' in locals() and _room_stay_dates:
+            for sd in _room_stay_dates:
+                db.add(BookingStayDate(booking_id=booking.id, date=sd))
+
+        # ── 5c. Payment ledger row (AGENT_COMMISSION — no gateway) ───────────
+        payment_ref = f"AGENT_{public_id_val}_{uuid.uuid4().hex[:8].upper()}"
+        db.add(Payment(
+            booking_id=booking.id,
+            payment_reference_id=payment_ref,
+            pg_order_id=None,
+            pg_payment_id=None,
+            amount=paid_amount_agent,
+            status=PaymentStatus.CAPTURED,
+            payment_method="AGENT_COMMISSION",
+            collected_by_type="AGENT_COMMISSION",
+        ))
+
+        # ── 5d. Coupon usage increment ────────────────────────────────────────
+        if coupon_applied:
+            try:
+                coupon_obj = await db.scalar(
+                    select(Coupon).where(Coupon.code == coupon_applied)
+                )
+                if coupon_obj:
+                    coupon_obj.usage_count = (coupon_obj.usage_count or 0) + 1
+            except Exception:
+                pass
+
+        await db.flush()
+
+        # ── 6. SSE Inventory Update ──────────────────────────────────────────
+        import time
+        from app.utils.sse import sse_manager, broadcast_transport_update
+
+        if request.target_type.lower() == 'package':
+            sse_payload = {
+                "version": int(time.time() * 1000),
+                "timestamp": now.isoformat(),
+                "package_id": variant.package_id,
+                "travel_date": str(request.travel_date),
+                "available": inventory.total_capacity - (inventory.booked_count + inventory.reserved_count),
+                "reserved": inventory.reserved_count,
+                "booked": inventory.booked_count,
+                "is_closed": inventory.is_closed,
+                "variant_id": package_variant_id,
+            }
+        else:
+            sse_payload = None
+
+        await db.commit()
+
+        if request.target_type.lower() == 'package':
+            for opt_id in transport_options_to_broadcast:
+                await broadcast_transport_update(db, opt_id, request.travel_date)
+            if sse_payload:
+                await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
+
+        # ── 7. Trigger ticket/email/SMS generation ───────────────────────────
+        async def _agent_booking_documents(b_id: int, b_public_id: str):
+            try:
+                from app.services.pdf_generator import process_post_booking_documents_task
+                await process_post_booking_documents_task(None, b_id, is_fully_paid=(booking_status_agent == BookingStatus.FULLY_PAID))
+                logger.info(f"Agent booking documents generated for {b_public_id}")
+            except Exception as doc_err:
+                logger.error(f"Agent booking document generation failed for {b_public_id}: {doc_err}")
+
+            try:
+                async with __import__('app.db.session', fromlist=['AsyncSessionLocal']).AsyncSessionLocal() as sms_db:
+                    from app.services.sms_service import get_booking_sms_payload
+                    from app.worker import get_arq_pool
+                    sms_payload = await get_booking_sms_payload(b_id, sms_db)
+                    if sms_payload:
+                        arq_pool = await get_arq_pool()
+                        if arq_pool:
+                            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+            except Exception as sms_err:
+                logger.warning(f"Agent booking SMS enqueue failed for {b_public_id}: {sms_err}")
+
+        background_tasks.add_task(_agent_booking_documents, booking.id, booking.public_id)
+
+        logger.info(
+            f"Agent direct booking confirmed | booking={public_id_val} | agent={current_user.id} "
+            f"| commission={agent_discount} | tourist_due={agent_payable}"
+        )
+
+        return {
+            "status": "success",
+            "booking_confirmed": True,
+            "payment_method": "AGENT_COMMISSION",
+            "message": "Booking confirmed via agent commission. Tourist pays the remaining amount at the office.",
+            "checkout_data": {
+                "booking_id": booking.public_id,
+                "booking_status": booking_status_agent.value,
+                "total_amount": float(total_amount),
+                "agent_commission": float(agent_discount),
+                "tourist_due_at_office": float(agent_payable),
+            }
+        }
+    # ═══════════════════════════════════════════════════════════════════════════
+    # END AGENT DIRECT BOOKING PATH
+    # ═══════════════════════════════════════════════════════════════════════════
 
     draft_id = "DRF-" + str(uuid.uuid4())[:8].upper()
     merchant_txn_id = f"TXN_{draft_id}_{str(uuid.uuid4())[:4].upper()}"
@@ -1125,7 +1404,7 @@ async def get_agent_dashboard_summary(
     total_earnings = Decimal("0.00")
     this_month_earnings = Decimal("0.00")
     
-    paid_statuses = {BookingStatus.FULLY_PAID}
+    paid_statuses = {BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID}
     for b in bookings:
         if b.status in paid_statuses:
             comm = b.agent_commission or Decimal("0.00")
@@ -1576,6 +1855,25 @@ async def get_booking_details(
                     "meal_included": day.meal_included,
                     "description": day.description
                 })
+
+        meals_list = []
+        from app.models.package import PackageMealItem
+        meal_stmt = select(PackageMealItem).where(
+            PackageMealItem.package_id == variant.package_id,
+            PackageMealItem.deleted_at.is_(None)
+        ).order_by(PackageMealItem.sort_order.asc())
+        meal_res = await db.execute(meal_stmt)
+        for m in meal_res.scalars().all():
+            meals_list.append({
+                "id": m.id,
+                "meal_type": m.meal_type.value if hasattr(m.meal_type, "value") else str(m.meal_type),
+                "name": m.name,
+                "serving_time": m.serving_time,
+                "description": m.description,
+                "is_vegetarian": m.is_vegetarian,
+                "day_number": m.day_number,
+                "sort_order": m.sort_order
+            })
     # Use already-loaded relationships to avoid enum type mismatch in raw SQL
     has_pending_cancellation = any(
         (r.status.value if hasattr(r.status, "value") else str(r.status)) == "PENDING"
@@ -1657,6 +1955,18 @@ async def get_booking_details(
             "created_at": p.created_at.isoformat() if p.created_at else None,
         })
 
+    if not payment_ledger and float(b.paid_amount or 0) > 0:
+        payment_ledger.append({
+            "id": 0,
+            "amount": float(b.paid_amount),
+            "payment_method": "ADMIN_MANUAL" if b.agent_id else "ONLINE",
+            "status": "CAPTURED",
+            "collected_by_type": "ONLINE",
+            "collected_by_label": "Verified Booking Payment",
+            "payment_reference_id": f"TXN_{b.public_id}",
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        })
+
     agent_paid = sum(Decimal(str(p.amount)) for p in raw_payments if p.status == PaymentStatus.CAPTURED)
     agent_payable = max(Decimal("0.00"), Decimal(str(b.total_amount)) - Decimal(str(b.agent_commission or "0.00")))
 
@@ -1676,16 +1986,8 @@ async def get_booking_details(
         "gst_amount": float(b.gst_amount),
         "gateway_fee": float(b.gateway_fee),
         "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
-        "remaining_balance": (
-            float(max(Decimal("0.00"), agent_payable - agent_paid))
-            if use_agent_payment_view
-            else float(b.remaining_balance)
-        ),
-        "paid_amount": (
-            float(agent_paid)
-            if use_agent_payment_view
-            else float(b.paid_amount)
-        ),
+        "remaining_balance": float(b.remaining_balance),
+        "paid_amount": float(b.paid_amount),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),
         "created_at": b.created_at.isoformat() if b.created_at else None,
         "package_title": package_title,
@@ -1706,6 +2008,7 @@ async def get_booking_details(
         "room_map_url": room_map_url,
         "room_highlights": room_highlights,
         "itinerary": itinerary,
+        "meals": meals_list,
         "passengers": [
             {
                 "full_name": p.full_name,

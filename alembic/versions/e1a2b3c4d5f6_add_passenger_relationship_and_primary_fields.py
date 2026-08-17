@@ -19,8 +19,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Add relationship_to_lead and is_primary columns to booking_passengers."""
-    op.add_column('booking_passengers', sa.Column('relationship_to_lead', sa.String(length=50), nullable=True))
-    op.add_column('booking_passengers', sa.Column('is_primary', sa.Boolean(), server_default='false', nullable=False))
+    op.execute("ALTER TABLE booking_passengers ADD COLUMN IF NOT EXISTS relationship_to_lead VARCHAR(length=50)")
+    op.execute("ALTER TABLE booking_passengers ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT 'false' NOT NULL")
 
 
 def downgrade() -> None:

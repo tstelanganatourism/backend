@@ -16,7 +16,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('packages', sa.Column('refreshments_min_passengers', sa.Integer(), nullable=False, server_default='1'))
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS refreshments_min_passengers INTEGER DEFAULT 1 NOT NULL")
 
 
 def downgrade() -> None:

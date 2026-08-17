@@ -55,13 +55,7 @@ async def get_packages(
     Public Package Discovery API.
     Returns a paginated list of active packages, properly eagerly loading variants for starting_price.
     """
-    user_suffix = ""
-    if current_user and (
-        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8886154275"
-    ):
-        user_suffix = ":special_user"
-    cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}{user_suffix}"
+    cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}"
     set_public_cache_headers(response)
 
     async def load_packages() -> PaginatedResponse[PackageListDTO]:
@@ -115,6 +109,7 @@ async def get_packages(
                 Package.place,
                 Package.region,
                 Package.cover_image_url,
+                Package.video_url,
                 Package.brochure_pdf_url,
                 Package.generated_brochure_url,
                 Package.is_active,
@@ -140,13 +135,6 @@ async def get_packages(
         total_count = (await db.execute(count_query)).scalar_one()
         packages = (await db.execute(data_query)).all()
 
-        is_promo_user = False
-        if current_user and (
-            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8886154275"
-        ):
-            is_promo_user = True
-
         # Fetch variants manually in one go to avoid ORM hydration penalty while giving frontend child pricing
         package_ids = [pkg.id for pkg in packages]
         variants_by_pkg = {}
@@ -162,21 +150,18 @@ async def get_packages(
                 variants_by_pkg.setdefault(v.package_id, []).append(PackageVariantPublicDTO(
                     id=v.id,
                     title=v.title,
-                    adult_price=Decimal("1.00") if is_promo_user else (v.adult_price or Decimal("0.00")),
-                    child_price=Decimal("1.00") if is_promo_user else (v.child_price or Decimal("0.00")),
-                    weekend_adult_price=Decimal("1.00") if is_promo_user else v.weekend_adult_price,
-                    weekend_child_price=Decimal("1.00") if is_promo_user else v.weekend_child_price,
-                    student_price=Decimal("1.00") if is_promo_user else v.student_price,
-                    weekend_student_price=Decimal("1.00") if is_promo_user else v.weekend_student_price,
+                    adult_price=v.adult_price or Decimal("0.00"),
+                    child_price=v.child_price or Decimal("0.00"),
+                    weekend_adult_price=v.weekend_adult_price,
+                    weekend_child_price=v.weekend_child_price,
+                    student_price=v.student_price,
+                    weekend_student_price=v.weekend_student_price,
                     transport_info=None
                 ))
 
         # Map to DTOs
-        import asyncio
-
-        async def build_dto(pkg):
-            active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
-            return PackageListDTO(
+        dto_list = [
+            PackageListDTO(
                 id=pkg.id,
                 slug=pkg.slug,
                 title=pkg.title,
@@ -184,20 +169,21 @@ async def get_packages(
                 duration=pkg.duration,
                 place=pkg.place,
                 region=pkg.region,
-                brochure_pdf_url=active_brochure_url,
+                brochure_pdf_url=pkg.brochure_pdf_url or pkg.generated_brochure_url,
                 generated_brochure_url=pkg.generated_brochure_url,
                 cover_image_url=pkg.cover_image_url,
+                video_url=pkg.video_url,
                 is_active=pkg.is_active,
                 is_featured=pkg.is_featured,
                 is_student_package=pkg.is_student_package,
                 min_passengers=pkg.min_passengers or 1,
                 tags=pkg.tags_list or [],
-                starting_price=Decimal("1.00") if is_promo_user else pkg.starting_price,
+                starting_price=pkg.starting_price,
                 transport_info=None,
                 variants=variants_by_pkg.get(pkg.id, [])
             )
-
-        dto_list = await asyncio.gather(*(build_dto(pkg) for pkg in packages))
+            for pkg in packages
+        ]
 
         has_next = (offset + size) < total_count
         has_prev = page > 1
@@ -288,8 +274,8 @@ async def get_package_category(
         packages_dto.append(PackageListDTO(
             id=pkg.id, slug=pkg.slug, title=pkg.title, type=pkg.type,
             duration=pkg.duration, place=pkg.place, region=pkg.region,
-            cover_image_url=pkg.cover_image_url, is_active=pkg.is_active,
-            is_featured=pkg.is_featured,
+            cover_image_url=pkg.cover_image_url, video_url=getattr(pkg, 'video_url', None),
+            is_active=pkg.is_active, is_featured=pkg.is_featured,
             is_student_package=getattr(pkg, 'is_student_package', False),
             tags=[t.name for t in pkg.tags], starting_price=pkg.starting_price,
             variants=[PackageVariantPublicDTO(
@@ -317,14 +303,13 @@ async def get_package_detail(
     Public Package Detail API.
     Returns full details for a specific package, including all content sections.
     """
-    user_suffix = ""
-    if current_user and (
-        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8886154275"
-    ):
-        user_suffix = ":special_user"
-    cache_key = f"packages:detail:{slug}{user_suffix}"
-    set_public_cache_headers(response)
+    is_agent = current_user is not None and current_user.role == UserRole.AGENT
+    if is_agent:
+        cache_key = f"packages:detail:{slug}:agent:{current_user.id}"
+        set_no_store_headers(response)
+    else:
+        cache_key = f"packages:detail:{slug}"
+        set_public_cache_headers(response)
 
     async def load_package_detail() -> PackageDetailDTO:
         query = (
@@ -386,21 +371,38 @@ async def get_package_detail(
         pkg_meals = results[10]
         pkg_extras = results[11]
             
-        is_promo_user = False
-        if current_user and (
-            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8886154275"
-        ):
-            is_promo_user = True
-
-        if is_promo_user:
-            starting_price = Decimal("1.00")
-        elif pkg.is_student_package:
+        if pkg.is_student_package:
             starting_price = min((v.student_price for v in pkg_variants if v.student_price is not None), default=None)
         else:
             starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
         
         active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
+
+        # Agent Quota & Commission details if agent is logged in
+        agent_comm_type = None
+        agent_comm_pct = None
+        agent_comm_fixed = None
+        agent_quota_val = None
+        agent_allowed_val = None
+        
+        if is_agent:
+            from app.models.user import AgentPackageQuota
+            quota_res = await db.execute(
+                select(AgentPackageQuota).where(
+                    AgentPackageQuota.agent_id == current_user.id,
+                    AgentPackageQuota.package_id == pkg.id
+                )
+            )
+            q_row = quota_res.scalar_one_or_none()
+            agent_comm_type = (q_row.commission_type if (q_row and q_row.commission_type) else None) or current_user.commission_type or "PERCENTAGE"
+            agent_comm_pct = (q_row.commission_percentage if (q_row and q_row.commission_percentage is not None) else None)
+            if agent_comm_pct is None:
+                agent_comm_pct = current_user.commission_percentage
+            agent_comm_fixed = (q_row.commission_fixed_amount if (q_row and q_row.commission_fixed_amount is not None) else None)
+            if agent_comm_fixed is None:
+                agent_comm_fixed = current_user.commission_fixed_amount
+            agent_quota_val = q_row.daily_quota if q_row else 10
+            agent_allowed_val = q_row.is_allowed if q_row else True
         
         return PackageDetailDTO(
             id=pkg.id,
@@ -414,6 +416,7 @@ async def get_package_detail(
             brochure_pdf_url=active_brochure_url,
             generated_brochure_url=pkg.generated_brochure_url,
             cover_image_url=pkg.cover_image_url,
+            video_url=pkg.video_url,
             is_active=pkg.is_active,
             is_featured=pkg.is_featured,
             tags=[tag.name for tag in pkg_tags if tag.is_active],
@@ -457,12 +460,12 @@ async def get_package_detail(
                 PackageVariantPublicDTO(
                     id=v.id,
                     title=v.title,
-                    adult_price=Decimal("1.00") if is_promo_user else (v.adult_price or Decimal("0.00")),
-                    child_price=Decimal("1.00") if is_promo_user else (v.child_price or Decimal("0.00")),
-                    weekend_adult_price=Decimal("1.00") if is_promo_user else v.weekend_adult_price,
-                    weekend_child_price=Decimal("1.00") if is_promo_user else v.weekend_child_price,
-                    student_price=Decimal("1.00") if is_promo_user else v.student_price,
-                    weekend_student_price=Decimal("1.00") if is_promo_user else v.weekend_student_price,
+                    adult_price=v.adult_price or Decimal("0.00"),
+                    child_price=v.child_price or Decimal("0.00"),
+                    weekend_adult_price=v.weekend_adult_price,
+                    weekend_child_price=v.weekend_child_price,
+                    student_price=v.student_price,
+                    weekend_student_price=v.weekend_student_price,
                     transport_info=None
                 ) for v in pkg_variants
             ],
@@ -505,7 +508,12 @@ async def get_package_detail(
             extras=[
                 item for item in pkg_extras
                 if not item.deleted_at and has_text(item.title)
-            ]
+            ],
+            agent_commission_type=agent_comm_type,
+            agent_commission_percentage=agent_comm_pct,
+            agent_commission_fixed_amount=agent_comm_fixed,
+            agent_daily_quota=agent_quota_val,
+            agent_is_allowed=agent_allowed_val,
         )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
@@ -710,19 +718,7 @@ async def get_package_availability(
                 eff_adult = max(Decimal("0.00"), (base_adult or Decimal("0.00")) + modifier)
                 eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
                 
-            # Hook for special ₹1 user testing
-            if current_user and (
-                current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-                current_user.phone_number == "8886154275"
-            ):
-                if is_student:
-                    base_student = Decimal("1.00")
-                    eff_student = Decimal("1.00")
-                else:
-                    base_adult = Decimal("1.00")
-                    base_child = Decimal("1.00")
-                    eff_adult = Decimal("1.00")
-                    eff_child = Decimal("1.00")
+
 
             if inv is None:
                 if current.day == 21:

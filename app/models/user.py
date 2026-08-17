@@ -25,7 +25,7 @@ class User(BaseModel):
     address = Column(Text, nullable=True)
     admin_notes = Column(Text, nullable=True)
     white_label_enabled = Column(Boolean, default=False, server_default="false", nullable=False)
-    
+
     # Profile picture
     avatar_url = Column(String, nullable=True)
 
@@ -41,6 +41,9 @@ class AgentPackageQuota(BaseModel):
     package_id = Column(Integer, ForeignKey("packages.id", ondelete="CASCADE"), nullable=False, index=True)
     daily_quota = Column(Integer, nullable=False, default=10, server_default="10")
     is_allowed = Column(Boolean, nullable=False, default=True, server_default="true")
+    commission_type = Column(String(16), nullable=True)  # PERCENTAGE or FIXED_AMOUNT
+    commission_percentage = Column(Numeric(5, 2), nullable=True)
+    commission_fixed_amount = Column(Numeric(10, 2), nullable=True)
 
     # Relationships
     agent = relationship("User", back_populates="package_quotas")
@@ -49,5 +52,3 @@ class AgentPackageQuota(BaseModel):
     __table_args__ = (
         UniqueConstraint("agent_id", "package_id", name="uq_agent_package_quota"),
     )
-
-

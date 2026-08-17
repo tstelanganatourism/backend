@@ -26,6 +26,7 @@ class RoomGalleryImageResponse(AppBaseModel):
     image_url: str
     alt_text: Optional[str] = None
     is_cover: bool
+    media_type: str = "image"
     sort_order: int
 
 class RoomHighlightResponse(AppBaseModel):
@@ -62,6 +63,7 @@ class RoomGalleryImageInput(AppBaseModel):
     image_url: str
     alt_text: Optional[str] = None
     is_cover: bool = False
+    media_type: str = "image"
     sort_order: int = 0
 
 class RoomHighlightInput(AppBaseModel):
@@ -91,6 +93,7 @@ class RoomBase(AppBaseModel):
     map_url: Optional[str] = None
     facilities: Optional[List[str]] = None
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None
     total_rooms: int
     slot_start: time
     slot_end: time

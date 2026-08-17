@@ -92,6 +92,7 @@ async def get_rooms(
                 Room.slug,
                 Room.lodge_name,
                 Room.cover_image_url,
+                Room.video_url,
                 Room.is_featured,
                 Room.starting_price,
                 Room.starting_weekend_price,
@@ -123,6 +124,7 @@ async def get_rooms(
                 slug=r.slug,
                 lodge_name=r.lodge_name,
                 cover_image_url=r.cover_image_url,
+                video_url=r.video_url,
                 is_featured=r.is_featured,
                 starting_price=r.starting_price,
                 starting_weekend_price=r.starting_weekend_price,
@@ -201,7 +203,8 @@ async def get_room_category(
             continue
         rooms_dto.append(RoomListDTO(
             id=room.id, slug=room.slug, lodge_name=room.lodge_name,
-            cover_image_url=room.cover_image_url, is_featured=room.is_featured,
+            cover_image_url=room.cover_image_url, video_url=room.video_url,
+            is_featured=room.is_featured,
             starting_price=room.starting_price, starting_weekend_price=room.starting_weekend_price,
             address=room.address, map_url=room.map_url, facilities=room.facilities or [],
         ))
@@ -224,13 +227,7 @@ async def get_room_detail(
     Public Room Detail API.
     Returns full details for a specific room including rich content.
     """
-    user_suffix = ""
-    if current_user and (
-        current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-        current_user.phone_number == "8886154275"
-    ):
-        user_suffix = ":special_user"
-    cache_key = f"rooms:detail:{slug}{user_suffix}"
+    cache_key = f"rooms:detail:{slug}"
     set_public_cache_headers(response)
 
     async def load_room_detail() -> RoomDetailDTO:
@@ -276,18 +273,7 @@ async def get_room_detail(
         r_faqs = results[3]
         r_policies = results[4]
 
-        is_promo_user = False
-        if current_user and (
-            current_user.email == "2024eb01987@online.bits-pilani.ac.in" or 
-            current_user.phone_number == "8886154275"
-        ):
-            if r.lodge_name and "vashista" in r.lodge_name.lower() and "bhadrachalam" in r.lodge_name.lower():
-                is_promo_user = True
-
-        if is_promo_user:
-            starting_price = Decimal("1.00")
-        else:
-            starting_price = min((v.weekday_price for v in r_variants), default=None)
+        starting_price = min((v.weekday_price for v in r_variants), default=None)
         
         active_brochure_url = r.brochure_pdf_url or r.generated_brochure_url
         
@@ -296,6 +282,7 @@ async def get_room_detail(
             slug=r.slug,
             lodge_name=r.lodge_name,
             cover_image_url=r.cover_image_url,
+            video_url=r.video_url,
             is_featured=r.is_featured,
             starting_price=starting_price,
             address=r.address,
@@ -318,8 +305,8 @@ async def get_room_detail(
                 RoomVariantPublicDTO(
                     id=v.id,
                     variant_name=v.variant_name,
-                    weekday_price=Decimal("1.00") if is_promo_user else v.weekday_price,
-                    weekend_price=Decimal("1.00") if is_promo_user else v.weekend_price,
+                    weekday_price=v.weekday_price,
+                    weekend_price=v.weekend_price,
                     capacity_per_room=v.capacity_per_room
                 ) for v in r_variants
             ],

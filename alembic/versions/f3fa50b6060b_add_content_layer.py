@@ -211,20 +211,20 @@ def upgrade() -> None:
     op.create_index(op.f('ix_room_policies_id'), 'room_policies', ['id'], unique=False)
     op.create_index(op.f('ix_room_policies_room_id'), 'room_policies', ['room_id'], unique=False)
     op.create_index(op.f('ix_room_policies_type'), 'room_policies', ['type'], unique=False)
-    op.add_column('packages', sa.Column('meta_title', sa.String(), nullable=True))
-    op.add_column('packages', sa.Column('meta_description', sa.String(), nullable=True))
-    op.add_column('packages', sa.Column('og_image_url', sa.String(), nullable=True))
-    op.add_column('packages', sa.Column('canonical_url', sa.String(), nullable=True))
-    op.add_column('rooms', sa.Column('slug', sa.String(), nullable=True))
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS meta_title VARCHAR")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS meta_description VARCHAR")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS og_image_url VARCHAR")
+    op.execute("ALTER TABLE packages ADD COLUMN IF NOT EXISTS canonical_url VARCHAR")
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS slug VARCHAR")
     
     # Data migration for existing rooms
     op.execute("UPDATE rooms SET slug = LOWER(REPLACE(lodge_name, ' ', '-')) || '-' || id WHERE slug IS NULL")
     
     op.alter_column('rooms', 'slug', nullable=False)
-    op.add_column('rooms', sa.Column('meta_title', sa.String(), nullable=True))
-    op.add_column('rooms', sa.Column('meta_description', sa.String(), nullable=True))
-    op.add_column('rooms', sa.Column('og_image_url', sa.String(), nullable=True))
-    op.add_column('rooms', sa.Column('canonical_url', sa.String(), nullable=True))
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS meta_title VARCHAR")
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS meta_description VARCHAR")
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS og_image_url VARCHAR")
+    op.execute("ALTER TABLE rooms ADD COLUMN IF NOT EXISTS canonical_url VARCHAR")
     op.create_index(op.f('ix_rooms_slug'), 'rooms', ['slug'], unique=True)
     # ### end Alembic commands ###
 

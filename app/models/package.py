@@ -51,6 +51,7 @@ class Package(BaseModel, SEOMixin):
     duration = Column(String, nullable=True)
     place = Column(String, nullable=True)
     cover_image_url = Column(String, nullable=True)
+    video_url = Column(String, nullable=True)  # Primary highlight video URL (Cloudinary)
     brochure_pdf_url = Column(String, nullable=True)
     generated_brochure_url = Column(String, nullable=True)
     brochure_generation_status = Column(SQLEnum(DocumentGenerationStatus), default=DocumentGenerationStatus.MISSING, server_default="MISSING", nullable=False)
@@ -112,6 +113,7 @@ class PackageGalleryImage(BaseModel, SortableMixin):
     alt_text = Column(String, nullable=True)
     is_cover = Column(Boolean, default=False, server_default="false")
     category = Column(String, nullable=True)  # e.g. 'boat', 'stay', 'food', 'scenery'
+    media_type = Column(String, nullable=False, server_default="image", default="image")  # 'image' or 'video'
     package = relationship("Package", back_populates="gallery")
 
 class PackageItineraryDay(BaseModel, SortableMixin):

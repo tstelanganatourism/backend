@@ -68,3 +68,6 @@ test_*.py
 # Temp Dumps & Guides
 api_dump.json
 guide.txt
+
+# Root Python scripts
+/*.py

@@ -16,7 +16,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('bookings', sa.Column('has_food_addon', sa.Boolean(), nullable=False, server_default='false'))
+    op.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS has_food_addon BOOLEAN DEFAULT 'false' NOT NULL")
 
 
 def downgrade() -> None:

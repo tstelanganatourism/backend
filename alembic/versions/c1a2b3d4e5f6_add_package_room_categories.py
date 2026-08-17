@@ -17,66 +17,61 @@ depends_on = None
 
 def upgrade() -> None:
     # ── package_categories ────────────────────────────────────────────────────
-    op.create_table(
-        'package_categories',
-        sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('sort_order', sa.BigInteger(), server_default='0', nullable=False),
-        sa.Column('name', sa.String(), nullable=False),
-        sa.Column('slug', sa.String(), nullable=False),
-        sa.Column('description', sa.String(), nullable=True),
-        sa.Column('cover_image_url', sa.String(), nullable=True),
-        sa.Column('icon', sa.String(), nullable=True),
-        sa.Column('is_active', sa.Boolean(), server_default='true', nullable=False),
-        sa.PrimaryKeyConstraint('id'),
+    op.execute("""
+    CREATE TABLE IF NOT EXISTS package_categories (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+        deleted_at TIMESTAMP WITH TIME ZONE,
+        sort_order BIGINT DEFAULT 0 NOT NULL,
+        name VARCHAR NOT NULL,
+        slug VARCHAR NOT NULL,
+        description VARCHAR,
+        cover_image_url VARCHAR,
+        icon VARCHAR,
+        is_active BOOLEAN DEFAULT true NOT NULL
     )
-    op.create_index(op.f('ix_package_categories_id'), 'package_categories', ['id'], unique=False)
-    op.create_index(op.f('ix_package_categories_slug'), 'package_categories', ['slug'], unique=True)
-    op.create_index(op.f('ix_package_categories_is_active'), 'package_categories', ['is_active'], unique=False)
-    op.create_index(op.f('ix_package_categories_deleted_at'), 'package_categories', ['deleted_at'], unique=False)
+    """)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_package_categories_id ON package_categories (id)")
+    op.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_package_categories_slug ON package_categories (slug)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_package_categories_is_active ON package_categories (is_active)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_package_categories_deleted_at ON package_categories (deleted_at)")
 
-    # ── package_category_assignments ──────────────────────────────────────────
-    op.create_table(
-        'package_category_assignments',
-        sa.Column('category_id', sa.BigInteger(), nullable=False),
-        sa.Column('package_id', sa.BigInteger(), nullable=False),
-        sa.ForeignKeyConstraint(['category_id'], ['package_categories.id'], ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['package_id'], ['packages.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('category_id', 'package_id'),
+    op.execute("""
+    CREATE TABLE IF NOT EXISTS package_category_assignments (
+        category_id BIGINT NOT NULL REFERENCES package_categories(id) ON DELETE CASCADE,
+        package_id BIGINT NOT NULL REFERENCES packages(id) ON DELETE CASCADE,
+        PRIMARY KEY (category_id, package_id)
     )
+    """)
 
-    # ── room_categories ───────────────────────────────────────────────────────
-    op.create_table(
-        'room_categories',
-        sa.Column('id', sa.BigInteger(), autoincrement=True, nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('deleted_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('sort_order', sa.BigInteger(), server_default='0', nullable=False),
-        sa.Column('name', sa.String(), nullable=False),
-        sa.Column('slug', sa.String(), nullable=False),
-        sa.Column('description', sa.String(), nullable=True),
-        sa.Column('cover_image_url', sa.String(), nullable=True),
-        sa.Column('icon', sa.String(), nullable=True),
-        sa.Column('is_active', sa.Boolean(), server_default='true', nullable=False),
-        sa.PrimaryKeyConstraint('id'),
+    op.execute("""
+    CREATE TABLE IF NOT EXISTS room_categories (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL,
+        deleted_at TIMESTAMP WITH TIME ZONE,
+        sort_order BIGINT DEFAULT 0 NOT NULL,
+        name VARCHAR NOT NULL,
+        slug VARCHAR NOT NULL,
+        description VARCHAR,
+        cover_image_url VARCHAR,
+        icon VARCHAR,
+        is_active BOOLEAN DEFAULT true NOT NULL
     )
-    op.create_index(op.f('ix_room_categories_id'), 'room_categories', ['id'], unique=False)
-    op.create_index(op.f('ix_room_categories_slug'), 'room_categories', ['slug'], unique=True)
-    op.create_index(op.f('ix_room_categories_is_active'), 'room_categories', ['is_active'], unique=False)
-    op.create_index(op.f('ix_room_categories_deleted_at'), 'room_categories', ['deleted_at'], unique=False)
+    """)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_room_categories_id ON room_categories (id)")
+    op.execute("CREATE UNIQUE INDEX IF NOT EXISTS ix_room_categories_slug ON room_categories (slug)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_room_categories_is_active ON room_categories (is_active)")
+    op.execute("CREATE INDEX IF NOT EXISTS ix_room_categories_deleted_at ON room_categories (deleted_at)")
 
-    # ── room_category_assignments ─────────────────────────────────────────────
-    op.create_table(
-        'room_category_assignments',
-        sa.Column('category_id', sa.BigInteger(), nullable=False),
-        sa.Column('room_id', sa.BigInteger(), nullable=False),
-        sa.ForeignKeyConstraint(['category_id'], ['room_categories.id'], ondelete='CASCADE'),
-        sa.ForeignKeyConstraint(['room_id'], ['rooms.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('category_id', 'room_id'),
+    op.execute("""
+    CREATE TABLE IF NOT EXISTS room_category_assignments (
+        category_id BIGINT NOT NULL REFERENCES room_categories(id) ON DELETE CASCADE,
+        room_id BIGINT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        PRIMARY KEY (category_id, room_id)
     )
+    """)
 
 
 def downgrade() -> None:

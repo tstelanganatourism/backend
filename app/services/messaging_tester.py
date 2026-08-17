@@ -94,7 +94,7 @@ class MessagingTester:
                     customer_name="Test User",
                     customer_phone=self.phone,
                     public_id="TSR-TEST-01",
-                    lodge_name="Haritha Hotel Kolluru",
+                    lodge_name="Godavari Riverside Bamboo Huts",
                     room_name="AC Deluxe Cottage",
                     checkin_date_str="25-Aug-2026",
                     checkin_time_str="11:00 AM",
@@ -117,7 +117,7 @@ class MessagingTester:
                     customer_name="Test User",
                     customer_phone=self.phone,
                     public_id="TSR-TEST-02",
-                    lodge_name="Haritha Hotel Kolluru",
+                    lodge_name="Godavari Riverside Bamboo Huts",
                     room_name="AC Deluxe Cottage",
                     checkin_date_str="25-Aug-2026",
                     checkin_time_str="11:00 AM",
@@ -159,7 +159,7 @@ class MessagingTester:
                     customer_name="Test User",
                     customer_phone=self.phone,
                     public_id="TSR-TEST-01",
-                    lodge_name="Haritha Hotel Kolluru",
+                    lodge_name="Godavari Riverside Bamboo Huts",
                     checkin_detail="Check-in at Reception after 11:00 AM",
                 )
                 self.record_result("SMS", "TSBOAT_ROOM_REMINDER", "PASS" if ok else "FAIL", "Room reminder SMS sent" if ok else "MSG91 API failure")

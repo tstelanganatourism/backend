@@ -51,14 +51,14 @@ def upgrade() -> None:
     op.create_index(op.f('ix_booking_drafts_id'), 'booking_drafts', ['id'], unique=False)
     op.create_index(op.f('ix_booking_drafts_razorpay_order_id'), 'booking_drafts', ['razorpay_order_id'], unique=True)
     op.create_index(op.f('ix_booking_drafts_user_id'), 'booking_drafts', ['user_id'], unique=False)
-    op.add_column('package_variant_inventory', sa.Column('reserved_count', sa.Integer(), server_default='0', nullable=False))
+    op.execute("ALTER TABLE package_variant_inventory ADD COLUMN IF NOT EXISTS reserved_count INTEGER DEFAULT 0 NOT NULL")
     op.drop_index(op.f('ix_packages_fts'), table_name='packages', postgresql_using='gin')
     op.create_index('ix_packages_fts', 'packages', [sa.literal_column("to_tsvector('english'::regconfig, title || ' ' || coalesce(description, ''))")], unique=False, postgresql_using='gin')
-    op.add_column('room_slot_inventory', sa.Column('reserved_rooms', sa.Integer(), server_default='0', nullable=False))
+    op.execute("ALTER TABLE room_slot_inventory ADD COLUMN IF NOT EXISTS reserved_rooms INTEGER DEFAULT 0 NOT NULL")
     op.drop_constraint(op.f('uq_room_slot_inventory'), 'room_slot_inventory', type_='unique')
     op.drop_index(op.f('ix_rooms_active_priority'), table_name='rooms', postgresql_where='(deleted_at IS NULL)')
     op.drop_index(op.f('ix_rooms_fts'), table_name='rooms', postgresql_using='gin')
-    op.add_column('users', sa.Column('white_label_enabled', sa.Boolean(), server_default='false', nullable=False))
+    op.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS white_label_enabled BOOLEAN DEFAULT 'false' NOT NULL")
     # ### end Alembic commands ###
 
 

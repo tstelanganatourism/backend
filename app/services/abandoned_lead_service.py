@@ -16,16 +16,19 @@ async def send_admin_abandoned_lead_notification(
     if db is None:
         from app.db.session import AsyncSessionLocal
         async with AsyncSessionLocal() as local_db:
-            from sqlalchemy import select
-            log_res = await local_db.execute(
-                select(CheckoutFunnelLog).where(CheckoutFunnelLog.id == log.id)
-            )
-            local_log = log_res.scalar_one_or_none()
-            if not local_log:
-                return False
-            res = await _send_admin_abandoned_lead_notification_core(local_log, local_db)
-            await local_db.commit()
-            return res
+            if log.id:
+                from sqlalchemy import select
+                log_res = await local_db.execute(
+                    select(CheckoutFunnelLog).where(CheckoutFunnelLog.id == log.id)
+                )
+                local_log = log_res.scalar_one_or_none()
+                if not local_log:
+                    return False
+                res = await _send_admin_abandoned_lead_notification_core(local_log, local_db)
+                await local_db.commit()
+                return res
+            else:
+                return await _send_admin_abandoned_lead_notification_core(log, local_db)
     else:
         return await _send_admin_abandoned_lead_notification_core(log, db)
 
