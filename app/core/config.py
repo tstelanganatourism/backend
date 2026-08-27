@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -10,14 +10,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     PROJECT_NAME: str = "TS Boat Tourism Booking API"
-    CORS_ORIGINS: list[str] = [
+    CORS_ORIGINS: Union[list[str], str] = [
         "https://tstelanganatourism.com",
         "https://www.tstelanganatourism.com",
         "https://frontend-six-art-92.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
-    ALLOWED_HOSTS: list[str] = ["*"]
+    ALLOWED_HOSTS: Union[list[str], str] = ["*"]
     
     # Security
     SECRET_KEY: str
@@ -111,7 +111,14 @@ class Settings(BaseSettings):
     @classmethod
     def parse_csv_list(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
+            import json
+            value_s = value.strip()
+            if value_s.startswith("[") and value_s.endswith("]"):
+                try:
+                    return json.loads(value_s)
+                except Exception:
+                    pass
+            return [item.strip() for item in value_s.split(",") if item.strip()]
         return value
 
     @model_validator(mode="after")
