@@ -2420,7 +2420,12 @@ async def download_public_booking_pdf(
     elif secret != expected and not booking_id.startswith("DEMO-"):
         raise HTTPException(status_code=403, detail="Invalid authorization secret for document PDF download")
 
-    url = f"http://127.0.0.1:3000/print/{doc_type}/{booking_id}?secret={secret}"
+    # In production use FRONTEND_URL; locally use 127.0.0.1:3000
+    if settings.ENVIRONMENT == "production":
+        frontend_base = settings.FRONTEND_URL.rstrip("/")
+    else:
+        frontend_base = "http://127.0.0.1:3000"
+    url = f"{frontend_base}/print/{doc_type}/{booking_id}?secret={secret}"
     from app.services.pdf_generator import sync_generate_pdf
     try:
         pdf_bytes = await asyncio.to_thread(sync_generate_pdf, url)
