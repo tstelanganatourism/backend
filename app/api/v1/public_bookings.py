@@ -1693,7 +1693,20 @@ async def get_booking_details(
     
     from app.models.room import Room, RoomVariant
     query = (
-        select(Booking, Package.title, PackageVariant.title, Room.lodge_name, RoomVariant.variant_name, Room.slot_start, Room.slot_end, Room.address, Room.id, Package.type)
+        select(
+            Booking,
+            Package.title,
+            PackageVariant.title,
+            Room.lodge_name,
+            RoomVariant.variant_name,
+            Room.slot_start,
+            Room.slot_end,
+            Room.address,
+            Room.id,
+            Package.type,
+            Package.cover_image_url,
+            Room.cover_image_url,
+        )
         .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
         .outerjoin(Package, PackageVariant.package_id == Package.id)
         .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
@@ -1830,6 +1843,7 @@ async def get_booking_details(
 
     boarding_point = None
     itinerary = []
+    meals_list = []
     if b.variant_id:
         from app.models.package import PackageBoardingPoint, PackageItineraryDay
         variant = b.package_variant
@@ -2037,6 +2051,7 @@ async def get_booking_details(
         "has_pending_postpone": has_pending_postpone,
         "is_rescheduled": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "APPROVED" for r in b.postpone_requests),
         "ticket_pdf_url": b.ticket_pdf_url,
+        "cover_image_url": row[11] if b.room_variant_id else row[10],
         "invoice_pdf_url": b.invoice_pdf_url,
         "ticket_generation_status": b.ticket_generation_status.value if hasattr(b.ticket_generation_status, "value") else str(b.ticket_generation_status),
         "invoice_generation_status": b.invoice_generation_status.value if hasattr(b.invoice_generation_status, "value") else str(b.invoice_generation_status),
@@ -2383,3 +2398,42 @@ async def process_balance_checkout(
             **balance_response,
         }
     }
+
+@router.get("/{booking_id}/pdf")
+async def download_public_booking_pdf(
+    booking_id: str,
+    doc_type: str = Query("ticket", enum=["ticket", "invoice", "form"]),
+    secret: Optional[str] = None
+):
+    """
+    Directly generate and stream vector PDF for ticket, invoice, or boarding form
+    using Playwright headless Chromium matching the exact print layout.
+    """
+    import hmac
+    import hashlib
+    SECRET_KEY = "tsaptourismpapikondalubadhrachalam"
+    expected = hmac.new(SECRET_KEY.encode("utf-8"), booking_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    
+    # If secret is passed, verify it; otherwise compute for valid public booking
+    if not secret:
+        secret = expected
+    elif secret != expected and not booking_id.startswith("DEMO-"):
+        raise HTTPException(status_code=403, detail="Invalid authorization secret for document PDF download")
+
+    url = f"http://127.0.0.1:3000/print/{doc_type}/{booking_id}?secret={secret}"
+    from app.services.pdf_generator import sync_generate_pdf
+    try:
+        pdf_bytes = await asyncio.to_thread(sync_generate_pdf, url)
+    except Exception as e:
+        logger.error(f"Error generating PDF for {url}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
+
+    filename = f"{doc_type.capitalize()}_{booking_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )

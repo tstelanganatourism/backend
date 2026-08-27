@@ -77,7 +77,8 @@ async def generate_pdf_from_url(url: str) -> bytes:
                 status = response.status if response else "no response"
                 raise Exception(f"Failed to load PDF page {url}: HTTP {status}")
 
-            await page.wait_for_selector(".brochure-container", timeout=15000)
+            await page.wait_for_selector("body", timeout=15000)
+            await page.wait_for_timeout(600)
             await page.emulate_media(media="print")
 
             try:
