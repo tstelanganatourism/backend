@@ -138,6 +138,7 @@ app.include_router(
 )
 from app.api.v1 import public_coupons
 from app.api.v1 import public_bookings
+from app.api.v1 import pre_bookings as public_pre_bookings
 app.include_router(
     public_coupons.router,
     prefix="/api/v1"
@@ -145,6 +146,10 @@ app.include_router(
 app.include_router(
     public_bookings.router,
     prefix="/api/v1/bookings"
+)
+app.include_router(
+    public_pre_bookings.router,
+    prefix="/api/v1/pre-bookings",
 )
 from app.api.v1 import payments
 app.include_router(
