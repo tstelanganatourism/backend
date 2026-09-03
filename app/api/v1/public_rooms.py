@@ -156,7 +156,12 @@ async def list_room_categories(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns all active room categories for /stays landing page."""
-    set_no_store_headers(response)
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached = get_mem_cached("room_cats", "all")
+    if cached is not None:
+        set_public_cache_headers(response)
+        return cached
+
     result = await db.execute(
         select(RoomCategory)
         .where(RoomCategory.is_active == True, RoomCategory.deleted_at.is_(None))
@@ -175,6 +180,8 @@ async def list_room_categories(
             cover_image_url=cat.cover_image_url, icon=cat.icon,
             sort_order=cat.sort_order, room_count=room_count,
         ))
+    set_mem_cached("room_cats", "all", out, ttl_seconds=120)
+    set_public_cache_headers(response)
     return out
 
 @router.get("/categories/{cat_slug}", response_model=RoomCategoryDetailPublicDTO, tags=["Public Discovery - Room Categories"])
@@ -184,7 +191,11 @@ async def get_room_category(
     db: AsyncSession = Depends(get_db),
 ):
     """Returns a single room category with its rooms for /stays/categories/{slug}."""
-    set_no_store_headers(response)
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached = get_mem_cached("room_cat_detail", cat_slug.lower())
+    if cached is not None:
+        set_public_cache_headers(response)
+        return cached
     result = await db.execute(
         select(RoomCategory)
         .where(
@@ -209,11 +220,14 @@ async def get_room_category(
             address=room.address, map_url=room.map_url, facilities=room.facilities or [],
         ))
     rooms_dto.sort(key=lambda r: (not r.is_featured, r.starting_price or 0))
-    return RoomCategoryDetailPublicDTO(
+    result_dto = RoomCategoryDetailPublicDTO(
         id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
         cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
         room_count=len(rooms_dto), rooms=rooms_dto,
     )
+    set_mem_cached("room_cat_detail", cat_slug.lower(), result_dto, ttl_seconds=120)
+    set_public_cache_headers(response)
+    return result_dto
 
 
 @router.get("/{slug}", response_model=RoomDetailDTO)

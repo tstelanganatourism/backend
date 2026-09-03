@@ -12,6 +12,7 @@ from sqlalchemy import select, func, or_, desc
 from app.db.session import get_db
 from app.middleware.auth import require_admin
 from app.models.pre_booking import PreBooking
+from app.models.user import User
 
 router = APIRouter(
     prefix="/pre-bookings",
@@ -85,7 +86,7 @@ def _serialize(pb: PreBooking) -> dict:
 @router.get("")
 async def list_pre_bookings(
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_admin),
+    current_admin: User = Depends(require_admin),
     search: Optional[str] = Query(None),
     is_confirmed: Optional[bool] = Query(None),
     is_contacted: Optional[bool] = Query(None),
@@ -97,20 +98,21 @@ async def list_pre_bookings(
     """List all pre-booking leads with filters and pagination."""
     q = select(PreBooking).where(PreBooking.deleted_at.is_(None))
 
-    if search:
-        like = f"%{search}%"
+    if search and search.strip():
+        like = f"%{search.strip()}%"
         q = q.where(or_(
             PreBooking.customer_name.ilike(like),
             PreBooking.customer_email.ilike(like),
             PreBooking.customer_phone.ilike(like),
             PreBooking.ref_id.ilike(like),
+            PreBooking.package_name.ilike(like),
         ))
     if is_confirmed is not None:
         q = q.where(PreBooking.is_confirmed == is_confirmed)
     if is_contacted is not None:
         q = q.where(PreBooking.is_contacted == is_contacted)
-    if package_id:
-        q = q.where(PreBooking.package_id == package_id)
+    if package_id and package_id.strip():
+        q = q.where(PreBooking.package_id == package_id.strip())
     if travel_date:
         q = q.where(PreBooking.travel_date == travel_date)
 
@@ -133,7 +135,7 @@ async def list_pre_bookings(
 @router.get("/stats")
 async def get_pre_booking_stats(
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_admin),
+    current_admin: User = Depends(require_admin),
 ):
     """Quick stats for the admin dashboard widget."""
     base = select(func.count(PreBooking.id)).where(PreBooking.deleted_at.is_(None))
@@ -141,14 +143,17 @@ async def get_pre_booking_stats(
     total = total_res.scalar() or 0
 
     pending_res = await db.execute(
-        base.where(PreBooking.is_confirmed == False)  # noqa: E712
+        select(func.count(PreBooking.id)).where(
+            PreBooking.deleted_at.is_(None),
+            PreBooking.is_confirmed == False,  # noqa: E712
+        )
     )
     pending = pending_res.scalar() or 0
 
     not_contacted_res = await db.execute(
         select(func.count(PreBooking.id)).where(
             PreBooking.deleted_at.is_(None),
-            PreBooking.is_contacted == False  # noqa: E712
+            PreBooking.is_contacted == False,  # noqa: E712
         )
     )
     not_contacted = not_contacted_res.scalar() or 0
@@ -156,7 +161,7 @@ async def get_pre_booking_stats(
     confirmed_res = await db.execute(
         select(func.count(PreBooking.id)).where(
             PreBooking.deleted_at.is_(None),
-            PreBooking.is_confirmed == True  # noqa: E712
+            PreBooking.is_confirmed == True,  # noqa: E712
         )
     )
     confirmed = confirmed_res.scalar() or 0
@@ -173,7 +178,7 @@ async def get_pre_booking_stats(
 async def get_pre_booking(
     pb_id: int,
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_admin),
+    current_admin: User = Depends(require_admin),
 ):
     """Get a single pre-booking by ID."""
     result = await db.execute(
@@ -196,7 +201,7 @@ async def update_pre_booking(
     pb_id: int,
     body: UpdatePreBooking,
     db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_admin),
+    current_admin: User = Depends(require_admin),
 ):
     """Update confirmation/contact status and admin notes."""
     result = await db.execute(
@@ -216,3 +221,23 @@ async def update_pre_booking(
     await db.commit()
     await db.refresh(pb)
     return _serialize(pb)
+
+
+@router.delete("/{pb_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_pre_booking(
+    pb_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """Soft delete a pre-booking lead."""
+    from app.core.timezone import get_ist_now
+    result = await db.execute(
+        select(PreBooking).where(PreBooking.id == pb_id, PreBooking.deleted_at.is_(None))
+    )
+    pb = result.scalar_one_or_none()
+    if not pb:
+        raise HTTPException(status_code=404, detail="Pre-booking not found.")
+
+    pb.deleted_at = get_ist_now()
+    await db.commit()
+    return None

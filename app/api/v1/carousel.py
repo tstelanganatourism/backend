@@ -57,130 +57,140 @@ async def get_carousel_slides(
     Items are ordered by order_priority (highest first), then by id descending.
     The carousel will show all slides added by the administrator.
     """
-    cache_key = "carousel:homepage:slides"
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
     set_public_cache_headers(response)
 
-    async def load_carousel() -> List[CarouselSlide]:
-        slides: List[CarouselSlide] = []
+    cached = get_mem_cached("carousel", "slides")
+    if cached is not None:
+        return cached
 
-        # Fetch featured packages (PUBLISHED + is_featured=True)
-        pkg_result = await db.execute(
+    slides: List[CarouselSlide] = []
+
+    import html
+    import re
+
+    # Fetch featured packages (PUBLISHED + is_featured=True)
+    pkg_result = await db.execute(
+        select(
+            Package.id,
+            Package.slug,
+            Package.title,
+            Package.description,
+            Package.cover_image_url,
+            Package.starting_price,
+            Package.region,
+            Package.duration,
+            Package.place,
+            Package.type,
+            Package.is_student_package,
+            Package.refreshment_student_price,
+            Package.has_refreshments,
+        )
+        .where(
+            Package.status == PublishStatus.PUBLISHED,
+            Package.is_featured == True,
+            Package.deleted_at.is_(None),
+        )
+        .order_by(Package.order_priority.desc(), Package.id.desc())
+    )
+    packages = pkg_result.all()
+
+    # Batch fetch all variants in ONE query instead of N+1
+    pkg_ids = [p.id for p in packages]
+    var_map: dict[int, list] = {}
+    if pkg_ids:
+        from app.models.package import PackageVariant
+        var_result = await db.execute(
             select(
-                Package.id,
-                Package.slug,
-                Package.title,
-                Package.description,
-                Package.cover_image_url,
-                Package.starting_price,
-                Package.region,
-                Package.duration,
-                Package.place,
-                Package.type,
-                Package.is_student_package,
-                Package.refreshment_student_price,
-                Package.has_refreshments,
+                PackageVariant.package_id,
+                PackageVariant.child_price,
+                PackageVariant.student_price,
+                PackageVariant.weekend_student_price
             )
             .where(
-                Package.status == PublishStatus.PUBLISHED,
-                Package.is_featured == True,
-                Package.deleted_at.is_(None),
+                PackageVariant.package_id.in_(pkg_ids),
+                PackageVariant.is_active == True,
+                PackageVariant.deleted_at.is_(None),
             )
-            .order_by(Package.order_priority.desc(), Package.id.desc())
         )
-        packages = pkg_result.all()
+        for v_pkg_id, c_price, s_price, wk_s_price in var_result.all():
+            var_map.setdefault(v_pkg_id, []).append((c_price, s_price, wk_s_price))
 
-        for pkg in packages:
-            # Strip HTML from description and truncate
-            desc = pkg.description or ""
-            import html
-            import re
-            desc = html.unescape(desc)
-            desc = re.sub(r'<[^>]+>', '', desc).strip()
-            desc = desc[:180] + "..." if len(desc) > 180 else desc
+    for pkg in packages:
+        desc = pkg.description or ""
+        desc = html.unescape(desc)
+        desc = re.sub(r'<[^>]+>', '', desc).strip()
+        desc = desc[:180] + "..." if len(desc) > 180 else desc
+        title = html.unescape(pkg.title or "")
 
-            title = html.unescape(pkg.title or "")
+        v_list = var_map.get(pkg.id, [])
+        child_prices = [row[0] for row in v_list if row[0] is not None]
+        min_child = min(child_prices) if child_prices else None
 
-            # Fetch variants to find the minimum child/student price
-            from app.models.package import PackageVariant
-            var_result = await db.execute(
-                select(PackageVariant.child_price, PackageVariant.student_price, PackageVariant.weekend_student_price)
-                .where(
-                    PackageVariant.package_id == pkg.id,
-                    PackageVariant.is_active == True,
-                    PackageVariant.deleted_at.is_(None),
-                )
-            )
-            variant_prices = var_result.all()
-            child_prices = [row[0] for row in variant_prices if row[0] is not None]
-            min_child = min(child_prices) if child_prices else None
+        student_prices = [row[1] for row in v_list if row[1] is not None]
+        min_student = min(student_prices) if student_prices else None
 
-            student_prices = [row[1] for row in variant_prices if row[1] is not None]
-            min_student = min(student_prices) if student_prices else None
+        wk_student_prices = [row[2] for row in v_list if row[2] is not None]
+        min_wk_student = min(wk_student_prices) if wk_student_prices else None
 
-            wk_student_prices = [row[2] for row in variant_prices if row[2] is not None]
-            min_wk_student = min(wk_student_prices) if wk_student_prices else None
+        slides.append(CarouselSlide(
+            type="package",
+            slug=pkg.slug,
+            title=title,
+            description=desc or None,
+            cover_image_url=pkg.cover_image_url,
+            starting_price=pkg.starting_price,
+            region=str(pkg.region.value) if pkg.region else None,
+            duration=pkg.duration,
+            place=pkg.place,
+            package_type=pkg.type.value if pkg.type else None,
+            child_price=min_child,
+            is_student_package=pkg.is_student_package,
+            student_price=min_student,
+            weekend_student_price=min_wk_student,
+            refreshment_student_price=pkg.refreshment_student_price,
+            has_refreshments=pkg.has_refreshments,
+        ))
 
-            slides.append(CarouselSlide(
-                type="package",
-                slug=pkg.slug,
-                title=title,
-                description=desc or None,
-                cover_image_url=pkg.cover_image_url,
-                starting_price=pkg.starting_price,
-                region=str(pkg.region.value) if pkg.region else None,
-                duration=pkg.duration,
-                place=pkg.place,
-                package_type=pkg.type.value if pkg.type else None,
-                child_price=min_child,
-                is_student_package=pkg.is_student_package,
-                student_price=min_student,
-                weekend_student_price=min_wk_student,
-                refreshment_student_price=pkg.refreshment_student_price,
-                has_refreshments=pkg.has_refreshments,
-            ))
-
-        # Fetch featured rooms (PUBLISHED + is_featured=True)
-        room_result = await db.execute(
-            select(
-                Room.slug,
-                Room.lodge_name,
-                Room.description,
-                Room.cover_image_url,
-                Room.starting_price,
-                Room.starting_weekend_price,
-                Room.address,
-            )
-            .where(
-                Room.status == PublishStatus.PUBLISHED,
-                Room.is_featured == True,
-                Room.is_active == True,
-                Room.deleted_at.is_(None),
-            )
-            .order_by(Room.order_priority.desc(), Room.id.desc())
+    # Fetch featured rooms (PUBLISHED + is_featured=True)
+    room_result = await db.execute(
+        select(
+            Room.slug,
+            Room.lodge_name,
+            Room.description,
+            Room.cover_image_url,
+            Room.starting_price,
+            Room.starting_weekend_price,
+            Room.address,
         )
-        rooms = room_result.all()
+        .where(
+            Room.status == PublishStatus.PUBLISHED,
+            Room.is_featured == True,
+            Room.is_active == True,
+            Room.deleted_at.is_(None),
+        )
+        .order_by(Room.order_priority.desc(), Room.id.desc())
+    )
+    rooms = room_result.all()
 
-        for room in rooms:
-            desc = room.description or ""
-            import html
-            import re
-            desc = html.unescape(desc)
-            desc = re.sub(r'<[^>]+>', '', desc).strip()
-            desc = desc[:180] + "..." if len(desc) > 180 else desc
+    for room in rooms:
+        desc = room.description or ""
+        desc = html.unescape(desc)
+        desc = re.sub(r'<[^>]+>', '', desc).strip()
+        desc = desc[:180] + "..." if len(desc) > 180 else desc
+        title = html.unescape(room.lodge_name or "")
 
-            title = html.unescape(room.lodge_name or "")
+        slides.append(CarouselSlide(
+            type="room",
+            slug=room.slug,
+            title=title,
+            description=desc or None,
+            cover_image_url=room.cover_image_url,
+            starting_price=room.starting_price,
+            starting_weekend_price=room.starting_weekend_price,
+            address=room.address,
+        ))
 
-            slides.append(CarouselSlide(
-                type="room",
-                slug=room.slug,
-                title=title,
-                description=desc or None,
-                cover_image_url=room.cover_image_url,
-                starting_price=room.starting_price,
-                starting_weekend_price=room.starting_weekend_price,
-                address=room.address,
-            ))
+    set_mem_cached("carousel", "slides", slides, ttl_seconds=CAROUSEL_CACHE_TTL)
+    return slides
 
-        return slides
-
-    return await ttl_cache_get_or_set(cache_key, CAROUSEL_CACHE_TTL, load_carousel)

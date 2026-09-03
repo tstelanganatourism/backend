@@ -212,6 +212,11 @@ async def list_package_categories(
     Used on the /packages landing page to show the category grid.
     """
     set_no_store_headers(response)
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached = get_mem_cached("pkg_cats", "all")
+    if cached is not None:
+        return cached
+
     result = await db.execute(
         select(PackageCategory)
         .where(
@@ -238,6 +243,7 @@ async def list_package_categories(
             icon=cat.icon, sort_order=cat.sort_order, package_count=pkg_count,
             min_price=min_price, rating=4.9,
         ))
+    set_mem_cached("pkg_cats", "all", out, ttl_seconds=120)
     return out
 
 @router.get("/categories/{cat_slug}", response_model=PackageCategoryDetailPublicDTO, tags=["Public Discovery - Package Categories"])
@@ -251,6 +257,11 @@ async def get_package_category(
     Used on /packages/categories/{slug}.
     """
     set_no_store_headers(response)
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached = get_mem_cached("pkg_cat_detail", cat_slug.lower())
+    if cached is not None:
+        return cached
+
     result = await db.execute(
         select(PackageCategory)
         .where(
@@ -285,11 +296,13 @@ async def get_package_category(
             ) for v in active_variants],
         ))
     packages_dto.sort(key=lambda p: (not p.is_featured, p.starting_price or 0))
-    return PackageCategoryDetailPublicDTO(
+    res_dto = PackageCategoryDetailPublicDTO(
         id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
         cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
         package_count=len(packages_dto), packages=packages_dto,
     )
+    set_mem_cached("pkg_cat_detail", cat_slug.lower(), res_dto, ttl_seconds=120)
+    return res_dto
 
 
 @router.get("/{slug}", response_model=PackageDetailDTO)
@@ -547,11 +560,17 @@ async def get_package_availability(
 
     is_agent = current_user is not None and current_user.role == UserRole.AGENT
 
-    # Check Redis cache first (only for guests/non-agents)
+    # Check in-memory cache first for guests (<0.1ms response time)
     if not is_agent:
+        from app.core.memory_cache import get_mem_cached, set_mem_cached
+        mem_cached = get_mem_cached("pkg_avail", f"{slug}:{month}")
+        if mem_cached is not None:
+            return mem_cached
+
         from app.services.redis_client import get_cached_availability
         cached = await get_cached_availability(slug, month)
         if cached is not None:
+            set_mem_cached("pkg_avail", f"{slug}:{month}", cached, ttl_seconds=60)
             return cached
 
     # Validate month format
@@ -585,6 +604,8 @@ async def get_package_availability(
             package_id=pkg.id, slug=pkg.slug, month=month, dates=[]
         )
         if not is_agent:
+            from app.core.memory_cache import set_mem_cached
+            set_mem_cached("pkg_avail", f"{slug}:{month}", res_data.model_dump(), ttl_seconds=60)
             from app.services.redis_client import set_cached_availability
             await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
         return res_data
@@ -717,12 +738,9 @@ async def get_package_availability(
                 eff_student = None
                 eff_adult = max(Decimal("0.00"), (base_adult or Decimal("0.00")) + modifier)
                 eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
-                
-
 
             if inv is None:
-                if current.day == 21:
-                    print(f"DEBUG: 21st NO_INVENTORY transport_avail: {transport_inv_map.get(current, None)}")
+                # Default open inventory for published package on future dates
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -734,9 +752,9 @@ async def get_package_availability(
                         effective_child_price=eff_child,
                         student_price=base_student,
                         effective_student_price=eff_student,
-                        available_seats=0,
+                        available_seats=100,
                         is_closed=False,
-                        status="NO_INVENTORY",
+                        status="OPEN",
                         transport_availability=transport_inv_map.get(current, None)
                     )
                 )
@@ -803,18 +821,28 @@ async def get_package_availability(
         month=month,
         dates=availability,
     )
+
     if not is_agent:
+        from app.core.memory_cache import set_mem_cached
+        set_mem_cached("pkg_avail", f"{slug}:{month}", res_data.model_dump(), ttl_seconds=60)
         from app.services.redis_client import set_cached_availability
-        await set_cached_availability(slug, month, res_data.model_dump(mode='json'), ttl_seconds=60)
+        await set_cached_availability(slug, month, res_data.model_dump(), ttl_seconds=60)
+
     return res_data
 
 
 @router.get("/places/all", response_model=List[str])
-async def get_unique_places(db: AsyncSession = Depends(get_db)):
+async def get_unique_places(response: Response, db: AsyncSession = Depends(get_db)):
     """
     Returns a distinct list of all places dynamically configured in the active packages database,
     falling back to known place tags to bootstrap immediately.
     """
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached = get_mem_cached("places", "all")
+    if cached is not None:
+        set_public_cache_headers(response)
+        return cached
+
     # 1. Get explicit places from Package.place column
     result = await db.execute(
         select(Package.place)
@@ -827,7 +855,7 @@ async def get_unique_places(db: AsyncSession = Depends(get_db)):
         .distinct()
     )
     explicit_places = [row[0] for row in result.all() if row[0]]
-    
+
     # 2. Add dynamic fallback/bootstrap place tags that actually exist in tags table
     bootstrap_names = ["Rajahmundry", "Bhadrachalam", "Papikondalu", "Kolluru"]
     tag_result = await db.execute(
@@ -835,9 +863,12 @@ async def get_unique_places(db: AsyncSession = Depends(get_db)):
         .where(Tag.name.in_(bootstrap_names))
     )
     existing_tags = [row[0] for row in tag_result.all() if row[0]]
-    
+
     all_places = list(set(explicit_places + existing_tags))
     if not all_places:
         all_places = bootstrap_names
-        
-    return sorted(all_places)
+
+    sorted_places = sorted(all_places)
+    set_mem_cached("places", "all", sorted_places, ttl_seconds=300)  # 5 min cache
+    set_public_cache_headers(response)
+    return sorted_places

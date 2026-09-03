@@ -6,7 +6,7 @@ import uuid
 import httpx
 from datetime import date, datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks, Query
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -569,7 +569,7 @@ DAILY_SEAT_CAPACITY = 100
 
 @router.get("/availability")
 async def get_prebooking_availability(
-    package_id: str,
+    package_id: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -587,12 +587,15 @@ async def get_prebooking_availability(
             func.coalesce(func.sum(PreBooking.adult_count + PreBooking.child_count), 0).label("booked_seats"),
         )
         .where(
-            PreBooking.package_id == package_id,
             PreBooking.travel_date >= min_date,
             PreBooking.travel_date <= max_date,
+            PreBooking.deleted_at.is_(None),
         )
-        .group_by(PreBooking.travel_date)
     )
+    if package_id and package_id.strip():
+        stmt = stmt.where(PreBooking.package_id == package_id.strip())
+
+    stmt = stmt.group_by(PreBooking.travel_date)
     result = await db.execute(stmt)
     booked_map = {row.travel_date.isoformat(): int(row.booked_seats or 0) for row in result.all()}
 
