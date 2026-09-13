@@ -200,43 +200,7 @@ async def checkout(
             
         package_variant_id = request.variant_id
         
-        # 1. Fetch inventory row with SELECT FOR UPDATE
-        inventory_query = (
-            select(PackageVariantInventory)
-            .where(
-                PackageVariantInventory.variant_id == request.variant_id,
-                PackageVariantInventory.date == request.travel_date,
-                PackageVariantInventory.deleted_at.is_(None)
-            )
-            .with_for_update()
-        )
-        
-        result = await db.execute(inventory_query)
-        inventory = result.scalar_one_or_none()
-        
-        if not inventory:
-            if is_admin:
-                inventory = PackageVariantInventory(
-                    variant_id=request.variant_id,
-                    date=request.travel_date,
-                    total_capacity=request.quantity,
-                    booked_count=0,
-                    reserved_count=0,
-                    is_closed=False,
-                )
-                db.add(inventory)
-                await db.flush()
-            else:
-                raise HTTPException(status_code=404, detail="Inventory not found for this date")
-            
-        if inventory.is_closed and not is_admin:
-            raise HTTPException(status_code=400, detail="Booking closed for this date")
-            
-        available = inventory.total_capacity - (inventory.booked_count + inventory.reserved_count)
-        if available < request.quantity and not is_admin:
-            raise HTTPException(status_code=400, detail=f"Insufficient inventory. Requested: {request.quantity}, Available: {available}")
-            
-        # 2. Get base variant details and verify parent package is active/not deleted
+        # 1. Get base variant details and verify parent package is active/not deleted
         variant_query = (
             select(PackageVariant)
             .options(selectinload(PackageVariant.package))
@@ -257,6 +221,46 @@ async def checkout(
             
         parent_package = variant.package
         target_id = parent_package.id
+
+        # 2. Fetch inventory row with SELECT FOR UPDATE
+        inventory_query = (
+            select(PackageVariantInventory)
+            .where(
+                PackageVariantInventory.variant_id == request.variant_id,
+                PackageVariantInventory.date == request.travel_date,
+                PackageVariantInventory.deleted_at.is_(None)
+            )
+            .with_for_update()
+        )
+        
+        result = await db.execute(inventory_query)
+        inventory = result.scalar_one_or_none()
+        
+        if not inventory:
+            if is_admin:
+                default_capacity = max(100, request.quantity)
+                inventory = PackageVariantInventory(
+                    variant_id=request.variant_id,
+                    date=request.travel_date,
+                    total_capacity=default_capacity,
+                    booked_count=0,
+                    reserved_count=0,
+                    is_closed=False,
+                )
+                db.add(inventory)
+                await db.flush()
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Schedule has not been opened yet for {request.travel_date}. Please select an available date from the calendar."
+                )
+            
+        if inventory.is_closed and not is_admin:
+            raise HTTPException(status_code=400, detail="Booking closed for this date")
+            
+        available = inventory.total_capacity - (inventory.booked_count + inventory.reserved_count)
+        if available < request.quantity and not is_admin:
+            raise HTTPException(status_code=400, detail=f"Insufficient seats available on {request.travel_date}. Requested: {request.quantity}, Available: {available}")
         
         # ── Agent Quota Enforcement ──────────────────────────────────────────
         is_agent = current_user is not None and current_user.role == UserRole.AGENT
@@ -697,10 +701,27 @@ async def checkout(
             inv = inv_result.scalar_one_or_none()
 
             if not inv:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Rooms unavailable on {stay_date.isoformat()}"
-                )
+                if is_admin:
+                    default_rooms = max(required_rooms, room_obj.total_rooms or 10)
+                    inv = RoomSlotInventory(
+                        room_variant_id=room_variant_id,
+                        date=stay_date,
+                        slot_start=request.slot_start,
+                        slot_end=request.slot_end,
+                        total_rooms=default_rooms,
+                        booked_rooms=0,
+                        reserved_rooms=0,
+                        weekday_price=variant.weekday_price,
+                        weekend_price=variant.weekend_price,
+                        is_closed=False,
+                    )
+                    db.add(inv)
+                    await db.flush()
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Rooms have not been opened yet for {stay_date.isoformat()}. Please select an available date from the calendar."
+                    )
 
             if inv.is_closed and not is_admin:
                 raise HTTPException(

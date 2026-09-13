@@ -423,9 +423,9 @@ async def get_room_availability(
             inv_rows_for_day = inv_map.get((variant.id, current), [])
             
             if not inv_rows_for_day:
-                # No inventory row at all → NO_INVENTORY
-                slot_start = str(room.slot_start) if room.slot_start else "12:00"
-                slot_end = str(room.slot_end) if room.slot_end else "11:00"
+                # No inventory opened by admin yet for this date -> NO_INVENTORY
+                slot_start = str(room.slot_start) if room.slot_start else "10:00"
+                slot_end = str(room.slot_end) if room.slot_end else "09:00"
                 availability.append(RoomDateAvailability(
                     date=current,
                     variant_id=variant.id,
@@ -434,7 +434,7 @@ async def get_room_availability(
                     slot_end=slot_end,
                     total_rooms=0,
                     available_rooms=0,
-                    is_closed=False,
+                    is_closed=True,
                     status="NO_INVENTORY",
                 ))
             else:

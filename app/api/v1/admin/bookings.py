@@ -184,11 +184,26 @@ async def list_admin_bookings(
             .where(PackageVariant.id.in_(variant_ids))
         )
         for pv, pkg_title, dep_time, pkg_type in pv_res.all():
+            # dep_time may be a datetime.time object or a plain string (e.g. "06:00:00")
+            if dep_time:
+                if hasattr(dep_time, 'strftime'):
+                    dep_time_str = dep_time.strftime('%I:%M %p')
+                else:
+                    # Parse string like "06:00:00" or "6:00 AM"
+                    from datetime import time as dt_time
+                    try:
+                        parts = str(dep_time).split(':')
+                        h, m = int(parts[0]), int(parts[1])
+                        dep_time_str = dt_time(h, m).strftime('%I:%M %p')
+                    except Exception:
+                        dep_time_str = str(dep_time)
+            else:
+                dep_time_str = None
             variant_map[pv.id] = {
                 "package_title": pkg_title, 
                 "variant_title": pv.title,
                 "package_type": pkg_type.value if hasattr(pkg_type, 'value') else str(pkg_type),
-                "departure_time": dep_time.strftime('%I:%M %p') if dep_time else None
+                "departure_time": dep_time_str
             }
 
     room_variant_map: dict = {}
@@ -199,11 +214,22 @@ async def list_admin_bookings(
             .where(RoomVariant.id.in_(room_variant_ids))
         )
         for rv, room_name, start_time, end_time in rv_res.all():
+            def _fmt_time(t):
+                if not t:
+                    return None
+                if hasattr(t, 'strftime'):
+                    return t.strftime('%I:%M %p')
+                try:
+                    from datetime import time as dt_time
+                    parts = str(t).split(':')
+                    return dt_time(int(parts[0]), int(parts[1])).strftime('%I:%M %p')
+                except Exception:
+                    return str(t)
             room_variant_map[rv.id] = {
                 "package_title": room_name, 
                 "variant_title": rv.variant_name,
-                "slot_start": start_time.strftime('%I:%M %p') if start_time else None,
-                "slot_end": end_time.strftime('%I:%M %p') if end_time else None
+                "slot_start": _fmt_time(start_time),
+                "slot_end": _fmt_time(end_time)
             }
 
     from datetime import datetime, timedelta

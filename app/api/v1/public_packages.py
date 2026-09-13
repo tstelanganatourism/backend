@@ -42,7 +42,7 @@ async def get_packages(
     db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Items per page"),
-    type: Optional[PackageType] = Query(None, description="Filter by TOUR or TRIP"),
+    type: Optional[str] = Query(None, description="Filter by TOUR or TRIP (also supports boat_ride, sightseeing)"),
     region: Optional[RegionType] = Query(None, description="Filter by AP or TS"),
     is_featured: Optional[bool] = Query(None, description="Filter featured only"),
     tags: Optional[List[str]] = Query(None, description="Filter by tags"),
@@ -69,7 +69,11 @@ async def get_packages(
 
         # Filters
         if type:
-            base_query = base_query.where(Package.type == type)
+            norm_type = str(type).strip().upper()
+            if norm_type in ("TOUR", "BOAT", "BOAT_RIDE", "BOAT-RIDE", "PACKAGE"):
+                base_query = base_query.where(Package.type == PackageType.TOUR)
+            elif norm_type in ("TRIP", "SIGHTSEEING", "TEMPLE"):
+                base_query = base_query.where(Package.type == PackageType.TRIP)
         if region:
             base_query = base_query.where(Package.region == region)
         if is_featured is not None:
@@ -211,7 +215,7 @@ async def list_package_categories(
     Returns all active package categories, ordered by sort_order.
     Used on the /packages landing page to show the category grid.
     """
-    set_no_store_headers(response)
+    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
     from app.core.memory_cache import get_mem_cached, set_mem_cached
     cached = get_mem_cached("pkg_cats", "all")
     if cached is not None:
@@ -243,7 +247,7 @@ async def list_package_categories(
             icon=cat.icon, sort_order=cat.sort_order, package_count=pkg_count,
             min_price=min_price, rating=4.9,
         ))
-    set_mem_cached("pkg_cats", "all", out, ttl_seconds=120)
+    set_mem_cached("pkg_cats", "all", out, ttl_seconds=300)
     return out
 
 @router.get("/categories/{cat_slug}", response_model=PackageCategoryDetailPublicDTO, tags=["Public Discovery - Package Categories"])
@@ -256,7 +260,7 @@ async def get_package_category(
     Returns a single package category with its packages.
     Used on /packages/categories/{slug}.
     """
-    set_no_store_headers(response)
+    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
     from app.core.memory_cache import get_mem_cached, set_mem_cached
     cached = get_mem_cached("pkg_cat_detail", cat_slug.lower())
     if cached is not None:
@@ -740,7 +744,7 @@ async def get_package_availability(
                 eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
 
             if inv is None:
-                # Default open inventory for published package on future dates
+                # No inventory opened by admin yet for this date -> UNPUBLISHED / CLOSED
                 availability.append(
                     PublicDateAvailability(
                         date=current,
@@ -752,10 +756,10 @@ async def get_package_availability(
                         effective_child_price=eff_child,
                         student_price=base_student,
                         effective_student_price=eff_student,
-                        available_seats=100,
-                        is_closed=False,
-                        status="OPEN",
-                        transport_availability=transport_inv_map.get(current, None)
+                        available_seats=0,
+                        is_closed=True,
+                        status="UNPUBLISHED",
+                        transport_availability=None
                     )
                 )
             elif inv.is_closed or (is_agent and not allowed):
