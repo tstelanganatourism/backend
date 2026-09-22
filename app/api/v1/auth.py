@@ -343,16 +343,31 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
 
 
 async def _send_admin_otp_email(email: str, full_name: str, otp: str):
-    """Send an Admin OTP email — tries Gmail SMTP first, then Brevo."""
+    """Send an OTP email via Brevo."""
     if settings.ENVIRONMENT == "development":
         logger.info(f"===========================================================")
         logger.info(f"ADMIN LOGIN OTP FOR {email}: {otp}")
         logger.info(f"===========================================================")
+        
+        # Write to current_otp.txt in development mode for programmatic verification
         try:
             with open("current_otp.txt", "w") as f:
                 f.write(otp)
         except Exception as e:
             logger.error(f"Failed to write OTP to current_otp.txt: {str(e)}")
+
+    primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
+    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+    if not primary_from or primary_from == "bookings@tstelanganatourism.com":
+        primary_from = "tstelanganatourism@gmail.com"
+    backup_key = settings.BREVO_API_KEY_BACKUP
+    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
+
+    logger.info(f"Sending Admin OTP to {email} with Sender: {primary_from}")
+
+    if not primary_key and not backup_key:
+        logger.warning("No BREVO_API_KEY_ADMIN, BREVO_API_KEY, or BREVO_API_KEY_BACKUP configured, skipping actual email send.")
+        return
 
     html_content = _build_otp_email_html(
         full_name=full_name,
@@ -365,40 +380,47 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
         accent_color="#075b60",
     )
 
-    from app.services.email_service import _send_via_gmail_smtp, _send_via_brevo
+    async def _attempt_send(api_key: str, from_email: str) -> tuple[bool, str]:
+        payload = {
+            "sender": {"email": from_email, "name": "TS Tourism Services"},
+            "to": [{"email": email, "name": full_name}],
+            "subject": "Verification Code - TS Tourism Admin",
+            "htmlContent": html_content,
+        }
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    json=payload,
+                    headers={
+                        "api-key": api_key,
+                        "Content-Type": "application/json"
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code not in (200, 201):
+                    logger.error(f"Brevo API Error for {email}: {resp.status_code} - {resp.text}")
+                    return False, f"Brevo API Error: {resp.status_code} - {resp.text}"
+                logger.info(f"Brevo API Success for {email}: {resp.status_code} - {resp.text}")
+                return True, ""
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
 
-    # 1. Try Gmail SMTP (most reliable)
-    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
-        success, err = await _send_via_gmail_smtp(email, full_name, "Verification Code - TS Tourism Admin", html_content)
-        if success:
-            logger.info(f"Admin OTP sent via Gmail SMTP to {email}")
-            return True
-        logger.warning(f"Gmail SMTP failed for Admin OTP to {email}: {err}. Falling back to Brevo...")
-
-    # 2. Try Brevo
-    primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
-    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tstelanganatourism@gmail.com"
-    backup_key = settings.BREVO_API_KEY_BACKUP
-    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
-
-    if not primary_key and not backup_key:
-        logger.warning("No email credentials configured for Admin OTP. OTP only logged above.")
-        return False
-
-    logger.info(f"Sending Admin OTP to {email} via Brevo, sender: {primary_from}")
+    # 1. Try Admin (Secondary) key
     if primary_key:
-        success, error_msg = await _send_via_brevo(primary_key, primary_from, email, full_name, "Verification Code - TS Tourism Admin", html_content)
+        success, error_msg = await _attempt_send(primary_key, primary_from)
         if success:
-            logger.info(f"Admin OTP email sent to {email} via Brevo primary key.")
+            logger.info(f"Admin OTP email sent to {email} successfully using primary admin key.")
             return True
-        logger.warning(f"Brevo primary key failed for Admin OTP to {email}: {error_msg}. Trying backup...")
+        logger.warning(f"Primary Admin Brevo key failed for OTP to {email}: {error_msg}. Attempting Backup key...")
 
+    # 2. Try Backup key
     if backup_key:
-        success, error_msg = await _send_via_brevo(backup_key, backup_from, email, full_name, "Verification Code - TS Tourism Admin", html_content)
+        success, error_msg = await _attempt_send(backup_key, backup_from)
         if success:
-            logger.info(f"Admin OTP email sent to {email} via Brevo backup key.")
+            logger.info(f"Admin OTP email sent to {email} successfully using backup key.")
             return True
-        logger.error(f"All email methods failed for Admin OTP to {email}: {error_msg}")
+        logger.error(f"Backup Brevo key also failed for OTP to {email}: {error_msg}")
 
     return False
 
