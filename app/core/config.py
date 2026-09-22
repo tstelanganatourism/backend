@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     BREVO_FROM_EMAIL_USER: Optional[str] = None
     BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
     BREVO_FROM_EMAIL_BACKUP: Optional[str] = None
+
+    # Gmail SMTP — primary sender (500 emails/day free, perfect deliverability)
+    # App Password generated at https://myaccount.google.com/apppasswords
+    GMAIL_USER: Optional[str] = None
+    GMAIL_APP_PASSWORD: Optional[str] = None
     
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None

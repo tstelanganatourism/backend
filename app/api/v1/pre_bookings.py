@@ -59,11 +59,21 @@ class PreBookingResponse(BaseModel):
 # ── Email helpers ──────────────────────────────────────────────────────────────
 
 async def _send_brevo(to_email: str, to_name: str, subject: str, html: str):
-    """Fire-and-forget Brevo send."""
+    """Send pre-booking email via Gmail SMTP first, with Brevo fallback."""
+    from app.services.email_service import _send_via_gmail_smtp
+    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
+        ok, err = await _send_via_gmail_smtp(to_email, to_name, subject, html)
+        if ok:
+            return True
+        logger.warning(f"Gmail SMTP failed for pre-booking email to {to_email}: {err}. Trying Brevo...")
+
     api_key = settings.BREVO_API_KEY_USER or settings.BREVO_API_KEY or ""
     from_email = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL or "tstelanganatourism@gmail.com"
+    if not from_email or "tstelanganatourism.com" in from_email:
+        from_email = "tstelanganatourism@gmail.com"
+
     if not api_key:
-        logger.warning("No Brevo API key configured — skipping email")
+        logger.warning("No email credentials configured — skipping email")
         return False
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
