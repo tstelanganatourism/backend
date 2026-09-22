@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     
     # Security
     SECRET_KEY: str
+    # Separate secret for PDF/ticket HMAC signing (falls back to SECRET_KEY if not set)
+    PDF_SECRET_KEY: Optional[str] = None
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
     ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30   # shorter for admin
@@ -43,14 +45,14 @@ class Settings(BaseSettings):
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
 
-    # PhonePe
+    # PhonePe — IMPORTANT: Default is PRODUCTION. Always set PHONEPE_ENV=SANDBOX in .env for local/staging.
     PHONEPE_MERCHANT_ID: Optional[str] = None
     PHONEPE_CLIENT_ID: Optional[str] = None
     PHONEPE_CLIENT_SECRET: Optional[str] = None
     PHONEPE_CLIENT_VERSION: str = "1"
     PHONEPE_SALT_KEY: Optional[str] = None
     PHONEPE_SALT_INDEX: int = 1
-    PHONEPE_ENV: str = "PRODUCTION"
+    PHONEPE_ENV: str = "PRODUCTION"  # CHANGE TO SANDBOX FOR TEST MODE
 
     
     # Brevo (Email Sending)

@@ -2432,13 +2432,19 @@ async def download_public_booking_pdf(
     """
     import hmac
     import hashlib
-    SECRET_KEY = "tsaptourismpapikondalubadhrachalam"
-    expected = hmac.new(SECRET_KEY.encode("utf-8"), booking_id.encode("utf-8"), hashlib.sha256).hexdigest()
-    
-    # If secret is passed, verify it; otherwise compute for valid public booking
-    if not secret:
-        secret = expected
-    elif secret != expected and not booking_id.startswith("DEMO-"):
+    # Use dedicated PDF_SECRET_KEY (falls back to SECRET_KEY if not set)
+    _pdf_secret = settings.PDF_SECRET_KEY or settings.SECRET_KEY or ""
+    PDF_SECRET_KEY = _pdf_secret.encode("utf-8")
+    expected = hmac.new(PDF_SECRET_KEY, booking_id.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    # DEMO bookings: allow without secret (no PII in demo content)
+    if booking_id.startswith("DEMO-"):
+        secret = secret or expected  # DEMO only — safe fallback
+    elif not secret:
+        # SECURITY: Never auto-fill the expected secret — that's a data-leak bypass
+        raise HTTPException(status_code=401, detail="Authorization secret is required to download this document")
+    elif not hmac.compare_digest(secret, expected):
+        # constant-time comparison prevents timing attacks
         raise HTTPException(status_code=403, detail="Invalid authorization secret for document PDF download")
 
     # In production use FRONTEND_URL; locally use 127.0.0.1:3000
