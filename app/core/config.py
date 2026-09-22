@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     BREVO_FROM_EMAIL_USER: Optional[str] = None
     BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
     BREVO_FROM_EMAIL_BACKUP: Optional[str] = None
+
+    # Gmail SMTP (direct relay — bypasses Brevo sender domain restrictions)
+    # Use a 16-char Google App Password from https://myaccount.google.com/apppasswords
+    GMAIL_USER: Optional[str] = None       # e.g. tstelanganatourism@gmail.com
+    GMAIL_APP_PASSWORD: Optional[str] = None  # 16-char App Password (not Gmail password)
     
     # Google Auth
     GOOGLE_CLIENT_ID: Optional[str] = None

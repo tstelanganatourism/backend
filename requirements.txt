@@ -14,6 +14,7 @@ resend==2.30.1
 python-multipart==0.0.29
 httpx==0.28.1
 python-dotenv==1.2.2
+aiosmtplib>=3.0.0
 loguru==0.7.3
 aiobotocore==3.7.0
 arq==0.28.0
