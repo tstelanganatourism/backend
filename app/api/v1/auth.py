@@ -302,9 +302,9 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
 
     # 2. Brevo fallback
     primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
-    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tstelanganatourism@gmail.com"
+    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
     backup_key = settings.BREVO_API_KEY_BACKUP
-    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
+    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
 
     if not primary_key and not backup_key:
         logger.warning("No email credentials configured, skipping reset email.")
@@ -362,9 +362,9 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
 
     # 2. Brevo fallback
     primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
-    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tstelanganatourism@gmail.com"
+    primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
     backup_key = settings.BREVO_API_KEY_BACKUP
-    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL
+    backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
 
     if not primary_key and not backup_key:
         logger.warning("No email credentials configured — Admin OTP only available in logs.")

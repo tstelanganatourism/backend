@@ -62,10 +62,10 @@ class Settings(BaseSettings):
     BREVO_API_KEY_USER: Optional[str] = None
     BREVO_API_KEY_ADMIN: Optional[str] = None
     BREVO_API_KEY_BACKUP: Optional[str] = None
-    BREVO_FROM_EMAIL: str = "tstelanganatourism@gmail.com"
-    BREVO_FROM_EMAIL_USER: Optional[str] = None
-    BREVO_FROM_EMAIL_ADMIN: Optional[str] = None
-    BREVO_FROM_EMAIL_BACKUP: Optional[str] = None
+    BREVO_FROM_EMAIL: str = "tickets@tstelanganatourism.com"
+    BREVO_FROM_EMAIL_USER: Optional[str] = "tickets@tstelanganatourism.com"
+    BREVO_FROM_EMAIL_ADMIN: Optional[str] = "tickets@tstelanganatourism.com"
+    BREVO_FROM_EMAIL_BACKUP: Optional[str] = "tickets@tstelanganatourism.com"
 
     # Gmail SMTP — primary sender (500 emails/day free, perfect deliverability)
     # App Password generated at https://myaccount.google.com/apppasswords

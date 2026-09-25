@@ -96,12 +96,10 @@ async def _send_via_brevo(
     html_content: str,
 ) -> tuple[bool, str]:
     """Send email via Brevo transactional API."""
-    # Ensure sender is valid in Brevo (must not be unverified custom domain)
-    if not from_email or "tstelanganatourism.com" in from_email:
-        from_email = "tstelanganatourism@gmail.com"
+    sender_email = from_email or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
 
     payload = {
-        "sender": {"email": from_email, "name": "TS Boat Tourism"},
+        "sender": {"email": sender_email, "name": "TS Boat Tourism"},
         "to": [{"email": recipient_email, "name": recipient_name or recipient_email}],
         "subject": subject,
         "htmlContent": html_content,
@@ -159,13 +157,10 @@ class EmailService:
         # ── Tier 2 & 3: Brevo Setup ──────────────────────────────────────────
         if is_admin:
             primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
-            primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL
+            primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
         else:
             primary_key = settings.BREVO_API_KEY_USER or settings.BREVO_API_KEY
-            primary_from = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL
-
-        if not primary_from or "tstelanganatourism.com" in primary_from:
-            primary_from = "tstelanganatourism@gmail.com"
+            primary_from = settings.BREVO_FROM_EMAIL_USER or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
 
         # Daily quota guard
         try:
@@ -186,7 +181,7 @@ class EmailService:
             logger.error(f"Failed to check daily email count: {e}")
 
         backup_key = settings.BREVO_API_KEY_BACKUP
-        backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tstelanganatourism@gmail.com"
+        backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
 
         if not primary_key and not backup_key:
             return False, "No email credentials configured (neither Gmail SMTP nor Brevo)"
