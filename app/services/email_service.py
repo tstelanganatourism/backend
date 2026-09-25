@@ -24,20 +24,33 @@ def _sync_send_gmail(
     subject: str,
     html_content: str,
 ):
-    """Synchronous Gmail SSL SMTP send helper run via asyncio.to_thread."""
+    """Synchronous Gmail SMTP send helper with dual-port (465 SSL & 587 TLS) support."""
+    clean_user = gmail_user.strip().strip('"').strip("'")
+    clean_pass = gmail_pass.replace(" ", "").strip().strip('"').strip("'")
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"TS Boat Tourism <{gmail_user}>"
+    msg["From"] = f"TS Boat Tourism <{clean_user}>"
     msg["To"] = f"{recipient_name} <{recipient_email}>" if recipient_name else recipient_email
-    msg["Reply-To"] = gmail_user
+    msg["Reply-To"] = clean_user
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-    clean_pass = gmail_pass.replace(" ", "")
-    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
-    server.login(gmail_user, clean_pass)
-    server.sendmail(gmail_user, [recipient_email], msg.as_string())
-    server.quit()
-    return True
+    # Try Port 465 SSL first
+    try:
+        server = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
+        server.login(clean_user, clean_pass)
+        server.sendmail(clean_user, [recipient_email], msg.as_string())
+        server.quit()
+        return True
+    except Exception as ssl_err:
+        logger.warning(f"Gmail SMTP Port 465 failed ({ssl_err}), retrying on Port 587 STARTTLS...")
+        # Fallback to Port 587 STARTTLS
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+        server.starttls()
+        server.login(clean_user, clean_pass)
+        server.sendmail(clean_user, [recipient_email], msg.as_string())
+        server.quit()
+        return True
 
 
 async def _send_via_gmail_smtp(
