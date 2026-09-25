@@ -278,7 +278,7 @@ def _build_otp_email_html(
 
 
 async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
-    """Send a password reset OTP email — tries Gmail SMTP first, then Brevo."""
+    """Send a password reset OTP email — uses Brevo HTTPS API first for instant delivery."""
     html_content = _build_otp_email_html(
         full_name=full_name,
         otp=otp,
@@ -292,23 +292,11 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
 
     from app.services.email_service import _send_via_gmail_smtp, _send_via_brevo
 
-    # 1. Gmail SMTP — most reliable
-    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
-        success, err = await _send_via_gmail_smtp(email, full_name, "Password Reset Code - TS Tourism", html_content)
-        if success:
-            logger.info(f"Password reset email sent via Gmail SMTP to {email}")
-            return True
-        logger.warning(f"Gmail SMTP failed for Password Reset OTP ({email}): {err}. Trying Brevo...")
-
-    # 2. Brevo fallback
+    # 1. Brevo Primary (Instant HTTPS)
     primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
     primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
     backup_key = settings.BREVO_API_KEY_BACKUP
     backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
-
-    if not primary_key and not backup_key:
-        logger.warning("No email credentials configured, skipping reset email.")
-        return False
 
     if primary_key:
         success, err = await _send_via_brevo(primary_key, primary_from, email, full_name, "Password Reset Code - TS Tourism", html_content)
@@ -322,13 +310,21 @@ async def _send_password_reset_otp_email(email: str, full_name: str, otp: str):
         if success:
             logger.info(f"Password reset email sent via Brevo backup to {email}")
             return True
-        logger.error(f"All email methods failed for Reset OTP ({email}): {err}")
+        logger.warning(f"Brevo backup failed for Reset OTP ({email}): {err}")
+
+    # 2. Gmail SMTP Fallback
+    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
+        success, err = await _send_via_gmail_smtp(email, full_name, "Password Reset Code - TS Tourism", html_content)
+        if success:
+            logger.info(f"Password reset email sent via Gmail SMTP to {email}")
+            return True
+        logger.error(f"Gmail SMTP failed for Password Reset OTP ({email}): {err}")
 
     return False
 
 
 async def _send_admin_otp_email(email: str, full_name: str, otp: str):
-    """Send Admin OTP — tries Gmail SMTP first, then Brevo."""
+    """Send Admin OTP — uses Brevo HTTPS API first for instant delivery."""
     if settings.ENVIRONMENT == "development":
         logger.info(f"===========================================================")
         logger.info(f"ADMIN LOGIN OTP FOR {email}: {otp}")
@@ -352,23 +348,11 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
 
     from app.services.email_service import _send_via_gmail_smtp, _send_via_brevo
 
-    # 1. Gmail SMTP — most reliable
-    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
-        success, err = await _send_via_gmail_smtp(email, full_name, "Verification Code - TS Tourism Admin", html_content)
-        if success:
-            logger.info(f"Admin OTP sent via Gmail SMTP to {email}")
-            return True
-        logger.warning(f"Gmail SMTP failed for Admin OTP ({email}): {err}. Trying Brevo...")
-
-    # 2. Brevo fallback
+    # 1. Brevo Primary (Instant HTTPS)
     primary_key = settings.BREVO_API_KEY_ADMIN or settings.BREVO_API_KEY
     primary_from = settings.BREVO_FROM_EMAIL_ADMIN or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
     backup_key = settings.BREVO_API_KEY_BACKUP
     backup_from = settings.BREVO_FROM_EMAIL_BACKUP or settings.BREVO_FROM_EMAIL or "tickets@tstelanganatourism.com"
-
-    if not primary_key and not backup_key:
-        logger.warning("No email credentials configured — Admin OTP only available in logs.")
-        return False
 
     if primary_key:
         success, err = await _send_via_brevo(primary_key, primary_from, email, full_name, "Verification Code - TS Tourism Admin", html_content)
@@ -382,7 +366,15 @@ async def _send_admin_otp_email(email: str, full_name: str, otp: str):
         if success:
             logger.info(f"Admin OTP sent via Brevo backup to {email}")
             return True
-        logger.error(f"All email methods failed for Admin OTP ({email}): {err}")
+        logger.warning(f"Brevo backup failed for Admin OTP ({email}): {err}")
+
+    # 2. Gmail SMTP Fallback
+    if settings.GMAIL_USER and settings.GMAIL_APP_PASSWORD:
+        success, err = await _send_via_gmail_smtp(email, full_name, "Verification Code - TS Tourism Admin", html_content)
+        if success:
+            logger.info(f"Admin OTP sent via Gmail SMTP to {email}")
+            return True
+        logger.error(f"Gmail SMTP failed for Admin OTP ({email}): {err}")
 
     return False
 
