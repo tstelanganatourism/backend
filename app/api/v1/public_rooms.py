@@ -150,6 +150,11 @@ async def get_rooms(
 
 # ── Public Room Category Endpoints (must be BEFORE /{slug} route) ─────────────
 
+DEFAULT_ROOM_CATEGORY_IMAGES = {
+    "bhadrachalam-accommodations": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1786273972/9b475911-9c60-4bf6-9ffb-b9f1802275a2_k6zmkd.jpg",
+    "papikondalu-forest-huts": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1784613514/ts_boat_tourism/packages/zkxrdmxykszetgupmi8d.jpg",
+}
+
 @router.get("/categories", response_model=List[RoomCategoryPublicDTO], tags=["Public Discovery - Room Categories"])
 async def list_room_categories(
     response: Response,
@@ -175,9 +180,18 @@ async def list_room_categories(
             1 for r in cat.rooms
             if r.is_active and r.status == PublishStatus.PUBLISHED and not r.deleted_at
         )
+        cover_image = cat.cover_image_url or DEFAULT_ROOM_CATEGORY_IMAGES.get(cat.slug)
+        if not cover_image:
+            for r in cat.rooms:
+                if r.cover_image_url:
+                    cover_image = r.cover_image_url
+                    break
+        if not cover_image:
+            cover_image = DEFAULT_ROOM_CATEGORY_IMAGES["bhadrachalam-accommodations"]
+
         out.append(RoomCategoryPublicDTO(
             id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
-            cover_image_url=cat.cover_image_url, icon=cat.icon,
+            cover_image_url=cover_image, icon=cat.icon,
             sort_order=cat.sort_order, room_count=room_count,
         ))
     set_mem_cached("room_cats", "all", out, ttl_seconds=120)
@@ -220,9 +234,18 @@ async def get_room_category(
             address=room.address, map_url=room.map_url, facilities=room.facilities or [],
         ))
     rooms_dto.sort(key=lambda r: (not r.is_featured, r.starting_price or 0))
+    cover_image = cat.cover_image_url or DEFAULT_ROOM_CATEGORY_IMAGES.get(cat.slug)
+    if not cover_image:
+        for r in rooms_dto:
+            if r.cover_image_url:
+                cover_image = r.cover_image_url
+                break
+    if not cover_image:
+        cover_image = DEFAULT_ROOM_CATEGORY_IMAGES["bhadrachalam-accommodations"]
+
     result_dto = RoomCategoryDetailPublicDTO(
         id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
-        cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
+        cover_image_url=cover_image, icon=cat.icon, sort_order=cat.sort_order,
         room_count=len(rooms_dto), rooms=rooms_dto,
     )
     set_mem_cached("room_cat_detail", cat_slug.lower(), result_dto, ttl_seconds=120)

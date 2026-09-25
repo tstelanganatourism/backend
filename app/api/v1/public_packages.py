@@ -206,6 +206,12 @@ async def get_packages(
 
 # ── Public Package Category Endpoints (must be BEFORE /{slug} route) ─────────────
 
+DEFAULT_CATEGORY_IMAGES = {
+    "papikondalu-tour-packages": "https://res.cloudinary.com/r929tquv/image/upload/v1785917181/ts_boat_tourism/images/haotjawjrhmnnzvm7yqz.webp",
+    "pochavaram-to-papikondalu-tour": "https://res.cloudinary.com/r929tquv/image/upload/v1784613500/ts_boat_tourism/packages/xolfujndmsrwgk22xqu2.jpg",
+    "bhadrachalam-packages": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1786268860/ts_boat_tourism/gallery/boats/q6md8goirybznxvajwet.png",
+}
+
 @router.get("/categories", response_model=List[PackageCategoryPublicDTO], tags=["Public Discovery - Package Categories"])
 async def list_package_categories(
     response: Response,
@@ -241,9 +247,20 @@ async def list_package_categories(
         prices = [p.starting_price for p in active_pkgs if p.starting_price and p.starting_price > 0]
         min_price = float(min(prices)) if prices else None
         
+        cover_image = cat.cover_image_url
+        if not cover_image:
+            cover_image = DEFAULT_CATEGORY_IMAGES.get(cat.slug)
+        if not cover_image and active_pkgs:
+            for p in active_pkgs:
+                if p.cover_image_url:
+                    cover_image = p.cover_image_url
+                    break
+        if not cover_image:
+            cover_image = DEFAULT_CATEGORY_IMAGES["papikondalu-tour-packages"]
+
         out.append(PackageCategoryPublicDTO(
             id=cat.id, name=cat.name, slug=cat.slug,
-            description=cat.description, cover_image_url=cat.cover_image_url,
+            description=cat.description, cover_image_url=cover_image,
             icon=cat.icon, sort_order=cat.sort_order, package_count=pkg_count,
             min_price=min_price, rating=4.9,
         ))
@@ -299,10 +316,20 @@ async def get_package_category(
                 student_price=v.student_price, weekend_student_price=v.weekend_student_price,
             ) for v in active_variants],
         ))
-    packages_dto.sort(key=lambda p: (not p.is_featured, p.starting_price or 0))
+    cover_image = cat.cover_image_url
+    if not cover_image:
+        cover_image = DEFAULT_CATEGORY_IMAGES.get(cat.slug)
+    if not cover_image and packages_dto:
+        for p in packages_dto:
+            if p.cover_image_url:
+                cover_image = p.cover_image_url
+                break
+    if not cover_image:
+        cover_image = DEFAULT_CATEGORY_IMAGES["papikondalu-tour-packages"]
+
     res_dto = PackageCategoryDetailPublicDTO(
         id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
-        cover_image_url=cat.cover_image_url, icon=cat.icon, sort_order=cat.sort_order,
+        cover_image_url=cover_image, icon=cat.icon, sort_order=cat.sort_order,
         package_count=len(packages_dto), packages=packages_dto,
     )
     set_mem_cached("pkg_cat_detail", cat_slug.lower(), res_dto, ttl_seconds=120)
