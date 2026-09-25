@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     PHONEPE_SALT_KEY: Optional[str] = None
     PHONEPE_SALT_INDEX: int = 1
     PHONEPE_ENV: str = "PRODUCTION"  # CHANGE TO SANDBOX FOR TEST MODE
+    PHONEPE_WEBHOOK_USERNAME: Optional[str] = None
+    PHONEPE_WEBHOOK_PASSWORD: Optional[str] = None
 
     
     # Brevo (Email Sending)

@@ -599,7 +599,6 @@ async def verify_status(
 
 
 
-
 # ─── PhonePe Webhook ──────────────────────────────────────────────────────────
 
 @router.post("/webhook/phonepe")
@@ -608,49 +607,120 @@ async def phonepe_webhook(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    PhonePe S2S Webhook callback.
+    PhonePe S2S Webhook callback — supports v2 HMAC and legacy x-verify signatures.
     Finalizes the booking draft or balance payment asynchronously.
+    Returns HTTP 200 immediately after verification so PhonePe doesn't retry.
     """
     import base64
     body_bytes = await request.body()
-    signature = request.headers.get("x-verify")
 
+    # ── Collect signature headers (v2 HMAC, SHA, or legacy x-verify) ─────────
+    x_hmac_signature = request.headers.get("x-phonepe-checksum-signature")
+    x_hmac_key_id = request.headers.get("x-phonepe-checksum-key-id")
+    x_verify = request.headers.get("x-verify")
+    auth_header = request.headers.get("authorization")
+
+    # ── Parse raw JSON body ───────────────────────────────────────────────────
     try:
         data = json.loads(body_bytes)
-        response_base64 = data.get("response")
     except Exception:
-        logger.error("PhonePe Webhook failed to parse raw request JSON.")
+        logger.error("PhonePe Webhook: failed to parse request body as JSON.")
         raise HTTPException(status_code=400, detail="Invalid request JSON")
 
-    if not response_base64:
-        raise HTTPException(status_code=400, detail="Missing response payload")
+    # Legacy v1 wraps payload in base64 "response" field
+    response_base64 = data.get("response")
 
-    is_valid = phonepe_service.verify_webhook_signature(response_base64, signature)
+    # ── Signature Verification ────────────────────────────────────────────────
+    if x_hmac_signature:
+        # v2 HMAC: sign raw body bytes
+        is_valid = phonepe_service.verify_webhook_signature(
+            raw_body=body_bytes,
+            x_hmac_signature=x_hmac_signature,
+            x_hmac_key_id=x_hmac_key_id,
+        )
+    elif auth_header:
+        # v2 SHA / Basic auth
+        is_valid = phonepe_service.verify_webhook_signature(
+            raw_body=body_bytes,
+            auth_header=auth_header,
+        )
+    elif x_verify and response_base64:
+        # Legacy x-verify: SHA256(base64_response + salt_key)
+        is_valid = phonepe_service.verify_webhook_signature(
+            raw_body=body_bytes,
+            x_verify=x_verify,
+            base64_response=response_base64,
+        )
+    elif phonepe_service.is_mock:
+        is_valid = True
+    else:
+        logger.warning("PhonePe Webhook: no recognised signature header received.")
+        is_valid = False
+
     if not is_valid:
-        logger.warning("PhonePe Webhook signature verification failed.")
+        logger.warning(
+            f"PhonePe Webhook signature FAILED. "
+            f"HMAC={x_hmac_signature is not None}, Auth={auth_header is not None}, xVerify={x_verify is not None}"
+        )
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    try:
-        decoded_bytes = base64.b64decode(response_base64)
-        payload = json.loads(decoded_bytes)
-    except Exception as e:
-        logger.error(f"PhonePe Webhook failed to decode/parse base64: {e}")
-        raise HTTPException(status_code=400, detail="Invalid base64 payload")
+    # ── Decode Payload ────────────────────────────────────────────────────────
+    if response_base64:
+        # Legacy v1 format — payload is base64-encoded JSON
+        try:
+            decoded_bytes = base64.b64decode(response_base64)
+            payload = json.loads(decoded_bytes)
+        except Exception as exc:
+            logger.error(f"PhonePe Webhook base64 decode failed: {exc}")
+            raise HTTPException(status_code=400, detail="Invalid base64 payload")
+    else:
+        # v2 format — fields are at root level of JSON body
+        payload = data
 
+    # ── Extract transaction fields ─────────────────────────────────────────────
+    event = payload.get("event")  # e.g., "checkout.order.completed" or "checkout.order.failed"
+    payload_data = payload.get("payload") or payload.get("data") or payload
+
+    merchant_txn_id = (
+        payload_data.get("merchantOrderId")
+        or payload_data.get("merchantTransactionId")
+        or payload.get("merchantOrderId")
+        or payload.get("merchantTransactionId")
+    )
+    gateway_payment_id = (
+        payload_data.get("orderId")
+        or payload_data.get("transactionId")
+        or payload_data.get("pgTransactionId")
+    )
+    payment_details = payload_data.get("paymentDetails") or []
+    if not gateway_payment_id and isinstance(payment_details, list) and len(payment_details) > 0:
+        gateway_payment_id = payment_details[0].get("transactionId") or payment_details[0].get("pgTransactionId")
+
+    payment_instrument = (payload_data.get("paymentInstrument") or {}).get("type")
+    if not payment_instrument and isinstance(payment_details, list) and len(payment_details) > 0:
+        payment_instrument = payment_details[0].get("paymentMode")
+
+    state = str(payload_data.get("state") or "").upper()
+    code = str(payload.get("code") or payload_data.get("code") or "").upper()
     success = payload.get("success")
-    code = payload.get("code")
-    payload_data = payload.get("data", {})
 
-    merchant_txn_id = payload_data.get("merchantTransactionId")
-    gateway_payment_id = payload_data.get("transactionId")
-    payment_instrument = payload_data.get("paymentInstrument", {}).get("type")
+    is_success = (
+        event == "checkout.order.completed"
+        or state == "COMPLETED"
+        or (success is True and code == "PAYMENT_SUCCESS")
+    )
+    is_failed = (
+        event == "checkout.order.failed"
+        or state in ("FAILED", "EXPIRED", "DECLINED")
+        or code in ("PAYMENT_ERROR", "PAYMENT_DECLINED", "TIMED_OUT")
+    )
 
     if not merchant_txn_id:
-        logger.warning("PhonePe Webhook payload missing merchantTransactionId")
+        logger.warning(f"PhonePe Webhook: merchantTransactionId missing. Payload: {payload}")
         return {"status": "ok"}
 
     try:
-        if success and code == "PAYMENT_SUCCESS":
+        if is_success:
             draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == merchant_txn_id).with_for_update()
             res = await db.execute(draft_query)
             draft = res.scalar_one_or_none()
@@ -658,7 +728,7 @@ async def phonepe_webhook(
             if draft:
                 sse_payloads = []
                 target_type = draft.target_type
-                public_id = await _finalize_draft(draft, gateway_payment_id, db, sse_payloads=sse_payloads, payment_source="PHONEPE")
+                public_id = await _finalize_draft(draft, gateway_payment_id or merchant_txn_id, db, sse_payloads=sse_payloads, payment_source="PHONEPE")
                 await db.commit()
 
                 from app.utils.cache import clear_cache_prefix
@@ -699,11 +769,29 @@ async def phonepe_webhook(
                     try:
                         from app.worker import get_arq_pool
                         arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                        if arq_pool:
+                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
                     except Exception as arq_err:
                         logger.warning(f"Failed to enqueue document tasks from PhonePe webhook: {arq_err}")
+
+                    # Direct in-process fallback to guarantee emails and documents
+                    try:
+                        from app.services.pdf_generator import process_post_booking_documents_task
+                        await process_post_booking_documents_task(None, booking.id, is_fully_paid=(booking.status == BookingStatus.FULLY_PAID))
+                    except Exception as doc_err:
+                        logger.error(f"Error in direct document/email generation from PhonePe webhook for {public_id}: {doc_err}")
+
                 logger.info(f"PhonePe Webhook finalized booking for transaction {merchant_txn_id}")
             else:
+                # Check if booking was already finalized (e.g., user polling /verify-status beat the webhook)
+                existing = await db.execute(
+                    select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == merchant_txn_id)
+                )
+                already_finalized = existing.scalar_one_or_none()
+                if already_finalized:
+                    logger.info(f"PhonePe Webhook: booking already finalized for transaction {merchant_txn_id}")
+                    return {"status": "ok"}
+
                 # Balance payment
                 from app.models.payment import Payment
                 from app.models.enums import PaymentStatus
@@ -716,7 +804,7 @@ async def phonepe_webhook(
 
                 if payment and payment.status != PaymentStatus.CAPTURED:
                     payment.status = PaymentStatus.CAPTURED
-                    payment.pg_payment_id = gateway_payment_id
+                    payment.pg_payment_id = gateway_payment_id or merchant_txn_id
                     if payment_instrument:
                         payment.payment_method = payment_instrument
 
@@ -726,13 +814,20 @@ async def phonepe_webhook(
                     try:
                         from app.worker import get_arq_pool
                         arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
+                        if arq_pool:
+                            await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, booking.status == BookingStatus.FULLY_PAID)
                     except Exception as arq_err:
                         logger.warning(f"Failed to enqueue documents task from PhonePe webhook: {arq_err}")
 
+                    try:
+                        from app.services.pdf_generator import process_post_booking_documents_task
+                        await process_post_booking_documents_task(None, booking.id, is_fully_paid=(booking.status == BookingStatus.FULLY_PAID))
+                    except Exception as doc_err:
+                        logger.error(f"Error in direct document/email generation for balance payment: {doc_err}")
+
                     await db.commit()
                     logger.info(f"PhonePe Webhook finalized balance payment for transaction {merchant_txn_id}")
-        else:
+        elif is_failed:
             # Payment failed
             draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == merchant_txn_id).with_for_update()
             res = await db.execute(draft_query)
@@ -757,10 +852,12 @@ async def phonepe_webhook(
                 payment = p_res.scalar_one_or_none()
                 if payment and payment.status != PaymentStatus.CAPTURED:
                     payment.status = PaymentStatus.FAILED
-                    payment.error_code = code
-                    payment.error_description = payload.get("message")
+                    payment.error_code = code or state
+                    payment.error_description = payload.get("message") or (payload_data.get("errorContext") or {}).get("description")
                     await db.commit()
                     logger.info(f"PhonePe Webhook marked balance payment failed for transaction {merchant_txn_id}")
+        else:
+            logger.info(f"PhonePe Webhook received non-terminal event: {event or state or code} for {merchant_txn_id}")
     except Exception as e:
         logger.error(f"PhonePe Webhook processing failed: {str(e)}")
         await db.rollback()

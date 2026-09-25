@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import time
 import httpx
 from loguru import logger
@@ -6,13 +8,16 @@ from fastapi import HTTPException, status
 from typing import Optional
 from app.core.config import settings
 
+
 class PhonePeService:
     def __init__(self):
         self.merchant_id = settings.PHONEPE_MERCHANT_ID
         self.client_id = settings.PHONEPE_CLIENT_ID
         self.client_secret = settings.PHONEPE_CLIENT_SECRET
         self.client_version = str(settings.PHONEPE_CLIENT_VERSION or "1")
-        self.env = settings.PHONEPE_ENV or "SANDBOX"
+        self.salt_key = settings.PHONEPE_SALT_KEY  # v1-style salt key used for webhook verification
+        self.salt_index = str(settings.PHONEPE_SALT_INDEX or "1")
+        self.env = settings.PHONEPE_ENV or "PRODUCTION"
 
         if self.env.upper() in ("PROD", "PRODUCTION"):
             self.base_url = "https://api.phonepe.com/apis/pg"
@@ -21,20 +26,26 @@ class PhonePeService:
             self.base_url = "https://api-preprod.phonepe.com/apis/pg-sandbox"
             self.oauth_url = "https://api-preprod.phonepe.com/apis/pg-sandbox/v1/oauth/token"
 
-        if self.env.upper() == "MOCK" or not self.client_id or not self.client_secret:
+        # Service is in MOCK mode only when no credentials at all are configured
+        if self.env.upper() == "MOCK" or (not self.client_id and not self.client_secret):
             logger.warning("PhonePe Service initialized in MOCK mode. Mocking payment gateway.")
             self.is_mock = True
         else:
             self.is_mock = False
-            logger.info(f"PhonePe Service initialized in {self.env} mode. Base URL: {self.base_url}")
+            logger.info(
+                f"PhonePe Service initialized in {self.env} mode. "
+                f"MerchantID={self.merchant_id}, ClientID={self.client_id}, Base={self.base_url}"
+            )
 
-        self._cached_token = None
-        self._token_expires_at = 0.0
+        self._cached_token: Optional[str] = None
+        self._token_expires_at: float = 0.0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OAuth Token Management
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def _get_oauth_token(self) -> str:
-        """
-        Fetches a fresh access token using Client credentials.
-        """
+        """Fetch and cache a PhonePe V2 OAuth access token."""
         if self._cached_token and time.time() < self._token_expires_at - 60:
             return self._cached_token
 
@@ -42,17 +53,16 @@ class PhonePeService:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "client_version": self.client_version,
-            "grant_type": "client_credentials"
+            "grant_type": "client_credentials",
         }
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(
                     self.oauth_url,
                     data=token_payload,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=15.0
                 )
-            
+
             if response.status_code == 200:
                 token_data = response.json()
                 token = token_data.get("access_token")
@@ -60,21 +70,28 @@ class PhonePeService:
                 if token:
                     self._cached_token = token
                     self._token_expires_at = time.time() + float(expires_in)
-                    logger.info(f"PhonePe OAuth token successfully cached. Expires in {expires_in} seconds.")
+                    logger.info(f"PhonePe OAuth token cached. Expires in {expires_in}s.")
                     return token
-            logger.error(f"Failed to fetch PhonePe OAuth token: {response.status_code} {response.text}")
+
+            logger.error(
+                f"PhonePe OAuth token fetch failed: {response.status_code} — {response.text[:300]}"
+            )
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to authenticate with payment provider."
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to authenticate with payment provider.",
             )
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Exception during PhonePe OAuth: {e}")
+        except Exception as exc:
+            logger.error(f"PhonePe OAuth connection error: {exc}")
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Connection to payment authentication server failed."
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Connection to payment authentication server failed.",
             )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Payment Initiation
+    # ─────────────────────────────────────────────────────────────────────────
 
     async def create_payment_url(
         self,
@@ -83,23 +100,19 @@ class PhonePeService:
         user_id: str,
         redirect_url: str,
         callback_url: str,
-        phone_number: Optional[str] = None
+        phone_number: Optional[str] = None,
     ) -> dict:
-        """
-        Creates a PhonePe V2 payment session and returns the redirect URL.
-        """
+        """Create a PhonePe V2 checkout session and return the redirect URL."""
         amount_paise = int(round(amount * 100))
 
         if self.is_mock:
-            mock_url = f"{settings.FRONTEND_URL}/payment-status?merchantTransactionId={transaction_id}&merchantId=MOCK&code=PAYMENT_SUCCESS"
-            logger.warning(f"Mocking PhonePe redirect URL for {amount} INR: {mock_url}")
-            return {
-                "redirect_url": mock_url,
-                "transaction_id": transaction_id,
-                "amount": amount_paise
-            }
+            mock_url = (
+                f"{settings.FRONTEND_URL}/payment-status"
+                f"?merchantTransactionId={transaction_id}&merchantId=MOCK&code=PAYMENT_SUCCESS"
+            )
+            logger.warning(f"MOCK: PhonePe redirect for ₹{amount}: {mock_url}")
+            return {"redirect_url": mock_url, "transaction_id": transaction_id, "amount": amount_paise}
 
-        # V2 Payload
         pay_payload = {
             "merchantOrderId": transaction_id,
             "amount": amount_paise,
@@ -107,136 +120,221 @@ class PhonePeService:
             "paymentFlow": {
                 "type": "PG_CHECKOUT",
                 "message": "TS Boat Tourism booking",
-                "merchantUrls": {
-                    "redirectUrl": redirect_url
-                }
-            }
+                "merchantUrls": {"redirectUrl": redirect_url},
+            },
         }
 
         token = await self._get_oauth_token()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"O-Bearer {token}",
-            # "X-CALLBACK-URL": callback_url,
-            # "X-CALL-MODE": "POST"
         }
+        if self.merchant_id:
+            headers["X-MERCHANT-ID"] = self.merchant_id
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.post(
                     f"{self.base_url}/checkout/v2/pay",
                     json=pay_payload,
                     headers=headers,
-                    timeout=15.0
                 )
-            
+
             try:
                 res_json = response.json()
             except ValueError:
-                logger.error(f"PhonePe Pay API responded with non-JSON: {response.status_code} {response.text}")
-                error_msg = response.text.strip()
-                if error_msg == "R016":
-                    detail_msg = "PhonePe Error R016: Callback URL is not whitelisted. Please whitelist the callback URL in PhonePe Dashboard."
-                else:
-                    detail_msg = f"PhonePe gateway error: {error_msg}"
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=detail_msg
+                raw = response.text.strip()
+                logger.error(f"PhonePe non-JSON response [{response.status_code}]: {raw}")
+                detail = (
+                    "PhonePe Error R016: Callback URL not whitelisted. Whitelist it in PhonePe Dashboard."
+                    if raw == "R016"
+                    else f"PhonePe gateway error: {raw}"
                 )
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
             if response.status_code == 200:
-                redirect_url_from_api = res_json.get("redirectUrl")
-                if redirect_url_from_api:
-                    return {
-                        "redirect_url": redirect_url_from_api,
-                        "transaction_id": transaction_id,
-                        "amount": amount_paise
-                    }
-                
-            logger.error(f"PhonePe Pay API responded with error: {response.text}")
+                redirect = res_json.get("redirectUrl")
+                if redirect:
+                    logger.info(f"PhonePe payment initiated for txn {transaction_id} — ₹{amount}")
+                    return {"redirect_url": redirect, "transaction_id": transaction_id, "amount": amount_paise}
+
+            err_msg = res_json.get("message") or res_json.get("error") or "Failed to generate payment link."
+            logger.error(f"PhonePe Pay API error [{response.status_code}]: {response.text[:300]}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"PhonePe gateway error: {res_json.get('message', 'Failed to generate payment link.')}"
+                detail=f"PhonePe gateway error: {err_msg}",
             )
         except HTTPException:
             raise
         except Exception as exc:
-            logger.error(f"HTTP Connection to PhonePe failed: {str(exc)}")
+            logger.error(f"PhonePe HTTP connection failed: {exc}")
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Connection to payment gateway failed."
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Connection to payment gateway failed.",
             )
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Payment Status Check (polling / verify-status endpoint)
+    # ─────────────────────────────────────────────────────────────────────────
+
     async def get_transaction_status(self, transaction_id: str) -> dict:
-        """
-        Queries PhonePe V2 API to check payment status.
-        """
+        """Query PhonePe V2 API to check payment status."""
         if self.is_mock:
             if transaction_id.startswith("fail_"):
                 return {"status": "FAILED", "gateway_payment_id": None}
             return {"status": "SUCCESS", "gateway_payment_id": f"pay_mock_{transaction_id}"}
 
         token = await self._get_oauth_token()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"O-Bearer {token}"
-        }
+        headers = {"Content-Type": "application/json", "Authorization": f"O-Bearer {token}"}
+        if self.merchant_id:
+            headers["X-MERCHANT-ID"] = self.merchant_id
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(
-                    f"{self.base_url}/checkout/v2/order/{transaction_id}/status?details=true&errorContext=true",
+                    f"{self.base_url}/checkout/v2/order/{transaction_id}/status"
+                    "?details=true&errorContext=true",
                     headers=headers,
-                    timeout=10.0
                 )
-            
+
             res_json = response.json()
             if response.status_code == 200:
-                state = res_json.get("state")
-                
-                # Retrieve transaction ID/payment ID if completed
+                state = str(res_json.get("state") or "").upper()
                 gateway_payment_id = None
                 payment_details = res_json.get("paymentDetails", [])
-                if payment_details and isinstance(payment_details, list):
+                if isinstance(payment_details, list):
                     for detail in payment_details:
-                        if detail.get("status") == "SUCCESS":
-                            gateway_payment_id = detail.get("pgTransactionId") or detail.get("cfTransactionId")
+                        det_status = str(detail.get("status") or detail.get("state") or "").upper()
+                        if det_status in ("SUCCESS", "COMPLETED"):
+                            gateway_payment_id = (
+                                detail.get("transactionId")
+                                or detail.get("pgTransactionId")
+                                or detail.get("cfTransactionId")
+                            )
                             break
-                    if not gateway_payment_id and len(payment_details) > 0:
-                        gateway_payment_id = payment_details[0].get("pgTransactionId")
+                    if not gateway_payment_id and payment_details:
+                        gateway_payment_id = (
+                            payment_details[0].get("transactionId")
+                            or payment_details[0].get("pgTransactionId")
+                        )
 
                 if state == "COMPLETED":
-                    return {"status": "SUCCESS", "gateway_payment_id": gateway_payment_id or transaction_id}
+                    return {"status": "SUCCESS", "gateway_payment_id": gateway_payment_id or res_json.get("orderId") or transaction_id}
                 elif state == "PENDING":
                     return {"status": "PENDING", "gateway_payment_id": gateway_payment_id}
                 else:
                     return {"status": "FAILED", "gateway_payment_id": gateway_payment_id}
-            
-            logger.warning(f"PhonePe Status query returned error code for {transaction_id}: {response.text}")
+
+            logger.warning(f"PhonePe status query error for {transaction_id}: {response.text[:200]}")
             return {"status": "PENDING", "gateway_payment_id": None}
         except Exception as exc:
-            logger.error(f"PhonePe Status check connection failed: {str(exc)}")
+            logger.error(f"PhonePe status check failed: {exc}")
             return {"status": "PENDING", "gateway_payment_id": None}
 
-    def verify_webhook_signature(self, base64_response: str, received_signature: str) -> bool:
-        """
-        Verify the signature of the webhook callback.
+    # ─────────────────────────────────────────────────────────────────────────
+    # Webhook Signature Verification
+    # PhonePe v2 supports two webhook auth modes:
+    #   1. HMAC  → headers: x-phonepe-checksum-signature + x-phonepe-checksum-key-id
+    #   2. SHA   → header: x-verify (legacy v1 format)
+    # We verify both so the endpoint works regardless of which mode is set in dashboard.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def verify_webhook_signature(
+        self,
+        raw_body: bytes,
+        x_verify: Optional[str] = None,
+        x_hmac_signature: Optional[str] = None,
+        x_hmac_key_id: Optional[str] = None,
+        auth_header: Optional[str] = None,
+        # legacy base64 response parameter (kept for backward compat callers)
+        base64_response: Optional[str] = None,
+    ) -> bool:
+        """Verify incoming PhonePe webhook authenticity.
+
+        Priority order:
+        1. HMAC (x-phonepe-checksum-signature)  — recommended by PhonePe v2 dashboard
+        2. SHA Basic Auth (Authorization)        — dashboard SHA option
+        3. SHA x-verify                         — legacy format still used by some accounts
+        4. MOCK mode                             — always returns True
         """
         if self.is_mock:
             return True
-            
-        if not received_signature:
-            return False
-            
-        import hashlib
-        try:
-            # Formula: SHA256(base64_response + salt_key) + "###" + salt_index
-            string_to_hash = base64_response + self.client_secret
-            hashed = hashlib.sha256(string_to_hash.encode('utf-8')).hexdigest()
-            expected_signature = f"{hashed}###{self.client_version}"
-            return expected_signature == received_signature
-        except Exception as e:
-            logger.error(f"Error verifying PhonePe webhook signature: {e}")
-            return False
+
+        # ── 1. HMAC mode ──────────────────────────────────────────────────────
+        if x_hmac_signature:
+            # Use salt_key as the HMAC secret (stored as PHONEPE_SALT_KEY env var)
+            # or fall back to client_secret if salt_key is not configured
+            hmac_secret = self.salt_key or self.client_secret
+            if not hmac_secret:
+                logger.error("PhonePe HMAC verification: no secret key configured (PHONEPE_SALT_KEY / PHONEPE_CLIENT_SECRET)")
+                return False
+            try:
+                computed = hmac.new(
+                    key=hmac_secret.encode("utf-8"),
+                    msg=raw_body,
+                    digestmod=hashlib.sha256,
+                ).hexdigest()
+                result = hmac.compare_digest(computed.lower(), x_hmac_signature.strip().lower())
+                if not result:
+                    logger.warning(
+                        f"PhonePe HMAC mismatch. KeyID={x_hmac_key_id} "
+                        f"Expected={computed[:16]}… Got={x_hmac_signature[:16]}…"
+                    )
+                return result
+            except Exception as exc:
+                logger.error(f"PhonePe HMAC verification error: {exc}")
+                return False
+
+        # ── 2. SHA / Basic Auth mode ──────────────────────────────────────────
+        if auth_header:
+            wh_user = settings.PHONEPE_WEBHOOK_USERNAME
+            wh_pass = settings.PHONEPE_WEBHOOK_PASSWORD
+            if wh_user and wh_pass:
+                try:
+                    auth_clean = auth_header.strip()
+                    # Check Basic auth
+                    if auth_clean.startswith("Basic "):
+                        expected_basic = "Basic " + base64.b64encode(f"{wh_user}:{wh_pass}".encode("utf-8")).decode("utf-8")
+                        if hmac.compare_digest(expected_basic, auth_clean):
+                            return True
+                    # Check SHA256(username:password)
+                    expected_sha = hashlib.sha256(f"{wh_user}:{wh_pass}".encode("utf-8")).hexdigest()
+                    if hmac.compare_digest(expected_sha.lower(), auth_clean.lower()):
+                        return True
+                    # Check SHA256(username:password:raw_body)
+                    expected_body_sha = hashlib.sha256(f"{wh_user}:{wh_pass}".encode("utf-8") + raw_body).hexdigest()
+                    if hmac.compare_digest(expected_body_sha.lower(), auth_clean.lower()):
+                        return True
+                except Exception as exc:
+                    logger.error(f"PhonePe SHA auth verification error: {exc}")
+                    return False
+
+        # ── 3. SHA x-verify (legacy) ──────────────────────────────────────────
+        sig = x_verify
+        b64 = base64_response
+        if sig and b64:
+            # Use salt_key if present; otherwise client_secret
+            secret = self.salt_key or self.client_secret
+            if not secret:
+                logger.error("PhonePe x-verify: no secret configured (PHONEPE_SALT_KEY / PHONEPE_CLIENT_SECRET)")
+                return False
+            try:
+                string_to_hash = b64 + secret
+                hashed = hashlib.sha256(string_to_hash.encode("utf-8")).hexdigest()
+                expected = f"{hashed}###{self.salt_index}"
+                result = hmac.compare_digest(expected.lower(), sig.strip().lower())
+                if not result:
+                    logger.warning(
+                        f"PhonePe x-verify mismatch. Expected={expected[:20]}… Got={sig[:20]}…"
+                    )
+                return result
+            except Exception as exc:
+                logger.error(f"PhonePe x-verify error: {exc}")
+                return False
+
+        # No signature headers present at all
+        logger.warning("PhonePe webhook received with no recognized signature headers.")
+        return False
+
 
 phonepe_service = PhonePeService()
