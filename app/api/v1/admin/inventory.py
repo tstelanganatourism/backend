@@ -1128,8 +1128,7 @@ async def generate_transport_inventory(
                 else:
                     opt_count = int(opt.capacity or 1)
                 t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
-                is_shared = t_type_str != 'SEPARATE_VEHICLE'
-                total_capacity = (opt_count * (opt.capacity or 1)) if is_shared else opt_count
+                total_capacity = opt_count
                 sse_payload = {
                     "version": int(time.time() * 1000),
                     "timestamp": get_ist_now().isoformat(),
@@ -1262,19 +1261,14 @@ async def update_transport_inventory_slot(
     if payload.capacity is not None:
         opt.capacity = payload.capacity
 
-    if payload.available_count is not None or payload.capacity is not None:
-        new_avail = payload.available_count if payload.available_count is not None else row.available_count
-        new_cap = opt.capacity or 1
-        
-        total_capacity_new = (new_avail * new_cap) if is_shared else new_avail
-        if total_capacity_new < row.booked_count:
+    if payload.available_count is not None:
+        new_avail = payload.available_count
+        if new_avail < row.booked_count:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot set available_count ({new_avail}) and capacity ({new_cap}) as it results in {total_capacity_new} seats/vehicles, which is below already booked ({row.booked_count})",
+                detail=f"Cannot set available_count ({new_avail}) below already booked ({row.booked_count})",
             )
-        
-        if payload.available_count is not None:
-            row.available_count = payload.available_count
+        row.available_count = new_avail
 
     if payload.is_closed is not None:
         row.is_closed = payload.is_closed
@@ -1673,17 +1667,13 @@ async def bulk_action_transport_inventory(
             if str(row.transport_option_id) in payload.option_counts:
                 new_capacity = int(payload.option_counts[str(row.transport_option_id)])
                 if row.available_count != new_capacity:
-                    opt = next((o for o in opts if o.id == row.transport_option_id), None)
-                    if opt:
-                        t_type = opt.type.value if hasattr(opt.type, "value") else str(opt.type)
-                        is_shared = t_type != "SEPARATE_VEHICLE"
-                        new_cap = opt.capacity or 1
-                        total_capacity_new = (new_capacity * new_cap) if is_shared else new_capacity
-                        if total_capacity_new < row.booked_count:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Cannot set vehicles to {new_capacity} on {row.date} for {opt.title} as it results in {total_capacity_new} capacity, below already booked ({row.booked_count})."
-                            )
+                    if new_capacity < row.booked_count:
+                        opt = next((o for o in opts if o.id == row.transport_option_id), None)
+                        title = opt.title if opt else "transport"
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot set capacity to {new_capacity} on {row.date} for {title} as it is below already booked ({row.booked_count})."
+                        )
                     row.available_count = new_capacity
                     modified = True
         elif payload.action == BulkActionType.OPEN:
@@ -1743,15 +1733,12 @@ async def bulk_action_transport_inventory(
                     if not opt:
                         continue
                     is_deleted = row.deleted_at is not None
-                    t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
-                    is_shared = t_type_str != 'SEPARATE_VEHICLE'
-                    
                     if is_deleted:
                         remaining = 0
                         is_closed = True
                         price_override = None
                     else:
-                        total_capacity = (row.available_count * (opt.capacity or 1)) if is_shared else row.available_count
+                        total_capacity = row.available_count
                         remaining = max(0, total_capacity - row.booked_count)
                         is_closed = row.is_closed
                         price_override = row.price_override

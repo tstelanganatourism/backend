@@ -194,8 +194,7 @@ class TransportInventoryRow(AppBaseModel):
     @classmethod
     def from_orm_with_option(cls, row, option) -> "TransportInventoryRow":
         t_type = str(option.type.value) if hasattr(option.type, 'value') else str(option.type)
-        is_shared = t_type != 'SEPARATE_VEHICLE'
-        total_capacity = (row.available_count * (option.capacity or 1)) if is_shared else row.available_count
+        total_capacity = row.available_count
         
         return cls(
             id=row.id,

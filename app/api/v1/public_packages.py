@@ -705,15 +705,6 @@ async def get_package_availability(
         option_ids = [opt.id for opt in transport_options]
         
         if option_ids:
-            # Pre-calculate capacity multipliers
-            opt_info = {}
-            for opt in transport_options:
-                t_type = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
-                opt_info[opt.id] = {
-                    "is_shared": t_type != 'SEPARATE_VEHICLE',
-                    "capacity": opt.capacity or 1
-                }
-                
             trans_inv_result = await db.execute(
                 select(PackageTransportInventory).where(
                     and_(
@@ -725,8 +716,7 @@ async def get_package_availability(
                 )
             )
             for row in trans_inv_result.scalars().all():
-                info = opt_info.get(row.transport_option_id, {"is_shared": True, "capacity": 1})
-                total_capacity = (row.available_count * info["capacity"]) if info["is_shared"] else row.available_count
+                total_capacity = row.available_count
                 
                 transport_inv_map.setdefault(row.date, []).append({
                     "option_id": row.transport_option_id,

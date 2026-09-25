@@ -519,7 +519,7 @@ async def checkout(
                     inv_row.booked_count += sel.quantity
                 else:  # SHARED — consume passenger seats
                     seats_needed = student_count if is_student_pkg else (adult_count + child_count)
-                    total_seats = inv_row.available_count * (t_opt.capacity or 1)
+                    total_seats = inv_row.available_count
                     remaining = total_seats - inv_row.booked_count
                     if seats_needed > remaining and not is_admin:
                         raise HTTPException(

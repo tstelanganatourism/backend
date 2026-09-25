@@ -130,11 +130,8 @@ async def broadcast_transport_update(db, transport_option_id: int, travel_date):
         )
     )
     
-    t_type_str = opt.type.value if hasattr(opt.type, 'value') else str(opt.type)
-    is_shared = t_type_str != 'SEPARATE_VEHICLE'
-    
     if inv_row:
-        total_capacity = (inv_row.available_count * (opt.capacity or 1)) if is_shared else inv_row.available_count
+        total_capacity = inv_row.available_count
         remaining = max(0, total_capacity - inv_row.booked_count)
         is_closed = inv_row.is_closed
         price_override = inv_row.price_override
