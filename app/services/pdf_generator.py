@@ -219,8 +219,9 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         ticket_url = f"{frontend_url}/print/ticket/{booking.public_id}?secret={signature}"
 
         # Resolve payment state
+        from decimal import Decimal
         if is_fully_paid is None:
-            is_fully_paid = booking.remaining_balance <= 0 or booking.status == BookingStatus.FULLY_PAID
+            is_fully_paid = (booking.remaining_balance <= Decimal("0.01") or booking.status == BookingStatus.FULLY_PAID)
 
         # Mark ticket/invoice statuses as AVAILABLE immediately — the print pages are
         # always live because they are server-rendered React pages, not R2 files.

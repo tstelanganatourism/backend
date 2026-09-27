@@ -20,6 +20,7 @@ from app.utils.pricing import get_effective_package_prices
 router = APIRouter(
     prefix="/bookings",
     tags=["Admin - Bookings"],
+    dependencies=[Depends(require_admin)]
 )
 
 
@@ -527,12 +528,6 @@ async def admin_create_booking(
         
         # Transport pricing & inventory verification for admin direct booking
         transport_snapshot_items = []
-        if variant.package.has_transport and not request.transport_selections:
-            raise HTTPException(
-                status_code=400,
-                detail="Transport selection is mandatory for this package."
-            )
-
         if request.transport_selections:
             from app.models.package import PackageTransportOption as PTO, PackageTransportInventory as PTI
             pkg_res_for_transport = await db.execute(
@@ -929,22 +924,6 @@ async def admin_create_booking(
         for sd in stay_dates:
             db.add(BookingStayDate(booking_id=booking.id, date=sd))
 
-    # Record initial payment in payments ledger if paid_amount / amount_paid > 0
-    effective_paid_amount = getattr(request, 'paid_amount', None) or getattr(request, 'amount_paid', None)
-    if effective_paid_amount and Decimal(str(effective_paid_amount)) > 0:
-        from app.models.payment import Payment
-        from app.models.enums import PaymentStatus
-        init_payment = Payment(
-            booking_id=booking.id,
-            amount=Decimal(str(effective_paid_amount)),
-            payment_method=getattr(request, 'payment_method', None) or "ADMIN_MANUAL",
-            status=PaymentStatus.CAPTURED,
-            collected_by_type="ADMIN_MANUAL",
-            collected_by_label=f"Admin ({current_admin.full_name or 'Staff'})",
-            payment_reference_id=f"ADMIN_{booking.public_id}_{int(asyncio.get_event_loop().time()*1000)}"
-        )
-        db.add(init_payment)
-
     # Extract phone and name for SMS before commit
     sms_phone = None
     sms_cust_name = "Customer"
@@ -995,8 +974,9 @@ async def admin_create_booking(
         try:
             from app.services.pdf_generator import process_post_booking_documents_task
             from app.db.session import AsyncSessionLocal
+            is_fully_paid_val = (booking.status == BookingStatus.FULLY_PAID or booking.remaining_balance <= Decimal("0.01"))
             async with AsyncSessionLocal() as bg_db:
-                await process_post_booking_documents_task({"db": bg_db}, b_id, is_fully_paid=True)
+                await process_post_booking_documents_task({"db": bg_db}, b_id, is_fully_paid=is_fully_paid_val)
             logger.info(f"Successfully generated documents and dispatched emails for admin booking {p_id}")
         except Exception as e:
             logger.error(f"Error processing post-booking documents and emails for {p_id}: {e}")
