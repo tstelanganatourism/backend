@@ -99,7 +99,8 @@ async def send_admin_booking_notification(
                 # Try to get hotel name from inventory or snapshot
                 inv_hotel_name = pricing.get("hotel_name")
                 if room_data:
-                    target_name = f"{inv_hotel_name or room_data[0]} ({room_data[3]})"
+                    # Room type (variant) is primary; hotel/lodge name is context
+                    target_name = f"{room_data[3]} — {inv_hotel_name or room_data[0]}"
                     hotel_address_admin = pricing.get("hotel_address") or room_data[1]
                     hotel_map_url_admin = pricing.get("hotel_map_url") or room_data[2]
                 
@@ -123,7 +124,8 @@ async def send_admin_booking_notification(
                     inv_row = inv_res.scalars().first()
                     if inv_row:
                         if inv_row.hotel_name and room_data:
-                            target_name = f"{inv_row.hotel_name} ({room_data[3]})"
+                            # variant_name (room type) is primary, hotel name is context
+                            target_name = f"{room_data[3]} — {inv_row.hotel_name}"
                         if inv_row.hotel_address:
                             hotel_address_admin = inv_row.hotel_address
                         if inv_row.hotel_map_url:

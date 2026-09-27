@@ -341,12 +341,14 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
                 res = await db.execute(select(Room.lodge_name, Room.address, Room.map_url, RoomVariant.variant_name).join(RoomVariant).where(RoomVariant.id == booking.room_variant_id))
                 room_data = res.first()
                 if inv_row and inv_row.hotel_name:
-                    target_name = f"{inv_row.hotel_name} — {room_data[0]} ({room_data[3]})" if room_data else inv_row.hotel_name
+                    # Room type (variant) is primary; hotel name is secondary context
+                    target_name = f"{room_data[3]} — {inv_row.hotel_name}" if room_data else inv_row.hotel_name
                     hotel_address = inv_row.hotel_address or (room_data[1] if room_data else None)
                     hotel_map_url = inv_row.hotel_map_url or (room_data[2] if room_data else None)
                 else:
                     if room_data:
-                        target_name = f"{room_data[0]} ({room_data[3]})"
+                        # variant_name first, lodge_name as context
+                        target_name = f"{room_data[3]} — {room_data[0]}"
                         hotel_address = room_data[1]
                         hotel_map_url = room_data[2]
                 
@@ -407,8 +409,8 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
         # Derive travel date and reporting details
         travel_date_str = booking.travel_date.strftime("%d %B %Y")
         reporting_str = room_checkin_time if is_room_booking else reporting_time
-        location_label = "Lodge / Stay Address" if is_room_booking else "Boarding Point"
-        location_val = hotel_name if is_room_booking else boarding_title
+        location_label = "Room Type / Property" if is_room_booking else "Boarding Point"
+        location_val = target_name if is_room_booking else boarding_title
 
         # Passenger summary
         pax_summary_list = [p.full_name for p in booking.passengers]
