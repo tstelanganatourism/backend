@@ -67,7 +67,7 @@ async def ttl_cache_get_or_set(
                 return value
             redis_available = True
         except Exception:
-            _redis_circuit_until = time.monotonic() + 30.0
+            _redis_circuit_until = time.monotonic() + 5.0
             redis_available = False
 
     # 3. Cache miss: Execute factory (DB query)

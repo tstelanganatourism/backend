@@ -28,12 +28,12 @@ bearer_scheme_optional = HTTPBearer(auto_error=False)
 
 async def get_current_user_optional(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme_optional),
-    db: AsyncSession = Depends(get_db),
 ) -> Optional[User]:
     """
     Optionally fetch the current authenticated user if the Bearer token is provided.
     If a token is provided but is invalid/expired, it raises a 401 so the frontend
     can trigger a token refresh, rather than silently failing to anonymous.
+    Does NOT open a DB session if no credentials are present (saving network DB overhead).
     """
     if not credentials:
         return None
@@ -58,16 +58,16 @@ async def get_current_user_optional(
         )
         
     user_id: int = int(payload["sub"])
-    user = await get_user_by_id(db, user_id)
-    
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User account not found.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-        
-    return user
+    from app.db.session import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_id(db, user_id)
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User account not found.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user
 
 
 async def get_current_user(

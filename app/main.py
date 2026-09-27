@@ -24,7 +24,8 @@ async def _periodic_draft_cleanup():
 
 
 async def _periodic_daily_cutoff():
-    """Runs on startup and every 5 minutes to trigger 6 AM inventory cutoff and dispatch travel day SMS reminders."""
+    """Runs after startup and every 5 minutes to trigger 6 AM inventory cutoff and dispatch travel day SMS reminders."""
+    await asyncio.sleep(5)
     while True:
         try:
             from app.workers.daily_cutoff import perform_daily_cutoff
@@ -40,7 +41,8 @@ async def _periodic_daily_cutoff():
 
 
 async def _periodic_missed_emails():
-    """Runs on startup and every 15 minutes to recover any missed customer or admin emails."""
+    """Runs after startup and every 15 minutes to recover any missed customer or admin emails."""
+    await asyncio.sleep(10)
     while True:
         try:
             from app.workers.missed_emails import recover_missed_emails
@@ -58,10 +60,35 @@ async def _periodic_missed_emails():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
+    # Warmup database connection pool & Redis to eliminate cold-start latencies
+    try:
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await session.execute(sqlalchemy.text("SELECT 1"))
+        logger.info("Database pool warmed up successfully.")
+    except Exception as e:
+        logger.warning(f"Database warmup warning: {e}")
+
+    try:
+        from app.services.redis_client import get_redis_raw
+        r = get_redis_raw()
+        await asyncio.wait_for(r.ping(), timeout=1.0)
+        logger.info("Redis connection warmed up successfully.")
+    except Exception as e:
+        logger.warning(f"Redis warmup warning: {e}")
+
     cleanup_task = asyncio.create_task(_periodic_draft_cleanup())
     cutoff_task = asyncio.create_task(_periodic_daily_cutoff())
     missed_emails_task = asyncio.create_task(_periodic_missed_emails())
-    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery.")
+    
+    # Warmup memory cache for packages and rooms to deliver < 1ms TTFB
+    try:
+        from app.services.cache_warmer import warmup_public_cache
+        asyncio.create_task(warmup_public_cache())
+    except Exception as e:
+        logger.warning(f"Failed to schedule cache warmup: {e}")
+
+    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery, memory cache warmer.")
 
     yield
 
@@ -292,6 +319,11 @@ async def rate_limit_middleware(request: Request, call_next):
 
     return await call_next(request)
 # -----------------------------------------------------------------------------
+
+@app.get("/ping")
+async def ping():
+    """Zero-overhead liveness ping for Render keep-alive (0 DB, 0 Redis, < 0.1ms)."""
+    return {"status": "ok"}
 
 @app.get("/health")
 async def health_check():

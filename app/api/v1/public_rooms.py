@@ -41,7 +41,6 @@ class RoomAvailabilityResponse(BaseModel):
 @router.get("", response_model=PaginatedResponse[RoomListDTO])
 async def get_rooms(
     response: Response,
-    db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Items per page"),
     is_featured: Optional[bool] = Query(None, description="Filter featured only"),
@@ -54,10 +53,18 @@ async def get_rooms(
     Returns a paginated list of active rooms/lodges.
     """
     cache_key = f"rooms:list:{page}:{size}:{is_featured}:{tuple(facilities or [])}:{sort}:{q or ''}"
-    set_public_cache_headers(response)
+    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
+
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    mem_key = f"{page}:{size}:{is_featured}:{tuple(facilities or [])}:{sort}:{q or ''}"
+    cached_mem = get_mem_cached("rooms_list", mem_key)
+    if cached_mem is not None:
+        return cached_mem
 
     async def load_rooms() -> PaginatedResponse[RoomListDTO]:
-        offset = (page - 1) * size
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            offset = (page - 1) * size
 
         # Base Query (Only PUBLISHED and ACTIVE rooms)
         base_query = select(Room).where(
@@ -224,7 +231,7 @@ async def get_room_category(
         raise HTTPException(status_code=404, detail="Room category not found")
     rooms_dto = []
     for room in cat.rooms:
-        if not (room.is_active and room.status == PublishStatus.PUBLISHED and not room.deleted_at):
+        if not (room.status == PublishStatus.PUBLISHED and not room.deleted_at):
             continue
         rooms_dto.append(RoomListDTO(
             id=room.id, slug=room.slug, lodge_name=room.lodge_name,
@@ -265,7 +272,12 @@ async def get_room_detail(
     Returns full details for a specific room including rich content.
     """
     cache_key = f"rooms:detail:{slug}"
-    set_public_cache_headers(response)
+    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
+
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    cached_mem = get_mem_cached("room_detail", slug.lower())
+    if cached_mem is not None:
+        return cached_mem
 
     async def load_room_detail() -> RoomDetailDTO:
         query = (
@@ -353,7 +365,9 @@ async def get_room_detail(
             policies=r_policies
         )
 
-    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_room_detail)
+    res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_room_detail)
+    set_mem_cached("room_detail", slug.lower(), res, ttl_seconds=3600)
+    return res
 
 
 @router.get("/{slug}/availability", response_model=RoomAvailabilityResponse)

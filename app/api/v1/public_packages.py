@@ -39,7 +39,6 @@ def has_text(value: object) -> bool:
 @router.get("", response_model=PaginatedResponse[PackageListDTO])
 async def get_packages(
     response: Response,
-    db: AsyncSession = Depends(get_db),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Items per page"),
     type: Optional[str] = Query(None, description="Filter by TOUR or TRIP (also supports boat_ride, sightseeing)"),
@@ -58,8 +57,16 @@ async def get_packages(
     cache_key = f"packages:list:{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}"
     set_public_cache_headers(response)
 
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    mem_key = f"{page}:{size}:{type}:{region}:{is_featured}:{tuple(tags or [])}:{place or ''}:{sort}:{q or ''}:{getattr(current_user, 'role', 'public')}"
+    cached_mem = get_mem_cached("packages_list", mem_key)
+    if cached_mem is not None:
+        return cached_mem
+
     async def load_packages() -> PaginatedResponse[PackageListDTO]:
-        offset = (page - 1) * size
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            offset = (page - 1) * size
 
         # Base Query (Only PUBLISHED packages)
         base_query = select(Package).where(
@@ -239,19 +246,19 @@ async def list_package_categories(
     categories = result.scalars().all()
     out = []
     for cat in categories:
-        active_pkgs = [
+        published_pkgs = [
             p for p in cat.packages
-            if p.is_active and p.status == PublishStatus.PUBLISHED and not p.deleted_at
+            if p.status == PublishStatus.PUBLISHED and not p.deleted_at
         ]
-        pkg_count = len(active_pkgs)
-        prices = [p.starting_price for p in active_pkgs if p.starting_price and p.starting_price > 0]
+        pkg_count = len(published_pkgs)
+        prices = [p.starting_price for p in published_pkgs if p.starting_price and p.starting_price > 0]
         min_price = float(min(prices)) if prices else None
         
         cover_image = cat.cover_image_url
         if not cover_image:
             cover_image = DEFAULT_CATEGORY_IMAGES.get(cat.slug)
-        if not cover_image and active_pkgs:
-            for p in active_pkgs:
+        if not cover_image and published_pkgs:
+            for p in published_pkgs:
                 if p.cover_image_url:
                     cover_image = p.cover_image_url
                     break
@@ -300,7 +307,7 @@ async def get_package_category(
         raise HTTPException(status_code=404, detail="Category not found")
     packages_dto = []
     for pkg in cat.packages:
-        if not (pkg.is_active and pkg.status == PublishStatus.PUBLISHED and not pkg.deleted_at):
+        if not (pkg.status == PublishStatus.PUBLISHED and not pkg.deleted_at):
             continue
         active_variants = [v for v in pkg.variants if v.is_active and not v.deleted_at]
         packages_dto.append(PackageListDTO(
@@ -336,117 +343,131 @@ async def get_package_category(
     return res_dto
 
 
+PACKAGE_SLUG_ALIASES = {
+    "rajahmundry-to-papikondalu-bhadrachalam-package": "rajahmundry-bhadrachalam-1-day-drop-package",
+    "bhadrachalam-to-papikondalu-boat-rajahmundry-package": "bhadrachalam-to-rajahmundry-1-day-drop-package",
+    "bhadrachalam-to-papikondalu-one-day-tour": "bhadrachalam-to-papikondalu-1-day-tour-package",
+    "bhadrachalam-to-papikondalu-one-day-package": "bhadrachalam-to-papikondalu-1-day-tour-package",
+    "bhadrachalam-to-papikondalu-maredumilli-2-days": "maredumilli-bhadrachalam-papikondalu",
+    "bhadrachalam-to-papikondalu-maredumilli-resort-package-2days": "maredumilli-bhadrachalam-papikondalu",
+    "pochavaram-to-papikondalu-1-day-boat-tour-package": "papikondalu-premium-tour",
+    "pochavaram-to-papikondalu-only-boat-point-package": "papikondalu-premium-tour",
+}
+
 @router.get("/{slug}", response_model=PackageDetailDTO)
 async def get_package_detail(
     slug: str,
     response: Response,
-    db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
     """
     Public Package Detail API.
     Returns full details for a specific package, including all content sections.
+    Supports backward-compatible slug resolution via PACKAGE_SLUG_ALIASES.
     """
+    resolved_slug = PACKAGE_SLUG_ALIASES.get(slug.lower(), slug.lower())
     is_agent = current_user is not None and current_user.role == UserRole.AGENT
     if is_agent:
-        cache_key = f"packages:detail:{slug}:agent:{current_user.id}"
+        cache_key = f"packages:detail:{resolved_slug}:agent:{current_user.id}"
         set_no_store_headers(response)
     else:
-        cache_key = f"packages:detail:{slug}"
-        set_public_cache_headers(response)
+        cache_key = f"packages:detail:{resolved_slug}"
+        set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
+
+    import time
+    t_start = time.perf_counter()
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    mem_key = f"{resolved_slug}:{is_agent}:{getattr(current_user, 'id', 0)}"
+    cached_mem = get_mem_cached("package_detail", mem_key) or (get_mem_cached("package_detail", resolved_slug) if not is_agent else None)
+    if cached_mem is not None:
+        logger.info(f"get_package_detail cache HIT for {resolved_slug} in {(time.perf_counter()-t_start)*1000:.2f}ms")
+        return cached_mem
 
     async def load_package_detail() -> PackageDetailDTO:
-        query = (
-            select(Package)
-            .where(
-                func.lower(Package.slug) == slug.lower(),
-                Package.status == PublishStatus.PUBLISHED,
-                Package.deleted_at.is_(None)
-            )
-        )
-        
-        pkg = (await db.execute(query)).unique().scalar_one_or_none()
-        
-        if not pkg:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Package not found or inactive"
-            )
-
-        import asyncio
-        from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption, PackageMealItem, PackageExtra
-
-        # Fetch all relationships concurrently to eliminate sequential roundtrips
-        async def fetch_rel(model, active_filter=None):
-            q = select(model).where(model.package_id == pkg.id)
-            if active_filter is not None:
-                q = q.where(active_filter)
-            return (await db.execute(q)).scalars().all()
-
-        results = await asyncio.gather(
-            fetch_rel(PackageVariant, and_(PackageVariant.is_active == True, PackageVariant.deleted_at == None)),
-            fetch_rel(PackageGalleryImage),
-            fetch_rel(PackageItineraryDay),
-            fetch_rel(PackageHighlight),
-            fetch_rel(PackageInclusion),
-            fetch_rel(PackageExclusion),
-            fetch_rel(PackageBoardingPoint),
-            fetch_rel(PackageFAQ),
-            fetch_rel(PackagePolicy),
-            fetch_rel(PackageTransportOption),
-            fetch_rel(PackageMealItem),
-            fetch_rel(PackageExtra),
-        )
-
-        pkg_variants = results[0]
-        # For tags, we must join the association table
-        tags_query = select(Tag).join(package_tags).where(package_tags.c.package_id == pkg.id, Tag.is_active == True)
-        pkg_tags = (await db.execute(tags_query)).scalars().all()
-        
-        pkg_gallery = results[1]
-        pkg_itinerary = results[2]
-        pkg_highlights = results[3]
-        pkg_inclusions = results[4]
-        pkg_exclusions = results[5]
-        pkg_boarding_points = results[6]
-        pkg_faqs = results[7]
-        pkg_policies = results[8]
-        pkg_transport_options = results[9]
-        pkg_meals = results[10]
-        pkg_extras = results[11]
-            
-        if pkg.is_student_package:
-            starting_price = min((v.student_price for v in pkg_variants if v.student_price is not None), default=None)
-        else:
-            starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
-        
-        active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
-
-        # Agent Quota & Commission details if agent is logged in
-        agent_comm_type = None
-        agent_comm_pct = None
-        agent_comm_fixed = None
-        agent_quota_val = None
-        agent_allowed_val = None
-        
-        if is_agent:
-            from app.models.user import AgentPackageQuota
-            quota_res = await db.execute(
-                select(AgentPackageQuota).where(
-                    AgentPackageQuota.agent_id == current_user.id,
-                    AgentPackageQuota.package_id == pkg.id
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as db:
+            query = (
+                select(Package)
+                .where(
+                    or_(
+                        func.lower(Package.slug) == resolved_slug,
+                        func.lower(Package.slug) == slug.lower()
+                    ),
+                    Package.status == PublishStatus.PUBLISHED,
+                    Package.deleted_at.is_(None)
                 )
             )
-            q_row = quota_res.scalar_one_or_none()
-            agent_comm_type = (q_row.commission_type if (q_row and q_row.commission_type) else None) or current_user.commission_type or "PERCENTAGE"
-            agent_comm_pct = (q_row.commission_percentage if (q_row and q_row.commission_percentage is not None) else None)
-            if agent_comm_pct is None:
-                agent_comm_pct = current_user.commission_percentage
-            agent_comm_fixed = (q_row.commission_fixed_amount if (q_row and q_row.commission_fixed_amount is not None) else None)
-            if agent_comm_fixed is None:
-                agent_comm_fixed = current_user.commission_fixed_amount
-            agent_quota_val = q_row.daily_quota if q_row else 10
-            agent_allowed_val = q_row.is_allowed if q_row else True
+            
+            pkg = (await db.execute(query)).unique().scalar_one_or_none()
+            
+            if not pkg:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Package not found or inactive"
+                )
+
+            from app.models.package import PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption, PackageMealItem, PackageExtra
+
+            vq = select(PackageVariant).where(PackageVariant.package_id == pkg.id, PackageVariant.is_active == True, PackageVariant.deleted_at == None)
+            gq = select(PackageGalleryImage).where(PackageGalleryImage.package_id == pkg.id, PackageGalleryImage.deleted_at == None)
+            iq = select(PackageItineraryDay).where(PackageItineraryDay.package_id == pkg.id, PackageItineraryDay.deleted_at == None)
+            hq = select(PackageHighlight).where(PackageHighlight.package_id == pkg.id, PackageHighlight.deleted_at == None)
+            inq = select(PackageInclusion).where(PackageInclusion.package_id == pkg.id, PackageInclusion.deleted_at == None)
+            eq = select(PackageExclusion).where(PackageExclusion.package_id == pkg.id, PackageExclusion.deleted_at == None)
+            bq = select(PackageBoardingPoint).where(PackageBoardingPoint.package_id == pkg.id, PackageBoardingPoint.deleted_at == None)
+            fq = select(PackageFAQ).where(PackageFAQ.package_id == pkg.id, PackageFAQ.deleted_at == None)
+            pq = select(PackagePolicy).where(PackagePolicy.package_id == pkg.id, PackagePolicy.deleted_at == None)
+            tq = select(PackageTransportOption).where(PackageTransportOption.package_id == pkg.id, PackageTransportOption.deleted_at == None)
+            mq = select(PackageMealItem).where(PackageMealItem.package_id == pkg.id, PackageMealItem.deleted_at == None)
+            exq = select(PackageExtra).where(PackageExtra.package_id == pkg.id, PackageExtra.deleted_at == None)
+            tagsq = select(Tag).join(package_tags).where(package_tags.c.package_id == pkg.id, Tag.is_active == True)
+
+            pkg_variants = (await db.execute(vq)).scalars().all()
+            pkg_gallery = (await db.execute(gq)).scalars().all()
+            pkg_itinerary = (await db.execute(iq)).scalars().all()
+            pkg_highlights = (await db.execute(hq)).scalars().all()
+            pkg_inclusions = (await db.execute(inq)).scalars().all()
+            pkg_exclusions = (await db.execute(eq)).scalars().all()
+            pkg_boarding_points = (await db.execute(bq)).scalars().all()
+            pkg_faqs = (await db.execute(fq)).scalars().all()
+            pkg_policies = (await db.execute(pq)).scalars().all()
+            pkg_transport_options = (await db.execute(tq)).scalars().all()
+            pkg_meals = (await db.execute(mq)).scalars().all()
+            pkg_extras = (await db.execute(exq)).scalars().all()
+            pkg_tags = (await db.execute(tagsq)).scalars().all()
+                
+            if pkg.is_student_package:
+                starting_price = min((v.student_price for v in pkg_variants if v.student_price is not None), default=None)
+            else:
+                starting_price = min((v.adult_price for v in pkg_variants if v.adult_price is not None), default=None)
+            
+            active_brochure_url = pkg.brochure_pdf_url or pkg.generated_brochure_url
+
+            # Agent Quota & Commission details if agent is logged in
+            agent_comm_type = None
+            agent_comm_pct = None
+            agent_comm_fixed = None
+            agent_quota_val = None
+            agent_allowed_val = None
+            
+            if is_agent:
+                from app.models.user import AgentPackageQuota
+                quota_res = await db.execute(
+                    select(AgentPackageQuota).where(
+                        AgentPackageQuota.agent_id == current_user.id,
+                        AgentPackageQuota.package_id == pkg.id
+                    )
+                )
+                q_row = quota_res.scalar_one_or_none()
+                agent_comm_type = (q_row.commission_type if (q_row and q_row.commission_type) else None) or current_user.commission_type or "PERCENTAGE"
+                agent_comm_pct = (q_row.commission_percentage if (q_row and q_row.commission_percentage is not None) else None)
+                if agent_comm_pct is None:
+                    agent_comm_pct = current_user.commission_percentage
+                agent_comm_fixed = (q_row.commission_fixed_amount if (q_row and q_row.commission_fixed_amount is not None) else None)
+                if agent_comm_fixed is None:
+                    agent_comm_fixed = current_user.commission_fixed_amount
+                agent_quota_val = q_row.daily_quota if q_row else 10
+                agent_allowed_val = q_row.is_allowed if q_row else True
         
         return PackageDetailDTO(
             id=pkg.id,
@@ -560,7 +581,11 @@ async def get_package_detail(
             agent_is_allowed=agent_allowed_val,
         )
 
-    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
+    res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
+    set_mem_cached("package_detail", mem_key, res, ttl_seconds=3600 if not is_agent else 120)
+    if not is_agent:
+        set_mem_cached("package_detail", resolved_slug, res, ttl_seconds=3600)
+    return res
 
 
 @router.get("/{slug}/availability", response_model=PublicPackageAvailabilityResponse)
