@@ -428,17 +428,24 @@ async def _finalize_draft(
     if background_tasks:
         background_tasks.add_task(_enqueue_documents_task_safe, booking.id, booking.public_id, booking.status == BookingStatus.FULLY_PAID)
 
-    # 8. Enqueue confirmation SMS via arq (Zero-DB background task)
-    # get_booking_sms_payload runs NOW while db is still open — no new connection.
-    # dispatch_sms_payload is enqueued to arq/Redis — retried if MSG91 is down.
+    # 8. Enqueue confirmation SMS via arq (Zero-DB background task) with direct fallback
     try:
         await db.flush()
-        from app.services.sms_service import get_booking_sms_payload
+        from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
         from app.worker import get_arq_pool
         sms_payload = await get_booking_sms_payload(booking.id, db)
         if sms_payload:
-            arq_pool = await get_arq_pool()
-            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+            try:
+                arq_pool = await get_arq_pool()
+                if arq_pool:
+                    await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+            except Exception as _arq_err:
+                logger.warning(f"ARQ SMS enqueue skipped for booking {booking.public_id}: {_arq_err}")
+
+            if background_tasks:
+                background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
+            else:
+                asyncio.create_task(dispatch_sms_payload(None, sms_payload))
     except Exception as _sms_err:
         logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 
@@ -526,14 +533,23 @@ async def verify_status(
                 from app.utils.ledger import recompute_booking_ledger
                 booking = await recompute_booking_ledger(booking.id, db)
 
-                # Enqueue SMS via arq (Zero-DB, retried if MSG91 is down)
+                # Enqueue SMS via arq + direct in-process fallback
                 try:
-                    from app.services.sms_service import get_booking_sms_payload
+                    from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
                     from app.worker import get_arq_pool
                     sms_payload = await get_booking_sms_payload(booking.id, db)
                     if sms_payload:
-                        arq_pool = await get_arq_pool()
-                        await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                        try:
+                            arq_pool = await get_arq_pool()
+                            if arq_pool:
+                                await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                        except Exception as _arq_err:
+                            logger.warning(f"ARQ SMS enqueue skipped: {_arq_err}")
+
+                        if background_tasks:
+                            background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
+                        else:
+                            asyncio.create_task(dispatch_sms_payload(None, sms_payload))
                 except Exception as _sms_err:
                     logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 

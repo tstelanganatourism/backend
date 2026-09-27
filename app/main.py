@@ -23,20 +23,55 @@ async def _periodic_draft_cleanup():
             logger.warning(f"Background draft cleanup error: {err}")
 
 
+async def _periodic_daily_cutoff():
+    """Runs on startup and every 5 minutes to trigger 6 AM inventory cutoff and dispatch travel day SMS reminders."""
+    while True:
+        try:
+            from app.workers.daily_cutoff import perform_daily_cutoff
+            await perform_daily_cutoff(None)
+        except asyncio.CancelledError:
+            break
+        except Exception as err:
+            logger.warning(f"Background daily cutoff / travel SMS error: {err}")
+        try:
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            break
+
+
+async def _periodic_missed_emails():
+    """Runs on startup and every 15 minutes to recover any missed customer or admin emails."""
+    while True:
+        try:
+            from app.workers.missed_emails import recover_missed_emails
+            await recover_missed_emails(None)
+        except asyncio.CancelledError:
+            break
+        except Exception as err:
+            logger.warning(f"Background missed emails recovery error: {err}")
+        try:
+            await asyncio.sleep(900)
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────────────
     cleanup_task = asyncio.create_task(_periodic_draft_cleanup())
-    logger.info("Automatic 60s inventory draft cleanup background loop started.")
+    cutoff_task = asyncio.create_task(_periodic_daily_cutoff())
+    missed_emails_task = asyncio.create_task(_periodic_missed_emails())
+    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery.")
 
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    cleanup_task.cancel()
-    try:
-        await cleanup_task
-    except asyncio.CancelledError:
-        pass
+    for task in (cleanup_task, cutoff_task, missed_emails_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     from app.db.session import engine
     await engine.dispose()
     logger.info("Database connection pool disposed gracefully.")

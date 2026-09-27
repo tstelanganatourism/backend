@@ -345,6 +345,11 @@ async def get_booking_sms_payload(
             return None
 
         clean_phone = re.sub(r"\D", "", sms_phone)
+        if len(clean_phone) == 12 and clean_phone.startswith("91"):
+            clean_phone = clean_phone[2:]
+        elif len(clean_phone) > 10:
+            clean_phone = clean_phone[-10:]
+
         if len(clean_phone) != 10:
             logger.warning(f"[SMS payload] Invalid phone '{sms_phone}' for booking {booking_id}.")
             return None

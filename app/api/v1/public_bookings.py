@@ -1193,15 +1193,21 @@ async def checkout(
 
             try:
                 async with __import__('app.db.session', fromlist=['AsyncSessionLocal']).AsyncSessionLocal() as sms_db:
-                    from app.services.sms_service import get_booking_sms_payload
+                    from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
                     from app.worker import get_arq_pool
                     sms_payload = await get_booking_sms_payload(b_id, sms_db)
                     if sms_payload:
-                        arq_pool = await get_arq_pool()
-                        if arq_pool:
-                            await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                        try:
+                            arq_pool = await get_arq_pool()
+                            if arq_pool:
+                                await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                        except Exception as arq_err:
+                            logger.warning(f"ARQ pool skipped for agent SMS: {arq_err}")
+                        
+                        # Direct in-process fallback
+                        await dispatch_sms_payload(None, sms_payload)
             except Exception as sms_err:
-                logger.warning(f"Agent booking SMS enqueue failed for {b_public_id}: {sms_err}")
+                logger.warning(f"Agent booking SMS dispatch failed for {b_public_id}: {sms_err}")
 
         background_tasks.add_task(_agent_booking_documents, booking.id, booking.public_id)
 
