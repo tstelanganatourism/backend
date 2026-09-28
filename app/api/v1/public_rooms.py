@@ -38,6 +38,53 @@ class RoomAvailabilityResponse(BaseModel):
     month: str
     dates: List[RoomDateAvailability]
 
+def format_room_type_title(slug: str, variant_names: List[str], fallback: str = "Deluxe Riverside Stay") -> str:
+    """
+    Business rule: Do NOT expose the backend lodge/hotel vendor name on public discovery.
+    Public discovery must only display the room type/category (e.g. 'Family Mini Suite A/C',
+    '3-Bed', '2-Bed Luxury Suite', 'AC Deluxe Room'). The specific lodge/hotel name is only
+    assigned in inventory or default, and only revealed to users upon booking in their ticket,
+    email, and SMS.
+    """
+    slug_lower = (slug or '').lower()
+    # 1. If slug itself explicitly describes room type (e.g. family-mini-suite-ac)
+    if any(k in slug_lower for k in ['suite', 'deluxe', 'luxury', 'bed', 'cottage', 'hut', 'room']):
+        parts = slug_lower.split('-')
+        clean_parts = []
+        for p in parts:
+            if p in ('ac', 'a/c'):
+                clean_parts.append('A/C')
+            elif p in ('nonac', 'non-ac'):
+                clean_parts.append('Non-A/C')
+            elif p.isdigit():
+                continue
+            else:
+                clean_parts.append(p.capitalize())
+        res = ' '.join(clean_parts).strip()
+        if res:
+            return res
+
+    # 2. Derive from active variant names
+    if variant_names:
+        if len(variant_names) == 1:
+            return variant_names[0]
+        has_suite = any('suite' in v.lower() for v in variant_names)
+        has_deluxe = any('deluxe' in v.lower() for v in variant_names)
+        has_4bed = any('4' in v or 'four' in v.lower() for v in variant_names)
+        has_2bed = any('2' in v or 'two' in v.lower() or 'double' in v.lower() for v in variant_names)
+        has_3bed = any('3' in v or 'three' in v.lower() or 'triple' in v.lower() for v in variant_names)
+
+        if has_suite and has_deluxe:
+            return "Deluxe & Family Suite A/C"
+        if has_2bed and has_4bed:
+            return "2-Bed & 4-Bed A/C Deluxe Room"
+        if has_3bed or has_suite:
+            return "Family Suite & Deluxe A/C"
+        return " / ".join(variant_names[:2])
+
+    return fallback or "Deluxe Riverside Stay"
+
+
 @router.get("", response_model=PaginatedResponse[RoomListDTO])
 async def get_rooms(
     response: Response,
@@ -123,13 +170,30 @@ async def get_rooms(
             total_count = (await db.execute(count_query)).scalar_one()
             rooms = (await db.execute(data_query)).all()
 
+            # Query active variants to determine public room type titles
+            room_ids = [r.id for r in rooms]
+            variant_map = {}
+            if room_ids:
+                v_res = await db.execute(
+                    select(RoomVariant.room_id, RoomVariant.variant_name)
+                    .where(
+                        RoomVariant.room_id.in_(room_ids),
+                        RoomVariant.is_active == True,
+                        RoomVariant.deleted_at.is_(None)
+                    )
+                    .order_by(RoomVariant.id.asc())
+                )
+                for rid, vname in v_res.all():
+                    variant_map.setdefault(rid, []).append(vname)
+
             # Map to DTOs
             dto_list = []
             for r in rooms:
+                display_title = format_room_type_title(r.slug, variant_map.get(r.id, []), r.lodge_name)
                 dto_list.append(RoomListDTO(
                     id=r.id,
                     slug=r.slug,
-                    lodge_name=r.lodge_name,
+                    lodge_name=display_title,
                     cover_image_url=r.cover_image_url,
                     video_url=r.video_url,
                     is_featured=r.is_featured,
@@ -233,8 +297,10 @@ async def get_room_category(
     for room in cat.rooms:
         if not (room.status == PublishStatus.PUBLISHED and not room.deleted_at):
             continue
+        v_names = [v.variant_name for v in room.variants if v.is_active and not v.deleted_at]
+        display_title = format_room_type_title(room.slug, v_names, room.lodge_name)
         rooms_dto.append(RoomListDTO(
-            id=room.id, slug=room.slug, lodge_name=room.lodge_name,
+            id=room.id, slug=room.slug, lodge_name=display_title,
             cover_image_url=room.cover_image_url, video_url=room.video_url,
             is_featured=room.is_featured,
             starting_price=room.starting_price, starting_weekend_price=room.starting_weekend_price,
@@ -299,7 +365,6 @@ async def get_room_detail(
                 detail="Room not found or inactive"
             )
             
-        import asyncio
         from app.models.room import RoomVariant, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy
 
         async def fetch_rel(model, active_filter=None):
@@ -308,28 +373,20 @@ async def get_room_detail(
                 q = q.where(active_filter)
             return (await db.execute(q)).scalars().all()
 
-        results = await asyncio.gather(
-            fetch_rel(RoomVariant, and_(RoomVariant.is_active == True)),
-            fetch_rel(RoomGalleryImage),
-            fetch_rel(RoomHighlight),
-            fetch_rel(RoomFAQ),
-            fetch_rel(RoomPolicy)
-        )
-
-        r_variants = results[0]
-        r_gallery = results[1]
-        r_highlights = results[2]
-        r_faqs = results[3]
-        r_policies = results[4]
+        r_variants = await fetch_rel(RoomVariant, and_(RoomVariant.is_active == True))
+        r_gallery = await fetch_rel(RoomGalleryImage)
+        r_highlights = await fetch_rel(RoomHighlight)
+        r_faqs = await fetch_rel(RoomFAQ)
+        r_policies = await fetch_rel(RoomPolicy)
 
         starting_price = min((v.weekday_price for v in r_variants), default=None)
-        
         active_brochure_url = r.brochure_pdf_url or r.generated_brochure_url
+        display_title = format_room_type_title(r.slug, [v.variant_name for v in r_variants], r.lodge_name)
         
         return RoomDetailDTO(
             id=r.id,
             slug=r.slug,
-            lodge_name=r.lodge_name,
+            lodge_name=display_title,
             cover_image_url=r.cover_image_url,
             video_url=r.video_url,
             is_featured=r.is_featured,
@@ -346,7 +403,7 @@ async def get_room_detail(
             booking_slots=r.booking_slots if r.booking_slots else [],
             created_at=r.created_at,
             updated_at=r.updated_at,
-            meta_title=r.meta_title,
+            meta_title=r.meta_title or f"{display_title} | TS Tourism Accommodations",
             meta_description=r.meta_description,
             og_image_url=r.og_image_url,
             canonical_url=r.canonical_url,

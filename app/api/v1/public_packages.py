@@ -469,117 +469,117 @@ async def get_package_detail(
                 agent_quota_val = q_row.daily_quota if q_row else 10
                 agent_allowed_val = q_row.is_allowed if q_row else True
         
-        return PackageDetailDTO(
-            id=pkg.id,
-            slug=pkg.slug,
-            title=pkg.title,
-            type=pkg.type,
-            duration=pkg.duration,
-            place=pkg.place,
-            region=pkg.region,
-            description=pkg.description,
-            brochure_pdf_url=active_brochure_url,
-            generated_brochure_url=pkg.generated_brochure_url,
-            cover_image_url=pkg.cover_image_url,
-            video_url=pkg.video_url,
-            is_active=pkg.is_active,
-            is_featured=pkg.is_featured,
-            tags=[tag.name for tag in pkg_tags if tag.is_active],
-            starting_price=starting_price,
-            advance_payment_type=pkg.advance_payment_type.value if hasattr(pkg.advance_payment_type, 'value') else str(pkg.advance_payment_type or "FULL_PAYMENT"),
-            advance_payment_value=pkg.advance_payment_value or Decimal("0.00"),
-            min_passengers=pkg.min_passengers or 1,
-            # Transport & Refreshments
-            is_student_package=pkg.is_student_package or False,
-            has_transport=pkg.has_transport or False,
-            transport_options=[
-                TransportOptionPublicDTO(
-                    id=t.id,
-                    type=t.type,
-                    title=t.title,
-                    capacity=t.capacity,
-                    adult_price=t.adult_price,
-                    child_price=t.child_price,
-                    weekend_adult_price=t.weekend_adult_price,
-                    weekend_child_price=t.weekend_child_price,
-                    student_price=t.student_price,
-                    weekend_student_price=t.weekend_student_price,
-                    fixed_price=t.fixed_price,
-                    weekend_fixed_price=t.weekend_fixed_price,
-                ) for t in pkg_transport_options
-            ],
-            has_refreshments=pkg.has_refreshments or False,
-            refreshment_adult_price=pkg.refreshment_adult_price,
-            refreshment_child_price=pkg.refreshment_child_price,
-            refreshment_student_price=pkg.refreshment_student_price,
-            refreshments_min_passengers=pkg.refreshments_min_passengers or 1,
-            has_food_option=pkg.has_food_option or False,
-            food_adult_price=pkg.food_adult_price,
-            food_child_price=pkg.food_child_price,
-            food_student_price=pkg.food_student_price,
-            meta_title=pkg.meta_title,
-            meta_description=pkg.meta_description,
-            og_image_url=pkg.og_image_url,
-            canonical_url=pkg.canonical_url,
-            variants=[
-                PackageVariantPublicDTO(
-                    id=v.id,
-                    title=v.title,
-                    adult_price=v.adult_price or Decimal("0.00"),
-                    child_price=v.child_price or Decimal("0.00"),
-                    weekend_adult_price=v.weekend_adult_price,
-                    weekend_child_price=v.weekend_child_price,
-                    student_price=v.student_price,
-                    weekend_student_price=v.weekend_student_price,
-                    transport_info=None
-                ) for v in pkg_variants
-            ],
-            gallery=[
-                item for item in pkg_gallery
-                if not item.deleted_at and has_text(item.image_url)
-            ],
-            itinerary=[
-                item for item in pkg_itinerary
-                if not item.deleted_at and has_text(item.title)
-            ],
-            highlights=[
-                item for item in pkg_highlights
-                if not item.deleted_at and has_text(item.title)
-            ],
-            inclusions=[
-                item for item in pkg_inclusions
-                if not item.deleted_at and has_text(item.label)
-            ],
-            exclusions=[
-                item for item in pkg_exclusions
-                if not item.deleted_at and has_text(item.label)
-            ],
-            boarding_points=[
-                item for item in pkg_boarding_points
-                if not item.deleted_at and has_text(item.title)
-            ],
-            faqs=[
-                item for item in pkg_faqs
-                if not item.deleted_at and has_text(item.question) and has_text(item.answer)
-            ],
-            policies=[
-                item for item in pkg_policies
-                if not item.deleted_at and has_text(item.title) and has_text(item.description)
-            ],
-            meals=[
-                item for item in pkg_meals
-                if not item.deleted_at and has_text(item.name)
-            ],
-            extras=[
-                item for item in pkg_extras
-                if not item.deleted_at and has_text(item.title)
-            ],
-            agent_commission_type=agent_comm_type,
-            agent_commission_percentage=agent_comm_pct,
-            agent_commission_fixed_amount=agent_comm_fixed,
-            agent_daily_quota=agent_quota_val,
-            agent_is_allowed=agent_allowed_val,
-        )
+            return PackageDetailDTO(
+                id=pkg.id,
+                slug=pkg.slug,
+                title=pkg.title,
+                type=pkg.type,
+                duration=pkg.duration,
+                place=pkg.place,
+                region=pkg.region,
+                description=pkg.description,
+                brochure_pdf_url=active_brochure_url,
+                generated_brochure_url=pkg.generated_brochure_url,
+                cover_image_url=pkg.cover_image_url,
+                video_url=pkg.video_url,
+                is_active=pkg.is_active,
+                is_featured=pkg.is_featured,
+                tags=[tag.name for tag in pkg_tags if tag.is_active],
+                starting_price=starting_price,
+                advance_payment_type=pkg.advance_payment_type.value if hasattr(pkg.advance_payment_type, 'value') else str(pkg.advance_payment_type or "FULL_PAYMENT"),
+                advance_payment_value=pkg.advance_payment_value or Decimal("0.00"),
+                min_passengers=pkg.min_passengers or 1,
+                # Transport & Refreshments
+                is_student_package=pkg.is_student_package or False,
+                has_transport=pkg.has_transport or False,
+                transport_options=[
+                    TransportOptionPublicDTO(
+                        id=t.id,
+                        type=t.type,
+                        title=t.title,
+                        capacity=t.capacity,
+                        adult_price=t.adult_price,
+                        child_price=t.child_price,
+                        weekend_adult_price=t.weekend_adult_price,
+                        weekend_child_price=t.weekend_child_price,
+                        student_price=t.student_price,
+                        weekend_student_price=t.weekend_student_price,
+                        fixed_price=t.fixed_price,
+                        weekend_fixed_price=t.weekend_fixed_price,
+                    ) for t in pkg_transport_options
+                ],
+                has_refreshments=pkg.has_refreshments or False,
+                refreshment_adult_price=pkg.refreshment_adult_price,
+                refreshment_child_price=pkg.refreshment_child_price,
+                refreshment_student_price=pkg.refreshment_student_price,
+                refreshments_min_passengers=pkg.refreshments_min_passengers or 1,
+                has_food_option=pkg.has_food_option or False,
+                food_adult_price=pkg.food_adult_price,
+                food_child_price=pkg.food_child_price,
+                food_student_price=pkg.food_student_price,
+                meta_title=pkg.meta_title,
+                meta_description=pkg.meta_description,
+                og_image_url=pkg.og_image_url,
+                canonical_url=pkg.canonical_url,
+                variants=[
+                    PackageVariantPublicDTO(
+                        id=v.id,
+                        title=v.title,
+                        adult_price=v.adult_price or Decimal("0.00"),
+                        child_price=v.child_price or Decimal("0.00"),
+                        weekend_adult_price=v.weekend_adult_price,
+                        weekend_child_price=v.weekend_child_price,
+                        student_price=v.student_price,
+                        weekend_student_price=v.weekend_student_price,
+                        transport_info=None
+                    ) for v in pkg_variants
+                ],
+                gallery=[
+                    item for item in pkg_gallery
+                    if not item.deleted_at and has_text(item.image_url)
+                ],
+                itinerary=[
+                    item for item in pkg_itinerary
+                    if not item.deleted_at and has_text(item.title)
+                ],
+                highlights=[
+                    item for item in pkg_highlights
+                    if not item.deleted_at and has_text(item.title)
+                ],
+                inclusions=[
+                    item for item in pkg_inclusions
+                    if not item.deleted_at and has_text(item.label)
+                ],
+                exclusions=[
+                    item for item in pkg_exclusions
+                    if not item.deleted_at and has_text(item.label)
+                ],
+                boarding_points=[
+                    item for item in pkg_boarding_points
+                    if not item.deleted_at and has_text(item.title)
+                ],
+                faqs=[
+                    item for item in pkg_faqs
+                    if not item.deleted_at and has_text(item.question) and has_text(item.answer)
+                ],
+                policies=[
+                    item for item in pkg_policies
+                    if not item.deleted_at and has_text(item.title) and has_text(item.description)
+                ],
+                meals=[
+                    item for item in pkg_meals
+                    if not item.deleted_at and has_text(item.name)
+                ],
+                extras=[
+                    item for item in pkg_extras
+                    if not item.deleted_at and has_text(item.title)
+                ],
+                agent_commission_type=agent_comm_type,
+                agent_commission_percentage=agent_comm_pct,
+                agent_commission_fixed_amount=agent_comm_fixed,
+                agent_daily_quota=agent_quota_val,
+                agent_is_allowed=agent_allowed_val,
+            )
 
     res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
     set_mem_cached("package_detail", mem_key, res, ttl_seconds=3600 if not is_agent else 120)
