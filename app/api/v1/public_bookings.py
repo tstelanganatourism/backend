@@ -1867,6 +1867,19 @@ async def get_booking_details(
             booked_by_name = booked_user.full_name
             booked_by_email = booked_user.email
             booked_by_role = booked_user.role.value if hasattr(booked_user.role, 'value') else str(booked_user.role)
+    elif b.source and (str(getattr(b.source, 'value', b.source)).upper() in ("ADMIN", "ADMIN_DIRECT")):
+        admin_info = b.pricing_snapshot or {}
+        booked_by_name = admin_info.get("admin_name") or "TS Boat Tourism Admin"
+        booked_by_email = admin_info.get("created_by_admin_email") or "admin@tstelanganatourism.com"
+        booked_by_role = "ADMIN"
+    elif b.agent_id:
+        booked_by_name = agent_name or "Agent"
+        booked_by_role = "AGENT"
+    else:
+        lead_pax = next((p for p in b.passengers if p.is_primary), None) or (b.passengers[0] if b.passengers else None)
+        booked_by_name = lead_pax.full_name if lead_pax else "Tourist Direct"
+        booked_by_email = b.customer_email
+        booked_by_role = "USER"
 
     boarding_point = None
     itinerary = []
@@ -2438,6 +2451,8 @@ async def download_public_booking_pdf(
     """
     import hmac
     import hashlib
+    import asyncio
+    from app.core.config import settings
     # Use dedicated PDF_SECRET_KEY (falls back to SECRET_KEY if not set)
     _pdf_secret = settings.PDF_SECRET_KEY or settings.SECRET_KEY or ""
     PDF_SECRET_KEY = _pdf_secret.encode("utf-8")

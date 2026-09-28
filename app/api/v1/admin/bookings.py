@@ -304,8 +304,11 @@ async def list_admin_bookings(
             "variant_title": title_info["variant_title"],
             "customer": {
                 "id": customer.id if customer else None,
-                "full_name": customer.full_name if customer else "Guest",
-                "email": customer.email if customer else None,
+                "full_name": customer.full_name if customer else (
+                    next((p.full_name for p in b.passengers if p.is_primary), None)
+                    or (b.passengers[0].full_name if b.passengers else "Guest")
+                ),
+                "email": customer.email if customer else b.customer_email,
             },
             "agent": {
                 "id": agent.id if agent else None,
@@ -766,12 +769,25 @@ async def admin_create_booking(
         )
         c_res = await db.execute(c_stmt)
         coupon_obj = c_res.scalar_one_or_none()
-        if coupon_obj:
-            now_ist = get_ist_now()
-            if coupon_obj.is_valid(now_ist, subtotal_amount):
-                coupon_discount = Decimal(str(coupon_obj.calculate_discount(float(subtotal_amount))))
-                coupon_applied = coupon_obj.code
-                coupon_obj.usage_count = (coupon_obj.usage_count or 0) + 1
+        if not coupon_obj:
+            raise HTTPException(status_code=400, detail=f"Coupon code '{c_code}' is invalid or inactive.")
+
+        target_type_str = "PACKAGE" if request.variant_id else ("ROOM" if request.room_variant_id else None)
+        target_id_val = variant.package_id if ('variant' in locals() and variant) else (room_obj.id if ('room_obj' in locals() and room_obj) else None)
+        total_pax = total_passengers if 'total_passengers' in locals() else ((request.adult_count or 0) + (request.child_count or 0) + (request.student_count or 0))
+
+        if not coupon_obj.is_valid(
+            booking_amount=float(subtotal_amount),
+            target_type=target_type_str,
+            target_id=target_id_val,
+            ticket_count=total_pax,
+            travel_date=travel_date
+        ):
+            raise HTTPException(status_code=400, detail=f"Coupon code '{c_code}' is not valid for this booking.")
+
+        coupon_discount = Decimal(str(coupon_obj.calculate_discount(float(subtotal_amount))))
+        coupon_applied = coupon_obj.code
+        coupon_obj.usage_count = (coupon_obj.usage_count or 0) + 1
 
     discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
 

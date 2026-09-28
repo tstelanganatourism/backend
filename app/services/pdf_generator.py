@@ -66,35 +66,48 @@ async def generate_pdf_from_url(url: str) -> bytes:
     Chromium zombie processes from leaking if navigation fails or times out.
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+            ]
+        )
         try:
             context = await browser.new_context(ignore_https_errors=True)
             page = await context.new_page()
-            logger.info(f"Navigating to {url} for brochure PDF generation")
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            logger.info(f"Navigating to {url} for PDF generation")
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
 
             if not response or not response.ok:
                 status = response.status if response else "no response"
                 raise Exception(f"Failed to load PDF page {url}: HTTP {status}")
 
-            await page.wait_for_selector("body", timeout=15000)
-            await page.wait_for_timeout(600)
+            await page.wait_for_selector("body", timeout=10000)
+            await page.wait_for_timeout(200)
             await page.emulate_media(media="print")
 
             try:
+                # Wait for images with 2.5s maximum cap so slow external images don't block generation
                 await page.evaluate("""
                     async () => {
                         const images = Array.from(document.images);
-                        await Promise.all(images.map(img => {
+                        const loadImages = Promise.all(images.map(img => {
                             if (img.complete) return Promise.resolve();
                             return new Promise((resolve) => {
                                 img.addEventListener('load', resolve);
                                 img.addEventListener('error', resolve);
                             });
                         }));
+                        await Promise.race([
+                            loadImages,
+                            new Promise(resolve => setTimeout(resolve, 2500))
+                        ]);
                     }
                 """)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(200)
             except Exception as e:
                 logger.warning(f"Timeout or error waiting for images on {url}: {e}")
 
