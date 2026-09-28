@@ -68,145 +68,145 @@ async def get_packages(
         async with AsyncSessionLocal() as db:
             offset = (page - 1) * size
 
-        # Base Query (Only PUBLISHED packages)
-        base_query = select(Package).where(
-            Package.status == PublishStatus.PUBLISHED,
-            Package.deleted_at.is_(None)
-        )
+            # Base Query (Only PUBLISHED packages)
+            base_query = select(Package).where(
+                Package.status == PublishStatus.PUBLISHED,
+                Package.deleted_at.is_(None)
+            )
 
-        # Filters
-        if type:
-            norm_type = str(type).strip().upper()
-            if norm_type in ("TOUR", "BOAT", "BOAT_RIDE", "BOAT-RIDE", "PACKAGE"):
-                base_query = base_query.where(Package.type == PackageType.TOUR)
-            elif norm_type in ("TRIP", "SIGHTSEEING", "TEMPLE"):
-                base_query = base_query.where(Package.type == PackageType.TRIP)
-        if region:
-            base_query = base_query.where(Package.region == region)
-        if is_featured is not None:
-            base_query = base_query.where(Package.is_featured == is_featured)
-        if place:
-            base_query = base_query.where(
-                or_(
-                    Package.place == place,
-                    Package.tags.any(Tag.name.ilike(f"%{place}%"))
+            # Filters
+            if type:
+                norm_type = str(type).strip().upper()
+                if norm_type in ("TOUR", "BOAT", "BOAT_RIDE", "BOAT-RIDE", "PACKAGE"):
+                    base_query = base_query.where(Package.type == PackageType.TOUR)
+                elif norm_type in ("TRIP", "SIGHTSEEING", "TEMPLE"):
+                    base_query = base_query.where(Package.type == PackageType.TRIP)
+            if region:
+                base_query = base_query.where(Package.region == region)
+            if is_featured is not None:
+                base_query = base_query.where(Package.is_featured == is_featured)
+            if place:
+                base_query = base_query.where(
+                    or_(
+                        Package.place == place,
+                        Package.tags.any(Tag.name.ilike(f"%{place}%"))
+                    )
                 )
+            
+            if q:
+                fts_vector = func.to_tsvector(text("'english'::regconfig"), Package.title + ' ' + func.coalesce(Package.description, ''))
+                base_query = base_query.where(
+                    fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
+                )
+            
+            if tags:
+                # Filter packages that have ANY of the requested tags (OR logic)
+                base_query = base_query.where(Package.tags.any(Tag.name.in_(tags)))
+
+            # Count Query
+            count_query = base_query.with_only_columns(func.count()).order_by(None)
+
+            # Projection Query to avoid ORM Hydration overhead
+            data_query = (
+                base_query
+                .outerjoin(package_tags, Package.id == package_tags.c.package_id)
+                .outerjoin(Tag, package_tags.c.tag_id == Tag.id)
+                .with_only_columns(
+                    Package.id,
+                    Package.slug,
+                    Package.title,
+                    Package.type,
+                    Package.duration,
+                    Package.place,
+                    Package.region,
+                    Package.cover_image_url,
+                    Package.video_url,
+                    Package.brochure_pdf_url,
+                    Package.generated_brochure_url,
+                    Package.is_active,
+                    Package.is_featured,
+                    Package.is_student_package,
+                    Package.starting_price,
+                    Package.min_passengers,
+                    func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
+                )
+                .group_by(Package.id)
             )
-        
-        if q:
-            fts_vector = func.to_tsvector(text("'english'::regconfig"), Package.title + ' ' + func.coalesce(Package.description, ''))
-            base_query = base_query.where(
-                fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
+
+            # Sorting
+            if sort == "price_low":
+                data_query = data_query.order_by(Package.starting_price.asc().nulls_last(), Package.id.desc())
+            elif sort == "price_high":
+                data_query = data_query.order_by(Package.starting_price.desc().nulls_last(), Package.id.desc())
+            else: # Default: priority
+                data_query = data_query.order_by(Package.order_priority.asc(), Package.id.desc())
+
+            data_query = data_query.offset(offset).limit(size)
+            
+            total_count = (await db.execute(count_query)).scalar_one()
+            packages = (await db.execute(data_query)).all()
+
+            # Fetch variants manually in one go to avoid ORM hydration penalty while giving frontend child pricing
+            package_ids = [pkg.id for pkg in packages]
+            variants_by_pkg = {}
+            if package_ids:
+                from app.models.package import PackageVariant
+                variants_query = select(PackageVariant).where(
+                    PackageVariant.package_id.in_(package_ids),
+                    PackageVariant.is_active == True,
+                    PackageVariant.deleted_at.is_(None)
+                )
+                all_variants = (await db.execute(variants_query)).scalars().all()
+                for v in all_variants:
+                    variants_by_pkg.setdefault(v.package_id, []).append(PackageVariantPublicDTO(
+                        id=v.id,
+                        title=v.title,
+                        adult_price=v.adult_price or Decimal("0.00"),
+                        child_price=v.child_price or Decimal("0.00"),
+                        weekend_adult_price=v.weekend_adult_price,
+                        weekend_child_price=v.weekend_child_price,
+                        student_price=v.student_price,
+                        weekend_student_price=v.weekend_student_price,
+                        transport_info=None
+                    ))
+
+            # Map to DTOs
+            dto_list = [
+                PackageListDTO(
+                    id=pkg.id,
+                    slug=pkg.slug,
+                    title=pkg.title,
+                    type=pkg.type,
+                    duration=pkg.duration,
+                    place=pkg.place,
+                    region=pkg.region,
+                    brochure_pdf_url=pkg.brochure_pdf_url or pkg.generated_brochure_url,
+                    generated_brochure_url=pkg.generated_brochure_url,
+                    cover_image_url=pkg.cover_image_url,
+                    video_url=pkg.video_url,
+                    is_active=pkg.is_active,
+                    is_featured=pkg.is_featured,
+                    is_student_package=pkg.is_student_package,
+                    min_passengers=pkg.min_passengers or 1,
+                    tags=pkg.tags_list or [],
+                    starting_price=pkg.starting_price,
+                    transport_info=None,
+                    variants=variants_by_pkg.get(pkg.id, [])
+                )
+                for pkg in packages
+            ]
+
+            has_next = (offset + size) < total_count
+            has_prev = page > 1
+
+            return PaginatedResponse(
+                items=dto_list,
+                total=total_count,
+                page=page,
+                size=size,
+                has_next=has_next,
+                has_prev=has_prev
             )
-        
-        if tags:
-            # Filter packages that have ANY of the requested tags (OR logic)
-            base_query = base_query.where(Package.tags.any(Tag.name.in_(tags)))
-
-        # Count Query
-        count_query = base_query.with_only_columns(func.count()).order_by(None)
-
-        # Projection Query to avoid ORM Hydration overhead
-        data_query = (
-            base_query
-            .outerjoin(package_tags, Package.id == package_tags.c.package_id)
-            .outerjoin(Tag, package_tags.c.tag_id == Tag.id)
-            .with_only_columns(
-                Package.id,
-                Package.slug,
-                Package.title,
-                Package.type,
-                Package.duration,
-                Package.place,
-                Package.region,
-                Package.cover_image_url,
-                Package.video_url,
-                Package.brochure_pdf_url,
-                Package.generated_brochure_url,
-                Package.is_active,
-                Package.is_featured,
-                Package.is_student_package,
-                Package.starting_price,
-                Package.min_passengers,
-                func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
-            )
-            .group_by(Package.id)
-        )
-
-        # Sorting
-        if sort == "price_low":
-            data_query = data_query.order_by(Package.starting_price.asc().nulls_last(), Package.id.desc())
-        elif sort == "price_high":
-            data_query = data_query.order_by(Package.starting_price.desc().nulls_last(), Package.id.desc())
-        else: # Default: priority
-            data_query = data_query.order_by(Package.order_priority.asc(), Package.id.desc())
-
-        data_query = data_query.offset(offset).limit(size)
-        
-        total_count = (await db.execute(count_query)).scalar_one()
-        packages = (await db.execute(data_query)).all()
-
-        # Fetch variants manually in one go to avoid ORM hydration penalty while giving frontend child pricing
-        package_ids = [pkg.id for pkg in packages]
-        variants_by_pkg = {}
-        if package_ids:
-            from app.models.package import PackageVariant
-            variants_query = select(PackageVariant).where(
-                PackageVariant.package_id.in_(package_ids),
-                PackageVariant.is_active == True,
-                PackageVariant.deleted_at.is_(None)
-            )
-            all_variants = (await db.execute(variants_query)).scalars().all()
-            for v in all_variants:
-                variants_by_pkg.setdefault(v.package_id, []).append(PackageVariantPublicDTO(
-                    id=v.id,
-                    title=v.title,
-                    adult_price=v.adult_price or Decimal("0.00"),
-                    child_price=v.child_price or Decimal("0.00"),
-                    weekend_adult_price=v.weekend_adult_price,
-                    weekend_child_price=v.weekend_child_price,
-                    student_price=v.student_price,
-                    weekend_student_price=v.weekend_student_price,
-                    transport_info=None
-                ))
-
-        # Map to DTOs
-        dto_list = [
-            PackageListDTO(
-                id=pkg.id,
-                slug=pkg.slug,
-                title=pkg.title,
-                type=pkg.type,
-                duration=pkg.duration,
-                place=pkg.place,
-                region=pkg.region,
-                brochure_pdf_url=pkg.brochure_pdf_url or pkg.generated_brochure_url,
-                generated_brochure_url=pkg.generated_brochure_url,
-                cover_image_url=pkg.cover_image_url,
-                video_url=pkg.video_url,
-                is_active=pkg.is_active,
-                is_featured=pkg.is_featured,
-                is_student_package=pkg.is_student_package,
-                min_passengers=pkg.min_passengers or 1,
-                tags=pkg.tags_list or [],
-                starting_price=pkg.starting_price,
-                transport_info=None,
-                variants=variants_by_pkg.get(pkg.id, [])
-            )
-            for pkg in packages
-        ]
-
-        has_next = (offset + size) < total_count
-        has_prev = page > 1
-
-        return PaginatedResponse(
-            items=dto_list,
-            total=total_count,
-            page=page,
-            size=size,
-            has_next=has_next,
-            has_prev=has_prev
-        )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_packages)
 

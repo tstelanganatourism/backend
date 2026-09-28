@@ -66,91 +66,91 @@ async def get_rooms(
         async with AsyncSessionLocal() as db:
             offset = (page - 1) * size
 
-        # Base Query (Only PUBLISHED and ACTIVE rooms)
-        base_query = select(Room).where(
-            Room.status == PublishStatus.PUBLISHED,
-            Room.is_active == True,
-            Room.deleted_at.is_(None)
-        )
-
-        # Filters
-        if is_featured is not None:
-            base_query = base_query.where(Room.is_featured == is_featured)
-        if q:
-            fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
-            base_query = base_query.where(
-                fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
-            )
-        
-        if facilities:
-            # Filter rooms that have ANY of the requested facilities (OR logic)
-            base_query = base_query.where(
-                or_(*(Room.facilities.contains([f]) for f in facilities))
+            # Base Query (Only PUBLISHED and ACTIVE rooms)
+            base_query = select(Room).where(
+                Room.status == PublishStatus.PUBLISHED,
+                Room.is_active == True,
+                Room.deleted_at.is_(None)
             )
 
-        # Count Query
-        count_query = base_query.with_only_columns(func.count()).order_by(None)
+            # Filters
+            if is_featured is not None:
+                base_query = base_query.where(Room.is_featured == is_featured)
+            if q:
+                fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
+                base_query = base_query.where(
+                    fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
+                )
+            
+            if facilities:
+                # Filter rooms that have ANY of the requested facilities (OR logic)
+                base_query = base_query.where(
+                    or_(*(Room.facilities.contains([f]) for f in facilities))
+                )
 
-        # Projection Query to avoid ORM Hydration overhead
-        data_query = (
-            base_query
-            .with_only_columns(
-                Room.id,
-                Room.slug,
-                Room.lodge_name,
-                Room.cover_image_url,
-                Room.video_url,
-                Room.is_featured,
-                Room.starting_price,
-                Room.starting_weekend_price,
-                Room.address,
-                Room.map_url,
-                Room.facilities,
-                Room.order_priority
+            # Count Query
+            count_query = base_query.with_only_columns(func.count()).order_by(None)
+
+            # Projection Query to avoid ORM Hydration overhead
+            data_query = (
+                base_query
+                .with_only_columns(
+                    Room.id,
+                    Room.slug,
+                    Room.lodge_name,
+                    Room.cover_image_url,
+                    Room.video_url,
+                    Room.is_featured,
+                    Room.starting_price,
+                    Room.starting_weekend_price,
+                    Room.address,
+                    Room.map_url,
+                    Room.facilities,
+                    Room.order_priority
+                )
             )
-        )
 
-        # Sorting
-        if sort == "price_low":
-            data_query = data_query.order_by(Room.starting_price.asc().nulls_last(), Room.id.desc())
-        elif sort == "price_high":
-            data_query = data_query.order_by(Room.starting_price.desc().nulls_last(), Room.id.desc())
-        else: # Default: priority
-            data_query = data_query.order_by(Room.order_priority.asc(), Room.id.desc())
+            # Sorting
+            if sort == "price_low":
+                data_query = data_query.order_by(Room.starting_price.asc().nulls_last(), Room.id.desc())
+            elif sort == "price_high":
+                data_query = data_query.order_by(Room.starting_price.desc().nulls_last(), Room.id.desc())
+            else: # Default: priority
+                data_query = data_query.order_by(Room.order_priority.asc(), Room.id.desc())
 
-        data_query = data_query.offset(offset).limit(size)
-        
-        total_count = (await db.execute(count_query)).scalar_one()
-        rooms = (await db.execute(data_query)).all()
+            data_query = data_query.offset(offset).limit(size)
+            
+            total_count = (await db.execute(count_query)).scalar_one()
+            rooms = (await db.execute(data_query)).all()
 
-        # Map to DTOs
-        dto_list = []
-        for r in rooms:
-            dto_list.append(RoomListDTO(
-                id=r.id,
-                slug=r.slug,
-                lodge_name=r.lodge_name,
-                cover_image_url=r.cover_image_url,
-                video_url=r.video_url,
-                is_featured=r.is_featured,
-                starting_price=r.starting_price,
-                starting_weekend_price=r.starting_weekend_price,
-                address=r.address,
-                map_url=r.map_url,
-                facilities=r.facilities if r.facilities else []
-            ))
+            # Map to DTOs
+            dto_list = []
+            for r in rooms:
+                dto_list.append(RoomListDTO(
+                    id=r.id,
+                    slug=r.slug,
+                    lodge_name=r.lodge_name,
+                    cover_image_url=r.cover_image_url,
+                    video_url=r.video_url,
+                    is_featured=r.is_featured,
+                    starting_price=r.starting_price,
+                    starting_weekend_price=r.starting_weekend_price,
+                    address=r.address,
+                    map_url=r.map_url,
+                    facilities=r.facilities if r.facilities else []
+                ))
 
-        has_next = (offset + size) < total_count
-        has_prev = page > 1
+            has_next = (offset + size) < total_count
+            has_prev = page > 1
 
-        return PaginatedResponse(
-            items=dto_list,
-            total=total_count,
-            page=page,
-            size=size,
-            has_next=has_next,
-            has_prev=has_prev
-        )
+            return PaginatedResponse(
+                items=dto_list,
+                total=total_count,
+                page=page,
+                size=size,
+                has_next=has_next,
+                has_prev=has_prev
+            )
 
     return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_rooms)
 
