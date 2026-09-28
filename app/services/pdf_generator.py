@@ -249,11 +249,11 @@ async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_pai
             primary_passenger_name = next((p.full_name for p in booking.passengers if p.is_primary), "Guest")
             recipients.append((booking.customer_email, primary_passenger_name))
             
-        # Logged-in User Email (If no tourist email provided)
-        elif booking.user_id:
+        # Logged-in User Email (Ensure creator receives a copy if distinct)
+        if booking.user_id:
             user = await db.get(User, booking.user_id)
-            if user and user.email:
-                recipients.append((user.email, user.full_name))
+            if user and user.email and not any(r[0] == user.email for r in recipients):
+                recipients.append((user.email, user.full_name or "Valued Customer"))
 
         # Agent Email (If booked via agent, always send them a copy)
         if booking.agent_id:

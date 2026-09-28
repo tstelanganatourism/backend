@@ -434,6 +434,7 @@ class AdminCreateBookingRequest(BaseModel):
     payment_method: Optional[str] = None
     # Booking mode: QUICK = only lead passenger details, rest auto-filled
     quick_booking: Optional[bool] = False
+    coupon_code: Optional[str] = None
 
 @router.post("/create")
 async def admin_create_booking(
@@ -752,10 +753,32 @@ async def admin_create_booking(
     else:
         raise HTTPException(status_code=400, detail="Invalid target_type. Must be 'package' or 'room'.")
 
+    # Coupon calculation for admin bookings
+    coupon_discount = Decimal("0.00")
+    coupon_applied = None
+    if getattr(request, 'coupon_code', None) and request.coupon_code.strip():
+        from app.models.coupon import Coupon
+        c_code = request.coupon_code.strip().upper()
+        c_stmt = select(Coupon).where(
+            Coupon.code == c_code,
+            Coupon.is_active == True,
+            Coupon.deleted_at.is_(None)
+        )
+        c_res = await db.execute(c_stmt)
+        coupon_obj = c_res.scalar_one_or_none()
+        if coupon_obj:
+            now_ist = get_ist_now()
+            if coupon_obj.is_valid(now_ist, subtotal_amount):
+                coupon_discount = Decimal(str(coupon_obj.calculate_discount(float(subtotal_amount))))
+                coupon_applied = coupon_obj.code
+                coupon_obj.usage_count = (coupon_obj.usage_count or 0) + 1
+
+    discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
+
     # Admin bookings: calculate GST (5%) and Gateway Fee (1%)
-    gst_amount = (subtotal_amount * Decimal("0.05")).quantize(Decimal("0.01"))
-    gateway_fee = ((subtotal_amount + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
-    total_amount = subtotal_amount + gst_amount + gateway_fee
+    gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
+    gateway_fee = ((discounted_subtotal + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
+    total_amount = discounted_subtotal + gst_amount + gateway_fee
 
     # Agent commission (if booking under an agent)
     agent_commission = Decimal("0.00")
@@ -775,8 +798,8 @@ async def admin_create_booking(
         "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
         "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
         "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
-        "coupon_discount": "0.00",
-        "coupon_applied": None,
+        "coupon_discount": str(coupon_discount),
+        "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
         "gateway_fee": str(gateway_fee),
         "tourist_total": str(total_amount),
@@ -784,6 +807,7 @@ async def admin_create_booking(
         "agent_payable": str(total_amount),
         "payment_method": "ADMIN_MANUAL",
         "created_by_admin_id": current_admin.id,
+        "created_by_admin_email": current_admin.email,
         "admin_name": current_admin.full_name,
         "booking_mode": "QUICK" if request.quick_booking else "FULL",
     }
@@ -843,10 +867,10 @@ async def admin_create_booking(
 
     booking = Booking(
         public_id=public_id_val,
-        user_id=request.user_id,
+        user_id=request.user_id or current_admin.id,
         agent_id=agent_id_val,
         source=BookingSource.ADMIN_DIRECT,
-        customer_email=request.customer_email,
+        customer_email=request.customer_email or current_admin.email,
         variant_id=package_variant_id_val,
         room_variant_id=room_variant_id_val,
         travel_date=travel_date,
@@ -856,8 +880,8 @@ async def admin_create_booking(
         has_refreshment_addon=pricing_snapshot["has_refreshment_addon"],
         has_food_addon=pricing_snapshot["has_food_addon"],
         subtotal_amount=subtotal_amount,
-        coupon_discount=Decimal("0.00"),
-        coupon_applied=None,
+        coupon_discount=coupon_discount,
+        coupon_applied=coupon_applied,
         gst_amount=gst_amount,
         gateway_fee=gateway_fee,
         total_amount=total_amount,
@@ -967,16 +991,20 @@ async def admin_create_booking(
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
 
+    # Pre-capture primitive values before commit so background task never touches detached booking attributes
+    b_id_val = booking.id
+    p_id_val = booking.public_id
+    is_fully_paid_val = (booking.status == BookingStatus.FULLY_PAID or booking.remaining_balance <= Decimal("0.01"))
+
     # Trigger ticket/invoice generation and notifications asynchronously (non-blocking)
-    async def _bg_enqueue(b_id: int, p_id: str):
+    async def _bg_enqueue(b_id: int, p_id: str, is_paid: bool):
         from loguru import logger
         # 1. Process documents, PDF & Email notification
         try:
             from app.services.pdf_generator import process_post_booking_documents_task
             from app.db.session import AsyncSessionLocal
-            is_fully_paid_val = (booking.status == BookingStatus.FULLY_PAID or booking.remaining_balance <= Decimal("0.01"))
             async with AsyncSessionLocal() as bg_db:
-                await process_post_booking_documents_task({"db": bg_db}, b_id, is_fully_paid=is_fully_paid_val)
+                await process_post_booking_documents_task({"db": bg_db}, b_id, is_fully_paid=is_paid)
             logger.info(f"Successfully generated documents and dispatched emails for admin booking {p_id}")
         except Exception as e:
             logger.error(f"Error processing post-booking documents and emails for {p_id}: {e}")
@@ -990,10 +1018,12 @@ async def admin_create_booking(
                 if sms_payload:
                     await dispatch_sms_payload(None, sms_payload)
                     logger.info(f"Dispatched confirmation SMS for admin direct booking {p_id}")
+                else:
+                    logger.warning(f"Could not build SMS payload for admin booking {p_id} (check passenger phone)")
         except Exception as _sms_err:
             logger.warning(f"Could not dispatch confirmation SMS for admin booking {p_id}: {_sms_err}")
 
-    asyncio.create_task(_bg_enqueue(booking.id, booking.public_id))
+    asyncio.create_task(_bg_enqueue(b_id_val, p_id_val, is_fully_paid_val))
 
     return {
         "status": "success",

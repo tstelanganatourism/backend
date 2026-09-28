@@ -751,42 +751,52 @@ async def send_admin_booking_notification(
 </body>
 </html>"""
 
-    if db:
-        from app.models.booking import EmailLog
-        existing_logs_query = select(EmailLog.id).where(
-            EmailLog.booking_id == booking.id,
-            EmailLog.email_type == "ADMIN_NOTIFICATION",
-            EmailLog.delivery_status == "SENT"
+    pricing = booking.pricing_snapshot or {}
+    admin_emails = ["tstelanganatourism@gmail.com"]
+    created_by_email = pricing.get("created_by_admin_email")
+    if created_by_email and "@" in created_by_email and created_by_email.strip() not in admin_emails:
+        admin_emails.append(created_by_email.strip())
+
+    overall_success = False
+    for a_email in admin_emails:
+        if db:
+            from app.models.booking import EmailLog
+            existing_logs_query = select(EmailLog.id).where(
+                EmailLog.booking_id == booking.id,
+                EmailLog.recipient_email == a_email,
+                EmailLog.email_type == "ADMIN_NOTIFICATION",
+                EmailLog.delivery_status == "SENT"
+            )
+            existing_logs_result = await db.execute(existing_logs_query)
+            if existing_logs_result.first():
+                logger.info(f"Skipping admin notification for {booking.public_id} to {a_email} because it was already SENT.")
+                overall_success = True
+                continue
+
+        success, error = await email_service.send_booking_email(
+            recipient_email=a_email,
+            recipient_name="TS Boat Tourism Admin",
+            subject=subject,
+            html_content=html_content,
+            is_admin=True,
+            db=db,
         )
-        existing_logs_result = await db.execute(existing_logs_query)
-        if existing_logs_result.first():
-            logger.info(f"Skipping admin notification for {booking.public_id} because it was already SENT.")
-            return True
 
-    success, error = await email_service.send_booking_email(
-        recipient_email=admin_email,
-        recipient_name="TS Boat Tourism Admin",
-        subject=subject,
-        html_content=html_content,
-        is_admin=True,
-        db=db,  # Reuse caller's session; never open a new connection here
-    )
+        if not success:
+            logger.error(f"Failed to send admin notification for booking {booking.public_id} to {a_email}: {error}")
+        else:
+            logger.info(f"Admin notification sent successfully for booking {booking.public_id} to {a_email}")
+            overall_success = True
 
-    if not success:
-        logger.error(f"Failed to send admin notification for booking {booking.public_id}: {error}")
-    else:
-        logger.info(f"Admin notification sent successfully for booking {booking.public_id}")
+        if db:
+            from app.models.booking import EmailLog
+            log_entry = EmailLog(
+                booking_id=booking.id,
+                recipient_email=a_email,
+                email_type="ADMIN_NOTIFICATION",
+                delivery_status="SENT" if success else "FAILED",
+                failure_reason=error if not success else None
+            )
+            db.add(log_entry)
 
-    if db:
-        from app.models.booking import EmailLog
-        log_entry = EmailLog(
-            booking_id=booking.id,
-            recipient_email=admin_email,
-            email_type="ADMIN_NOTIFICATION",
-            delivery_status="SENT" if success else "FAILED",
-            failure_reason=error if not success else None
-        )
-        db.add(log_entry)
-        # We don't commit here, we let the calling task commit so it's one transaction
-
-    return success
+    return overall_success
