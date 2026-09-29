@@ -292,6 +292,7 @@ async def list_admin_bookings(
             "coupon_discount": float(b.coupon_discount),
             "coupon_applied": b.coupon_applied,
             "gst_amount": float(b.gst_amount),
+            "service_charge": float(getattr(b, 'service_charge', 0.0) or 0.0),
             "gateway_fee": float(b.gateway_fee),
             "total_amount": float(b.total_amount),
             "paid_amount": float(b.paid_amount),
@@ -791,10 +792,11 @@ async def admin_create_booking(
 
     discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
 
-    # Admin bookings: calculate GST (5%) and Gateway Fee (1%)
+    # Admin bookings: calculate GST (5%), Service Charge (1%), and Gateway Fee (1%)
     gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
-    gateway_fee = ((discounted_subtotal + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
-    total_amount = discounted_subtotal + gst_amount + gateway_fee
+    service_charge = (discounted_subtotal * Decimal("0.01")).quantize(Decimal("0.01"))
+    gateway_fee = ((discounted_subtotal + gst_amount + service_charge) * Decimal("0.01")).quantize(Decimal("0.01"))
+    total_amount = discounted_subtotal + gst_amount + service_charge + gateway_fee
 
     # Agent commission (if booking under an agent)
     agent_commission = Decimal("0.00")
@@ -817,6 +819,7 @@ async def admin_create_booking(
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
+        "service_charge": str(service_charge),
         "gateway_fee": str(gateway_fee),
         "tourist_total": str(total_amount),
         "agent_discount": "0.00",
@@ -899,6 +902,7 @@ async def admin_create_booking(
         coupon_discount=coupon_discount,
         coupon_applied=coupon_applied,
         gst_amount=gst_amount,
+        service_charge=service_charge,
         gateway_fee=gateway_fee,
         total_amount=total_amount,
         paid_amount=paid_amount_val,

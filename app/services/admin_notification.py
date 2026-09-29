@@ -282,6 +282,7 @@ async def send_admin_booking_notification(
     food_sub        = Decimal(str(pricing.get("food_amount", pricing.get("catering_amount", "0.00"))))
     extras_sub      = Decimal(str(pricing.get("extras_amount", pricing.get("extras_subtotal", "0.00"))))
     gst_amount      = Decimal(str(pricing.get("gst_amount", "0.00")))
+    service_charge  = Decimal(str(pricing.get("service_charge", "0.00")))
     gateway_fee     = Decimal(str(pricing.get("gateway_fee", "0.00")))
     tourist_total   = Decimal(str(pricing.get("tourist_total", "0.00")))
     coupon_discount = Decimal(str(pricing.get("coupon_discount", "0.00")))
@@ -355,7 +356,16 @@ async def send_admin_booking_notification(
     <tr>
       <td style="padding:6px 0;font-size:13px;color:#475569;">GST (5%)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(gst_amount):,.2f}</td>
-    </tr>
+    </tr>"""
+
+    if float(service_charge) > 0:
+        fin_rows += f"""
+    <tr>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Ts Boat Service Charge (1%)</td>
+      <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(service_charge):,.2f}</td>
+    </tr>"""
+
+    fin_rows += f"""
     <tr>
       <td style="padding:6px 0;font-size:13px;color:#475569;">Gateway Fee (1%)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(gateway_fee):,.2f}</td>

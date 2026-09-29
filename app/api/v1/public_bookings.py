@@ -799,8 +799,9 @@ async def checkout(
         
     discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
     gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
-    gateway_fee = ((discounted_subtotal + gst_amount) * Decimal("0.01")).quantize(Decimal("0.01"))
-    total_amount = discounted_subtotal + gst_amount + gateway_fee
+    service_charge = (discounted_subtotal * Decimal("0.01")).quantize(Decimal("0.01"))
+    gateway_fee = ((discounted_subtotal + gst_amount + service_charge) * Decimal("0.01")).quantize(Decimal("0.01"))
+    total_amount = discounted_subtotal + gst_amount + service_charge + gateway_fee
     
     # Overrides removed to fix invoice generation.
     
@@ -866,6 +867,7 @@ async def checkout(
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
+        "service_charge": str(service_charge),
         "gateway_fee": str(gateway_fee),
         "tourist_total": str(total_amount),
         "commissionable_base": str(commissionable_base),
@@ -1086,6 +1088,7 @@ async def checkout(
             coupon_discount=coupon_discount,
             coupon_applied=coupon_applied,
             gst_amount=gst_amount,
+            service_charge=service_charge,
             gateway_fee=gateway_fee,
             total_amount=total_amount,
             paid_amount=paid_amount_agent,
@@ -1544,6 +1547,7 @@ async def get_agent_bookings(
             "coupon_discount": float(b.coupon_discount),
             "coupon_applied": b.coupon_applied,
             "gst_amount": float(b.gst_amount),
+            "service_charge": float(getattr(b, 'service_charge', 0.0) or 0.0),
             "gateway_fee": float(b.gateway_fee),
             "total_amount": float(b.total_amount),
             "paid_amount": float(b.paid_amount),
@@ -1685,6 +1689,7 @@ async def get_tourist_bookings(
             "coupon_discount": float(b.coupon_discount),
             "coupon_applied": b.coupon_applied,
             "gst_amount": float(b.gst_amount),
+            "service_charge": float(getattr(b, 'service_charge', 0.0) or 0.0),
             "gateway_fee": float(b.gateway_fee),
             "paid_amount": float(_b_public_paid),
             "remaining_balance": float(_b_public_remaining),
@@ -2038,8 +2043,9 @@ async def get_booking_details(
         "coupon_discount": float(b.coupon_discount),
         "coupon_applied": b.coupon_applied,
         "gst_amount": float(b.gst_amount),
+        "service_charge": float(getattr(b, 'service_charge', 0.0) or 0.0),
         "gateway_fee": float(b.gateway_fee),
-        "total_amount": float(b.subtotal_amount) + float(b.gst_amount) + float(b.gateway_fee) - float(b.coupon_discount),
+        "total_amount": float(b.total_amount),
         "remaining_balance": float(b.remaining_balance),
         "paid_amount": float(b.paid_amount),
         "status": b.status.value if hasattr(b.status, 'value') else str(b.status),

@@ -333,6 +333,7 @@ async def _finalize_draft(
         coupon_discount=Decimal(snapshot['coupon_discount']),
         coupon_applied=draft.coupon_applied,
         gst_amount=Decimal(snapshot['gst_amount']),
+        service_charge=Decimal(snapshot.get('service_charge', '0.00')),
         gateway_fee=Decimal(snapshot['gateway_fee']),
         total_amount=tourist_total,
         paid_amount=tourist_amount_payable,

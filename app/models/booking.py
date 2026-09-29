@@ -39,6 +39,7 @@ class Booking(BaseModel):
     coupon_discount = Column(Numeric(12, 2), default=0.00, server_default="0.00", nullable=False)
     coupon_applied = Column(String(50), nullable=True)
     gst_amount = Column(Numeric(12, 2), nullable=False)       # Fixed 5% GST
+    service_charge = Column(Numeric(12, 2), default=0.00, server_default="0.00", nullable=False)  # 1% Service Charge
     gateway_fee = Column(Numeric(12, 2), nullable=False)      # Fixed 1% Gateway Fee
     total_amount = Column(Numeric(12, 2), nullable=False)     # Grand total
     
