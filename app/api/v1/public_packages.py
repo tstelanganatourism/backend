@@ -213,7 +213,10 @@ async def get_packages(
                 has_prev=has_prev
             )
 
-    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_packages)
+    res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_packages)
+    if res is not None:
+        set_mem_cached("packages_list", mem_key, res, ttl_seconds=300)
+    return res
 
 
 # ── Public Package Category Endpoints (must be BEFORE /{slug} route) ─────────────

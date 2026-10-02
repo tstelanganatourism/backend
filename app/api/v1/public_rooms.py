@@ -217,7 +217,10 @@ async def get_rooms(
                 has_prev=has_prev
             )
 
-    return await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_rooms)
+    res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_rooms)
+    if res is not None:
+        set_mem_cached("rooms_list", mem_key, res, ttl_seconds=300)
+    return res
 
 
 # ── Public Room Category Endpoints (must be BEFORE /{slug} route) ─────────────
