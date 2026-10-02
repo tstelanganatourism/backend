@@ -1415,54 +1415,95 @@ async def bulk_action_package_inventory(
     if payload.from_date > payload.to_date:
         raise HTTPException(status_code=400, detail="from_date must be <= to_date")
         
+    from sqlalchemy.orm import joinedload
+    variant_res = await db.execute(
+        select(PackageVariant)
+        .options(joinedload(PackageVariant.package))
+        .where(PackageVariant.id == payload.variant_id)
+    )
+    variant = variant_res.scalar_one_or_none()
+    if not variant:
+        raise HTTPException(status_code=404, detail="Package variant not found")
+
     query = select(PackageVariantInventory).where(
         PackageVariantInventory.variant_id == payload.variant_id,
         PackageVariantInventory.date >= payload.from_date,
         PackageVariantInventory.date <= payload.to_date,
-        PackageVariantInventory.deleted_at.is_(None),
     )
     res = await db.execute(query)
-    rows = res.scalars().all()
+    existing_rows = res.scalars().all()
+    rows_by_date = {r.date: r for r in existing_rows}
     
-    if not rows:
-        return {"updated": 0, "message": "No inventory found in the given date range."}
-        
-    updated = 0
     import datetime
+    from datetime import timedelta
+    updated = 0
     modified_rows = []
     
-    for row in rows:
-        modified = False
-        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_capacity is not None:
-            if row.total_capacity != payload.total_capacity:
-                if payload.total_capacity < row.booked_count:
-                    raise HTTPException(status_code=400, detail=f"Cannot reduce capacity to {payload.total_capacity} on {row.date} — {row.booked_count} seats already booked.")
-                row.total_capacity = payload.total_capacity
-                modified = True
-        elif payload.action == BulkActionType.OPEN:
-            if row.is_closed:
-                row.is_closed = False
-                modified = True
-        elif payload.action == BulkActionType.CLOSE:
-            if not row.is_closed:
-                row.is_closed = True
-                modified = True
-        elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is None:
-                if row.booked_count > 0:
-                    raise HTTPException(status_code=400, detail=f"Cannot delete inventory on {row.date} — {row.booked_count} seats already booked.")
-                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
-                modified = True
-                
-        if modified:
-            modified_rows.append(row)
-            updated += 1
+    cur_d = payload.from_date
+    while cur_d <= payload.to_date:
+        row = rows_by_date.get(cur_d)
+        if row is None:
+            # If OPEN or UPDATE_CAPACITY, auto-generate missing date row
+            if payload.action in (BulkActionType.OPEN, BulkActionType.UPDATE_CAPACITY):
+                cap = payload.total_capacity if payload.total_capacity is not None else (getattr(variant, 'max_capacity', None) or 500)
+                new_row = PackageVariantInventory(
+                    variant_id=payload.variant_id,
+                    date=cur_d,
+                    total_capacity=cap,
+                    booked_count=0,
+                    reserved_count=0,
+                    is_closed=False,
+                )
+                db.add(new_row)
+                modified_rows.append(new_row)
+                updated += 1
+        else:
+            modified = False
+            if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_capacity is not None:
+                if row.deleted_at is not None:
+                    row.deleted_at = None
+                    row.is_closed = False
+                    modified = True
+                if row.total_capacity != payload.total_capacity:
+                    if payload.total_capacity < row.booked_count:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot reduce capacity to {payload.total_capacity} on {row.date} — {row.booked_count} seats already booked."
+                        )
+                    row.total_capacity = payload.total_capacity
+                    modified = True
+            elif payload.action == BulkActionType.OPEN:
+                if row.deleted_at is not None:
+                    row.deleted_at = None
+                    row.is_closed = False
+                    modified = True
+                elif row.is_closed:
+                    row.is_closed = False
+                    modified = True
+            elif payload.action == BulkActionType.CLOSE:
+                if row.deleted_at is None and not row.is_closed:
+                    row.is_closed = True
+                    modified = True
+            elif payload.action == BulkActionType.DELETE:
+                if row.deleted_at is None:
+                    if row.booked_count > 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot delete inventory on {row.date} — {row.booked_count} seats already booked."
+                        )
+                    row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                    modified = True
+                    
+            if modified:
+                modified_rows.append(row)
+                updated += 1
+        cur_d += timedelta(days=1)
             
     if updated == 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="No slots were modified. They are already in the requested state."
-        )
+        return {
+            "updated": 0, 
+            "message": "No slots were modified. All slots in the selected date range are already in the requested state."
+        }
             
     await db.commit()
     from app.utils.cache import clear_cache_prefix_async
@@ -1472,33 +1513,25 @@ async def bulk_action_package_inventory(
     # Broadcast SSE updates for modified rows
     if updated > 0:
         from app.utils.sse import sse_manager, build_package_sse_payload
-        from sqlalchemy.orm import joinedload
-        variant_res = await db.execute(
-            select(PackageVariant)
-            .options(joinedload(PackageVariant.package))
-            .where(PackageVariant.id == payload.variant_id)
-        )
-        variant = variant_res.scalar_one_or_none()
-        if variant:
-            if updated > 50:
-                import time
-                from app.core.timezone import get_ist_now
-                bulk_payload = {
-                    "version": int(time.time() * 1000),
-                    "timestamp": get_ist_now().isoformat(),
-                    "package_id": variant.package_id,
-                    "type": "packages"
-                }
-                await sse_manager.broadcast_event("package", str(variant.package_id), "BULK_REFRESH", bulk_payload)
-            else:
-                for row in modified_rows:
-                    if row.deleted_at is not None:
-                        sse_payload = build_package_sse_payload(variant, None, row.date)
-                        sse_payload["available"] = 0
-                        sse_payload["is_closed"] = True
-                    else:
-                        sse_payload = build_package_sse_payload(variant, row, row.date)
-                    await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
+        if updated > 50:
+            import time
+            from app.core.timezone import get_ist_now
+            bulk_payload = {
+                "version": int(time.time() * 1000),
+                "timestamp": get_ist_now().isoformat(),
+                "package_id": variant.package_id,
+                "type": "packages"
+            }
+            await sse_manager.broadcast_event("package", str(variant.package_id), "BULK_REFRESH", bulk_payload)
+        else:
+            for row in modified_rows:
+                if row.deleted_at is not None:
+                    sse_payload = build_package_sse_payload(variant, None, row.date)
+                    sse_payload["available"] = 0
+                    sse_payload["is_closed"] = True
+                else:
+                    sse_payload = build_package_sse_payload(variant, row, row.date)
+                await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
         
     action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
     return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
@@ -1513,54 +1546,96 @@ async def bulk_action_room_inventory(
     if payload.from_date > payload.to_date:
         raise HTTPException(status_code=400, detail="from_date must be <= to_date")
         
+    room_result = await db.execute(
+        select(RoomVariant, Room).join(Room, Room.id == RoomVariant.room_id).where(
+            RoomVariant.id == payload.room_variant_id
+        )
+    )
+    rv_row = room_result.first()
+    if not rv_row:
+        raise HTTPException(status_code=404, detail="Room variant not found")
+    room_variant, room_obj = rv_row
+
     query = select(RoomSlotInventory).where(
         RoomSlotInventory.room_variant_id == payload.room_variant_id,
         RoomSlotInventory.date >= payload.from_date,
         RoomSlotInventory.date <= payload.to_date,
-        RoomSlotInventory.deleted_at.is_(None),
     )
     res = await db.execute(query)
-    rows = res.scalars().all()
+    existing_rows = res.scalars().all()
+    rows_by_date = {r.date: r for r in existing_rows}
     
-    if not rows:
-        return {"updated": 0, "message": "No inventory found in the given date range."}
-        
-    updated = 0
     import datetime
+    from datetime import timedelta
+    updated = 0
     modified_rows = []
     
-    for row in rows:
-        modified = False
-        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_rooms is not None:
-            if row.total_rooms != payload.total_rooms:
-                if payload.total_rooms < row.booked_rooms:
-                    raise HTTPException(status_code=400, detail=f"Cannot reduce rooms to {payload.total_rooms} on {row.date} — {row.booked_rooms} rooms already booked.")
-                row.total_rooms = payload.total_rooms
-                modified = True
-        elif payload.action == BulkActionType.OPEN:
-            if row.is_closed:
-                row.is_closed = False
-                modified = True
-        elif payload.action == BulkActionType.CLOSE:
-            if not row.is_closed:
-                row.is_closed = True
-                modified = True
-        elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is None:
-                if row.booked_rooms > 0:
-                    raise HTTPException(status_code=400, detail=f"Cannot delete inventory on {row.date} — {row.booked_rooms} rooms already booked.")
-                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
-                modified = True
-                
-        if modified:
-            modified_rows.append(row)
-            updated += 1
+    cur_d = payload.from_date
+    while cur_d <= payload.to_date:
+        row = rows_by_date.get(cur_d)
+        if row is None:
+            if payload.action in (BulkActionType.OPEN, BulkActionType.UPDATE_CAPACITY):
+                tot_rooms = payload.total_rooms if payload.total_rooms is not None else (room_variant.total_rooms or 10)
+                new_row = RoomSlotInventory(
+                    room_variant_id=payload.room_variant_id,
+                    date=cur_d,
+                    slot_start=room_obj.slot_start,
+                    slot_end=room_obj.slot_end,
+                    total_rooms=tot_rooms,
+                    booked_rooms=0,
+                    reserved_rooms=0,
+                    is_closed=False,
+                )
+                db.add(new_row)
+                modified_rows.append(new_row)
+                updated += 1
+        else:
+            modified = False
+            if payload.action == BulkActionType.UPDATE_CAPACITY and payload.total_rooms is not None:
+                if row.deleted_at is not None:
+                    row.deleted_at = None
+                    row.is_closed = False
+                    modified = True
+                if row.total_rooms != payload.total_rooms:
+                    if payload.total_rooms < row.booked_rooms:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot reduce rooms to {payload.total_rooms} on {row.date} — {row.booked_rooms} rooms already booked."
+                        )
+                    row.total_rooms = payload.total_rooms
+                    modified = True
+            elif payload.action == BulkActionType.OPEN:
+                if row.deleted_at is not None:
+                    row.deleted_at = None
+                    row.is_closed = False
+                    modified = True
+                elif row.is_closed:
+                    row.is_closed = False
+                    modified = True
+            elif payload.action == BulkActionType.CLOSE:
+                if row.deleted_at is None and not row.is_closed:
+                    row.is_closed = True
+                    modified = True
+            elif payload.action == BulkActionType.DELETE:
+                if row.deleted_at is None:
+                    if row.booked_rooms > 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Cannot delete inventory on {row.date} — {row.booked_rooms} rooms already booked."
+                        )
+                    row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                    modified = True
+                    
+            if modified:
+                modified_rows.append(row)
+                updated += 1
+        cur_d += timedelta(days=1)
             
     if updated == 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="No slots were modified. They are already in the requested state."
-        )
+        return {
+            "updated": 0, 
+            "message": "No slots were modified. All slots in the selected date range are already in the requested state."
+        }
             
     await db.commit()
     
@@ -1569,54 +1644,46 @@ async def bulk_action_room_inventory(
     await clear_cache_prefix_async(f"inventory:rooms:{payload.room_variant_id}")
     await clear_cache_prefix_async("rooms:")
     
-    from app.models.room import RoomVariant, Room
     from app.services.redis_client import invalidate_cached_availability
     from app.utils.cache import trigger_frontend_revalidation
     import asyncio
     
-    room_result = await db.execute(
-        select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
-            RoomVariant.id == payload.room_variant_id
-        )
-    )
-    room_info = room_result.first()
-    if room_info:
-        slug, room_id = room_info
-        await clear_cache_prefix_async(f"rooms:detail:{slug}")
-        asyncio.create_task(invalidate_cached_availability(slug))
-        trigger_frontend_revalidation(tags=[f"room-{slug}"])
+    slug, room_id = room_obj.slug, room_obj.id
+    await clear_cache_prefix_async(f"rooms:detail:{slug}")
+    asyncio.create_task(invalidate_cached_availability(slug))
+    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+    
+    # Broadcast SSE updates for modified rows
+    if updated > 0:
+        import time
+        from app.core.timezone import get_ist_now
+        from app.utils.sse import sse_manager
         
-        # Broadcast SSE updates for modified rows
-        if updated > 0:
-            import time
-            from app.core.timezone import get_ist_now
-            from app.utils.sse import sse_manager
-            
-            if updated > 50:
-                bulk_payload = {
+        if updated > 50:
+            bulk_payload = {
+                "version": int(time.time() * 1000),
+                "timestamp": get_ist_now().isoformat(),
+                "room_id": room_id,
+                "type": "rooms"
+            }
+            await sse_manager.broadcast_event("room", str(room_id), "BULK_REFRESH", bulk_payload)
+        else:
+            for row in modified_rows:
+                is_deleted = row.deleted_at is not None
+                sse_payload = {
                     "version": int(time.time() * 1000),
                     "timestamp": get_ist_now().isoformat(),
                     "room_id": room_id,
-                    "type": "rooms"
+                    "travel_date": str(row.date),
+                    "available": 0 if is_deleted else max(0, row.total_rooms - row.booked_rooms - row.reserved_rooms),
+                    "reserved": 0 if is_deleted else row.reserved_rooms,
+                    "booked": 0 if is_deleted else row.booked_rooms,
+                    "is_closed": True if is_deleted else row.is_closed,
+                    "variant_id": payload.room_variant_id,
+                    "slot_start": str(row.slot_start),
+                    "slot_end": str(row.slot_end)
                 }
-                await sse_manager.broadcast_event("room", str(room_id), "BULK_REFRESH", bulk_payload)
-            else:
-                for row in modified_rows:
-                    is_deleted = row.deleted_at is not None
-                    sse_payload = {
-                        "version": int(time.time() * 1000),
-                        "timestamp": get_ist_now().isoformat(),
-                        "room_id": room_id,
-                        "travel_date": str(row.date),
-                        "available": 0 if is_deleted else max(0, row.total_rooms - row.booked_rooms - row.reserved_rooms),
-                        "reserved": 0 if is_deleted else row.reserved_rooms,
-                        "booked": 0 if is_deleted else row.booked_rooms,
-                        "is_closed": True if is_deleted else row.is_closed,
-                        "variant_id": payload.room_variant_id,
-                        "slot_start": str(row.slot_start),
-                        "slot_end": str(row.slot_end)
-                    }
-                    await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
+                await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
 
     action_name = payload.action.value if hasattr(payload.action, 'value') else payload.action
     return {"updated": updated, "message": f"Successfully applied {action_name} to {updated} slots."}
@@ -1648,58 +1715,82 @@ async def bulk_action_transport_inventory(
         PackageTransportInventory.transport_option_id.in_(opt_ids),
         PackageTransportInventory.date >= payload.from_date,
         PackageTransportInventory.date <= payload.to_date,
-        PackageTransportInventory.deleted_at.is_(None),
     )
     res = await db.execute(query)
-    rows = res.scalars().all()
+    existing_rows = res.scalars().all()
+    rows_by_opt_and_date = {(r.transport_option_id, r.date): r for r in existing_rows}
     
-    if not rows:
-        return {"updated": 0, "message": "No transport inventory found in the given date range."}
-        
-    updated = 0
     import datetime
+    from datetime import timedelta
+    updated = 0
     modified_rows = []
     
-    for row in rows:
-        modified = False
-        if payload.action == BulkActionType.UPDATE_CAPACITY and payload.option_counts:
-            # Only update if a count was provided for this option
-            if str(row.transport_option_id) in payload.option_counts:
-                new_capacity = int(payload.option_counts[str(row.transport_option_id)])
-                if row.available_count != new_capacity:
-                    if new_capacity < row.booked_count:
-                        opt = next((o for o in opts if o.id == row.transport_option_id), None)
-                        title = opt.title if opt else "transport"
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Cannot set capacity to {new_capacity} on {row.date} for {title} as it is below already booked ({row.booked_count})."
-                        )
-                    row.available_count = new_capacity
-                    modified = True
-        elif payload.action == BulkActionType.OPEN:
-            if row.is_closed:
-                row.is_closed = False
-                modified = True
-        elif payload.action == BulkActionType.CLOSE:
-            if not row.is_closed:
-                row.is_closed = True
-                modified = True
-        elif payload.action == BulkActionType.DELETE:
-            if row.deleted_at is None:
-                if row.booked_count > 0:
-                    raise HTTPException(status_code=400, detail=f"Cannot delete transport on {row.date} — {row.booked_count} booked.")
-                row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
-                modified = True
-                
-        if modified:
-            modified_rows.append(row)
-            updated += 1
+    for opt in opts:
+        cur_d = payload.from_date
+        while cur_d <= payload.to_date:
+            row = rows_by_opt_and_date.get((opt.id, cur_d))
+            if row is None:
+                if payload.action in (BulkActionType.OPEN, BulkActionType.UPDATE_CAPACITY):
+                    cap = int(payload.option_counts[str(opt.id)]) if (payload.option_counts and str(opt.id) in payload.option_counts) else int(opt.capacity or 1)
+                    new_row = PackageTransportInventory(
+                        transport_option_id=opt.id,
+                        date=cur_d,
+                        available_count=cap,
+                        booked_count=0,
+                        is_closed=False,
+                    )
+                    db.add(new_row)
+                    modified_rows.append(new_row)
+                    updated += 1
+            else:
+                modified = False
+                if payload.action == BulkActionType.UPDATE_CAPACITY and payload.option_counts:
+                    if str(opt.id) in payload.option_counts:
+                        new_capacity = int(payload.option_counts[str(opt.id)])
+                        if row.deleted_at is not None:
+                            row.deleted_at = None
+                            row.is_closed = False
+                            modified = True
+                        if row.available_count != new_capacity:
+                            if new_capacity < row.booked_count:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Cannot set capacity to {new_capacity} on {row.date} for {opt.title} as it is below already booked ({row.booked_count})."
+                                )
+                            row.available_count = new_capacity
+                            modified = True
+                elif payload.action == BulkActionType.OPEN:
+                    if row.deleted_at is not None:
+                        row.deleted_at = None
+                        row.is_closed = False
+                        modified = True
+                    elif row.is_closed:
+                        row.is_closed = False
+                        modified = True
+                elif payload.action == BulkActionType.CLOSE:
+                    if row.deleted_at is None and not row.is_closed:
+                        row.is_closed = True
+                        modified = True
+                elif payload.action == BulkActionType.DELETE:
+                    if row.deleted_at is None:
+                        if row.booked_count > 0:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Cannot delete transport on {row.date} — {row.booked_count} booked."
+                            )
+                        row.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+                        modified = True
+                        
+                if modified:
+                    modified_rows.append(row)
+                    updated += 1
+            cur_d += timedelta(days=1)
             
     if updated == 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="No slots were modified. They are already in the requested state."
-        )
+        return {
+            "updated": 0, 
+            "message": "No slots were modified. All slots in the selected date range are already in the requested state."
+        }
             
     await db.commit()
     

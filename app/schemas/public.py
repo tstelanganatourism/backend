@@ -83,6 +83,7 @@ class PackageListDTO(AppBaseModel):
     is_active: bool = True
     is_featured: bool
     is_student_package: bool = False
+    order_priority: Optional[int] = 0
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
     advance_payment_type: Optional[str] = "FULL_PAYMENT"
@@ -206,6 +207,7 @@ class RoomListDTO(AppBaseModel):
     address: Optional[str] = None
     map_url: Optional[str] = None
     facilities: List[str] = Field(default_factory=list)
+    order_priority: Optional[int] = 0
 
 class RoomDetailDTO(RoomListDTO, SEOSchema):
     description: Optional[str] = None

@@ -78,12 +78,20 @@ async def get_signed_url(
                         raise HTTPException(status_code=403, detail="Not authorized to view this document")
                         
     elif req.object_key.startswith("private/brochures/"):
-        pass 
+        from app.models.package import Package
+        from sqlalchemy.future import select
+        async with AsyncSessionLocal() as db:
+            stmt = select(Package.slug).where(Package.brochure_pdf_url.ilike(f"%{req.object_key}%")).limit(1)
+            result = await db.execute(stmt)
+            slug = result.scalars().first()
+            if slug:
+                return SignedUrlResponse(url=f"/print/package/{slug}?autoDownload=true", expires_in=900)
+        return SignedUrlResponse(url="/brochures", expires_in=900)
     else:
         raise HTTPException(status_code=400, detail="Unknown document prefix or invalid URL")
 
     # If it is a legacy key not starting with http, return a dummy/blank url or raise error as R2 is removed
-    raise HTTPException(status_code=404, detail="Legacy R2 keys are no longer accessible.")
+    raise HTTPException(status_code=404, detail="Legacy document key is no longer accessible.")
 
 
 @router.get("/download")
@@ -163,10 +171,23 @@ async def download_document(
                         raise HTTPException(status_code=403, detail="Not authorized to view this document")
 
     elif key.startswith("private/brochures/"):
-        pass  # Public access allowed
+        # Legacy R2 brochure key: redirect to dynamic package print/PDF generator
+        from fastapi.responses import RedirectResponse
+        from app.models.package import Package
+        from sqlalchemy.future import select
+        async with AsyncSessionLocal() as db:
+            stmt = select(Package.slug).where(Package.brochure_pdf_url.ilike(f"%{key}%")).limit(1)
+            result = await db.execute(stmt)
+            slug = result.scalars().first()
+            if slug:
+                return RedirectResponse(url=f"/print/package/{slug}?autoDownload=true", status_code=307)
+        if filename:
+            slug = filename.replace("-brochure.pdf", "").replace(".pdf", "")
+            return RedirectResponse(url=f"/print/package/{slug}?autoDownload=true", status_code=307)
+        return RedirectResponse(url="/brochures", status_code=307)
 
     else:
         raise HTTPException(status_code=400, detail="Unknown document prefix")
 
-    raise HTTPException(status_code=404, detail="Legacy R2 keys are no longer accessible.")
+    raise HTTPException(status_code=404, detail="Legacy document key is no longer accessible.")
 

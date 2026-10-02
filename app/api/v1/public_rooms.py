@@ -201,7 +201,8 @@ async def get_rooms(
                     starting_weekend_price=r.starting_weekend_price,
                     address=r.address,
                     map_url=r.map_url,
-                    facilities=r.facilities if r.facilities else []
+                    facilities=r.facilities if r.facilities else [],
+                    order_priority=r.order_priority
                 ))
 
             has_next = (offset + size) < total_count
@@ -305,8 +306,9 @@ async def get_room_category(
             is_featured=room.is_featured,
             starting_price=room.starting_price, starting_weekend_price=room.starting_weekend_price,
             address=room.address, map_url=room.map_url, facilities=room.facilities or [],
+            order_priority=room.order_priority,
         ))
-    rooms_dto.sort(key=lambda r: (not r.is_featured, r.starting_price or 0))
+    rooms_dto.sort(key=lambda r: (r.order_priority if r.order_priority is not None else 9999, r.id))
     cover_image = cat.cover_image_url or DEFAULT_ROOM_CATEGORY_IMAGES.get(cat.slug)
     if not cover_image:
         for r in rooms_dto:

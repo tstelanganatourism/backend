@@ -57,10 +57,17 @@ class SSEManager:
 
 def build_package_sse_payload(variant, inventory_row, travel_date):
     import time
+    from datetime import date
     from app.core.timezone import get_ist_now
     from decimal import Decimal
     
-    is_weekend = travel_date.weekday() in (5, 6)
+    if isinstance(travel_date, str):
+        try:
+            travel_date = date.fromisoformat(travel_date)
+        except Exception:
+            pass
+
+    is_weekend = travel_date.weekday() in (5, 6) if hasattr(travel_date, 'weekday') else False
     is_student = False
     if hasattr(variant, 'package') and variant.package:
         is_student = variant.package.is_student_package
@@ -72,24 +79,31 @@ def build_package_sse_payload(variant, inventory_row, travel_date):
     is_closed = True
 
     if inventory_row:
-        modifier = inventory_row.price_override if inventory_row.price_override is not None else Decimal("0.00")
+        if inventory_row.price_override is not None:
+            try:
+                modifier = Decimal(str(inventory_row.price_override))
+            except Exception:
+                modifier = Decimal("0.00")
         total_capacity = inventory_row.total_capacity
         booked_count = inventory_row.booked_count
         reserved_count = getattr(inventory_row, 'reserved_count', 0)
         is_closed = inventory_row.is_closed
 
     if is_student:
-        b_student = variant.weekend_student_price if is_weekend and getattr(variant, 'weekend_student_price', None) is not None else getattr(variant, 'student_price', Decimal("0.00"))
+        raw_student = variant.weekend_student_price if is_weekend and getattr(variant, 'weekend_student_price', None) is not None else getattr(variant, 'student_price', None)
+        b_student = Decimal(str(raw_student)) if raw_student is not None else Decimal("0.00")
         b_adult = Decimal("0.00")
         b_child = Decimal("0.00")
     else:
         b_student = None
-        b_adult = variant.weekend_adult_price if is_weekend and getattr(variant, 'weekend_adult_price', None) is not None else getattr(variant, 'adult_price', Decimal("0.00"))
-        b_child = variant.weekend_child_price if is_weekend and getattr(variant, 'weekend_child_price', None) is not None else getattr(variant, 'child_price', Decimal("0.00"))
+        raw_adult = variant.weekend_adult_price if is_weekend and getattr(variant, 'weekend_adult_price', None) is not None else getattr(variant, 'adult_price', None)
+        raw_child = variant.weekend_child_price if is_weekend and getattr(variant, 'weekend_child_price', None) is not None else getattr(variant, 'child_price', None)
+        b_adult = Decimal(str(raw_adult)) if raw_adult is not None else Decimal("0.00")
+        b_child = Decimal(str(raw_child)) if raw_child is not None else Decimal("0.00")
 
-    eff_student = float(max(Decimal("0.00"), (b_student or Decimal("0.00")) + modifier)) if b_student is not None else None
-    eff_adult = float(max(Decimal("0.00"), (b_adult or Decimal("0.00")) + modifier))
-    eff_child = float(max(Decimal("0.00"), (b_child or Decimal("0.00")) + modifier))
+    eff_student = float(max(Decimal("0.00"), b_student + modifier)) if b_student is not None else None
+    eff_adult = float(max(Decimal("0.00"), b_adult + modifier))
+    eff_child = float(max(Decimal("0.00"), b_child + modifier))
 
     return {
         "version": int(time.time() * 1000),

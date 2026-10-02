@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, text, delete
+from sqlalchemy import select, func, or_, text, delete, update
 from typing import List, Optional
 from datetime import time
 
@@ -125,7 +125,7 @@ async def list_rooms(
         selectinload(Room.variants),
         selectinload(Room.categories)
     )
-    query = query.order_by(Room.order_priority.desc(), Room.created_at.desc()).limit(limit).offset(offset)
+    query = query.order_by(Room.order_priority.asc(), Room.id.asc()).limit(limit).offset(offset)
     
     result = await db.execute(query)
     items = result.scalars().all()
@@ -331,6 +331,38 @@ async def remove_room_from_category(
 router.include_router(room_category_router)
 
 
+class RoomReorderItem(BaseModel):
+    id: int
+    order_priority: int
+
+
+@router.put("/reorder", status_code=200)
+async def reorder_rooms(
+    items: List[RoomReorderItem],
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Bulk update order_priority for rooms/lodges.
+    Instantly clears public discovery memory caches.
+    """
+    if not items:
+        return {"status": "success", "updated": 0}
+        
+    for item in items:
+        await db.execute(
+            update(Room)
+            .where(Room.id == item.id)
+            .values(order_priority=item.order_priority)
+        )
+    await db.commit()
+    
+    from app.core.memory_cache import clear_mem_cache
+    clear_mem_cache("rooms_list")
+    clear_mem_cache("room_cat_detail")
+    
+    return {"status": "success", "updated": len(items)}
+
+
 @router.get("/{room_id}", response_model=RoomDetailResponse)
 async def get_room(
     room_id: int,
@@ -478,6 +510,10 @@ async def update_room(
     )
 
     await db.commit()
+    
+    from app.core.memory_cache import clear_mem_cache
+    clear_mem_cache("rooms_list")
+    clear_mem_cache("room_cat_detail")
     
     await log_action(
         db=db,

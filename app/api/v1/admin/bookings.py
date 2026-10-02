@@ -395,6 +395,186 @@ async def get_bookings_summary(
     }
 
 
+# ─── Admin Print Report ───────────────────────────────────────────────────────
+
+@router.get("/print-report")
+async def get_bookings_print_report(
+    db: AsyncSession = Depends(get_db),
+    date: Optional[str] = Query(None, description="Single date (YYYY-MM-DD)"),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+    status_filter: Optional[str] = Query(None, description="Filter by status"),
+):
+    """
+    Returns all PACKAGE (non-room) bookings for a given date or date range.
+    Used by the admin print/download bookings report feature.
+    Includes phone number of the primary passenger for each booking.
+    """
+    from datetime import datetime as dt
+
+    # Resolve date range
+    if date:
+        try:
+            single_dt = dt.strptime(date, "%Y-%m-%d").date()
+            start_dt = single_dt
+            end_dt = single_dt
+        except ValueError:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail="Invalid date format. Use YYYY-MM-DD.")
+    elif start_date or end_date:
+        start_dt = dt.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end_dt = dt.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+    else:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="Provide either 'date' or 'start_date'/'end_date'.")
+
+    # Base query — ONLY package bookings (variant_id is not null, room_variant_id is null)
+    base_query = (
+        select(Booking)
+        .where(Booking.deleted_at.is_(None))
+        .where(Booking.variant_id.isnot(None))
+        .where(Booking.room_variant_id.is_(None))
+    )
+
+    # Date range filter on travel_date
+    if start_dt and end_dt:
+        base_query = base_query.where(
+            and_(Booking.travel_date >= start_dt, Booking.travel_date <= end_dt)
+        )
+    elif start_dt:
+        base_query = base_query.where(Booking.travel_date >= start_dt)
+    elif end_dt:
+        base_query = base_query.where(Booking.travel_date <= end_dt)
+
+    # Optional status filter
+    if status_filter:
+        from app.models.enums import BookingStatus
+        try:
+            status_enum = BookingStatus(status_filter.upper())
+            base_query = base_query.where(Booking.status == status_enum)
+        except ValueError:
+            pass
+
+    base_query = (
+        base_query
+        .options(selectinload(Booking.passengers))
+        .order_by(Booking.travel_date.asc(), Booking.created_at.asc())
+    )
+
+    result = await db.execute(base_query)
+    bookings = result.scalars().all()
+
+    # Batch-load variant info (package title, variant title, package type)
+    variant_ids = {b.variant_id for b in bookings if b.variant_id}
+    variant_map: dict = {}
+    if variant_ids:
+        from app.models.package import PackageBoardingPoint
+        pv_res = await db.execute(
+            select(PackageVariant, Package.title, Package.type)
+            .join(Package, Package.id == PackageVariant.package_id)
+            .where(PackageVariant.id.in_(variant_ids))
+        )
+        for pv, pkg_title, pkg_type in pv_res.all():
+            variant_map[pv.id] = {
+                "package_title": pkg_title,
+                "variant_title": pv.title,
+                "package_type": pkg_type.value if hasattr(pkg_type, 'value') else str(pkg_type),
+            }
+
+    # Batch-load user info
+    user_ids = {b.user_id for b in bookings if b.user_id}
+    user_map: dict = {}
+    if user_ids:
+        u_res = await db.execute(select(User).where(User.id.in_(user_ids)))
+        for u in u_res.scalars().all():
+            user_map[u.id] = u
+
+    items = []
+    for b in bookings:
+        info = variant_map.get(b.variant_id, {"package_title": "—", "variant_title": "—", "package_type": None})
+        customer = user_map.get(b.user_id) if b.user_id else None
+        primary_pax = next((p for p in b.passengers if p.is_primary), b.passengers[0] if b.passengers else None)
+
+        # Phone: prefer primary passenger phone, then user phone
+        phone = (
+            (primary_pax.phone_number if primary_pax else None)
+            or (customer.phone_number if customer else None)
+            or "—"
+        )
+
+        # Transport selections from pricing snapshot
+        transport_text = "—"
+        if b.pricing_snapshot and isinstance(b.pricing_snapshot, dict):
+            ts_list = b.pricing_snapshot.get("transport_selections", [])
+            if ts_list:
+                parts = []
+                for ts in ts_list:
+                    title = ts.get("title", "")
+                    qty = ts.get("quantity")
+                    if qty and int(qty) > 1:
+                        parts.append(f"{qty}x {title}")
+                    else:
+                        parts.append(title)
+                transport_text = ", ".join(parts) if parts else "—"
+
+        # Passenger count
+        pax_count = b.student_count if (b.student_count and b.student_count > 0) else (b.adult_count + b.child_count)
+        pax_label_parts = []
+        if b.student_count and b.student_count > 0:
+            pax_label_parts.append(f"{b.student_count} Student{'s' if b.student_count > 1 else ''}")
+        else:
+            if b.adult_count > 0:
+                pax_label_parts.append(f"{b.adult_count} Adult{'s' if b.adult_count > 1 else ''}")
+            if b.child_count > 0:
+                pax_label_parts.append(f"{b.child_count} Child{'ren' if b.child_count > 1 else ''}")
+        pax_label = ", ".join(pax_label_parts) if pax_label_parts else f"{pax_count} Pax"
+
+        items.append({
+            "pnr": b.public_id,
+            "package_name": info["package_title"],
+            "category": info["variant_title"],
+            "package_type": info["package_type"],
+            "transport": transport_text,
+            "booker_name": (
+                primary_pax.full_name if primary_pax
+                else (customer.full_name if customer else "Guest")
+            ),
+            "passenger_count": pax_count,
+            "passenger_label": pax_label,
+            "travel_date": b.travel_date.isoformat(),
+            "mobile": phone,
+            "status": b.status.value if hasattr(b.status, "value") else str(b.status),
+            "source": b.source.value if hasattr(b.source, "value") else str(b.source),
+            "total_amount": float(b.total_amount),
+            "paid_amount": float(b.paid_amount),
+            "remaining_balance": float(b.remaining_balance),
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        })
+
+    # Determine report date label
+    if date:
+        report_label = dt.strptime(date, "%Y-%m-%d").strftime("%d %B %Y")
+    elif start_dt and end_dt and start_dt == end_dt:
+        report_label = start_dt.strftime("%d %B %Y")
+    elif start_dt and end_dt:
+        report_label = f"{start_dt.strftime('%d %b %Y')} – {end_dt.strftime('%d %b %Y')}"
+    elif start_dt:
+        report_label = f"From {start_dt.strftime('%d %b %Y')}"
+    elif end_dt:
+        report_label = f"Up to {end_dt.strftime('%d %b %Y')}"
+    else:
+        report_label = "All Dates"
+
+    return {
+        "report_label": report_label,
+        "date": date,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total": len(items),
+        "items": items,
+    }
+
+
 # ─── Admin Direct Booking ────────────────────────────────────────────────────
 
 class AdminPassengerInput(BaseModel):
@@ -439,6 +619,13 @@ class AdminCreateBookingRequest(BaseModel):
     # Booking mode: QUICK = only lead passenger details, rest auto-filled
     quick_booking: Optional[bool] = False
     coupon_code: Optional[str] = None
+    # Tax & Surcharges overrides
+    gst_rate: Optional[float] = None              # Percentage override (e.g. 0.0, 5.0, 18.0)
+    gst_amount: Optional[float] = None            # Direct rupee amount override
+    service_charge_rate: Optional[float] = None   # Percentage override (e.g. 0.0, 1.0, 2.0)
+    service_charge_amount: Optional[float] = None # Direct rupee amount override
+    gateway_fee_rate: Optional[float] = None      # Percentage override (e.g. 0.0, 1.0)
+    gateway_fee_amount: Optional[float] = None    # Direct rupee amount override
 
 @router.post("/create")
 async def admin_create_booking(
@@ -792,10 +979,39 @@ async def admin_create_booking(
 
     discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
 
-    # Admin bookings: calculate GST (5%), Service Charge (1%), and Gateway Fee (1%)
-    gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
-    service_charge = (discounted_subtotal * Decimal("0.01")).quantize(Decimal("0.01"))
-    gateway_fee = ((discounted_subtotal + gst_amount + service_charge) * Decimal("0.01")).quantize(Decimal("0.01"))
+    # Admin bookings: calculate GST, Ts Boat Service Charge, and Gateway Fee
+    # Admin has full control to override rates or direct amounts (including setting to 0)
+    if request.gst_amount is not None:
+        gst_amount = Decimal(str(request.gst_amount)).quantize(Decimal("0.01"))
+        effective_gst_rate = (gst_amount / discounted_subtotal * Decimal("100")).quantize(Decimal("0.01")) if discounted_subtotal > Decimal("0") else Decimal("0.00")
+    elif request.gst_rate is not None:
+        effective_gst_rate = Decimal(str(request.gst_rate)).quantize(Decimal("0.01"))
+        gst_amount = (discounted_subtotal * (effective_gst_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        effective_gst_rate = Decimal("5.00")
+        gst_amount = (discounted_subtotal * Decimal("0.05")).quantize(Decimal("0.01"))
+
+    if request.service_charge_amount is not None:
+        service_charge = Decimal(str(request.service_charge_amount)).quantize(Decimal("0.01"))
+        effective_sc_rate = (service_charge / discounted_subtotal * Decimal("100")).quantize(Decimal("0.01")) if discounted_subtotal > Decimal("0") else Decimal("0.00")
+    elif request.service_charge_rate is not None:
+        effective_sc_rate = Decimal(str(request.service_charge_rate)).quantize(Decimal("0.01"))
+        service_charge = (discounted_subtotal * (effective_sc_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        effective_sc_rate = Decimal("1.00")
+        service_charge = (discounted_subtotal * Decimal("0.01")).quantize(Decimal("0.01"))
+
+    if request.gateway_fee_amount is not None:
+        gateway_fee = Decimal(str(request.gateway_fee_amount)).quantize(Decimal("0.01"))
+        tax_base = discounted_subtotal + gst_amount + service_charge
+        effective_gw_rate = (gateway_fee / tax_base * Decimal("100")).quantize(Decimal("0.01")) if tax_base > Decimal("0") else Decimal("0.00")
+    elif request.gateway_fee_rate is not None:
+        effective_gw_rate = Decimal(str(request.gateway_fee_rate)).quantize(Decimal("0.01"))
+        gateway_fee = ((discounted_subtotal + gst_amount + service_charge) * (effective_gw_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        effective_gw_rate = Decimal("0.00")
+        gateway_fee = Decimal("0.00")
+
     total_amount = discounted_subtotal + gst_amount + service_charge + gateway_fee
 
     # Agent commission (if booking under an agent)
@@ -819,8 +1035,11 @@ async def admin_create_booking(
         "coupon_discount": str(coupon_discount),
         "coupon_applied": coupon_applied,
         "gst_amount": str(gst_amount),
+        "gst_rate": str(effective_gst_rate),
         "service_charge": str(service_charge),
+        "service_charge_rate": str(effective_sc_rate),
         "gateway_fee": str(gateway_fee),
+        "gateway_fee_rate": str(effective_gw_rate),
         "tourist_total": str(total_amount),
         "agent_discount": "0.00",
         "agent_payable": str(total_amount),
@@ -2240,3 +2459,123 @@ async def _reschedule_booking_date(booking: Booking, new_date: date, db: AsyncSe
         logger.error(f"Failed to queue post-booking documents task: {e}")
         
     return locals().get("transport_updates", [])
+
+
+class AdminAdjustTaxesRequest(BaseModel):
+    gst_rate: Optional[float] = None
+    gst_amount: Optional[float] = None
+    service_charge_rate: Optional[float] = None
+    service_charge_amount: Optional[float] = None
+    gateway_fee_rate: Optional[float] = None
+    gateway_fee_amount: Optional[float] = None
+
+
+@router.patch("/{booking_id}/adjust-taxes")
+async def admin_adjust_booking_taxes(
+    booking_id: int,
+    request: AdminAdjustTaxesRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """
+    Adjust GST, Ts Boat Service Charge, and Gateway Fee for an existing booking.
+    Recalculates total_amount and remaining_balance, updates pricing_snapshot,
+    and enqueues invoice/ticket document regeneration.
+    """
+    result = await db.execute(
+        select(Booking).where(Booking.id == booking_id).with_for_update()
+    )
+    booking = result.scalar_one_or_none()
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    pricing = dict(booking.pricing_snapshot or {})
+    subtotal_amount = booking.subtotal_amount
+    coupon_discount = booking.coupon_discount or Decimal("0.00")
+    discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
+
+    # 1. GST calculation
+    if request.gst_amount is not None:
+        gst_amount = Decimal(str(request.gst_amount)).quantize(Decimal("0.01"))
+        effective_gst_rate = (gst_amount / discounted_subtotal * Decimal("100")).quantize(Decimal("0.01")) if discounted_subtotal > Decimal("0") else Decimal("0.00")
+    elif request.gst_rate is not None:
+        effective_gst_rate = Decimal(str(request.gst_rate)).quantize(Decimal("0.01"))
+        gst_amount = (discounted_subtotal * (effective_gst_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        gst_amount = booking.gst_amount
+        effective_gst_rate = Decimal(str(pricing.get("gst_rate", "5.00")))
+
+    # 2. Service charge calculation
+    if request.service_charge_amount is not None:
+        service_charge = Decimal(str(request.service_charge_amount)).quantize(Decimal("0.01"))
+        effective_sc_rate = (service_charge / discounted_subtotal * Decimal("100")).quantize(Decimal("0.01")) if discounted_subtotal > Decimal("0") else Decimal("0.00")
+    elif request.service_charge_rate is not None:
+        effective_sc_rate = Decimal(str(request.service_charge_rate)).quantize(Decimal("0.01"))
+        service_charge = (discounted_subtotal * (effective_sc_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        service_charge = booking.service_charge
+        effective_sc_rate = Decimal(str(pricing.get("service_charge_rate", "1.00")))
+
+    # 3. Gateway fee calculation
+    tax_base = discounted_subtotal + gst_amount + service_charge
+    if request.gateway_fee_amount is not None:
+        gateway_fee = Decimal(str(request.gateway_fee_amount)).quantize(Decimal("0.01"))
+        effective_gw_rate = (gateway_fee / tax_base * Decimal("100")).quantize(Decimal("0.01")) if tax_base > Decimal("0") else Decimal("0.00")
+    elif request.gateway_fee_rate is not None:
+        effective_gw_rate = Decimal(str(request.gateway_fee_rate)).quantize(Decimal("0.01"))
+        gateway_fee = (tax_base * (effective_gw_rate / Decimal("100"))).quantize(Decimal("0.01"))
+    else:
+        gateway_fee = booking.gateway_fee
+        effective_gw_rate = Decimal(str(pricing.get("gateway_fee_rate", "0.00")))
+
+    new_total_amount = discounted_subtotal + gst_amount + service_charge + gateway_fee
+
+    booking.gst_amount = gst_amount
+    booking.service_charge = service_charge
+    booking.gateway_fee = gateway_fee
+    booking.total_amount = new_total_amount
+
+    paid_amt = booking.paid_amount or Decimal("0.00")
+    booking.remaining_balance = max(Decimal("0.00"), new_total_amount - paid_amt)
+
+    pricing.update({
+        "gst_amount": str(gst_amount),
+        "gst_rate": str(effective_gst_rate),
+        "service_charge": str(service_charge),
+        "service_charge_rate": str(effective_sc_rate),
+        "gateway_fee": str(gateway_fee),
+        "gateway_fee_rate": str(effective_gw_rate),
+        "tourist_total": str(new_total_amount),
+        "agent_payable": str(new_total_amount),
+        "last_adjusted_by_admin": current_admin.email,
+        "last_adjusted_at": datetime.utcnow().isoformat(),
+    })
+    booking.pricing_snapshot = pricing
+
+    db.add(booking)
+    await db.commit()
+    await db.refresh(booking)
+
+    # Trigger post-booking documents update asynchronously
+    try:
+        from app.worker import get_arq_pool
+        arq_pool = await get_arq_pool()
+        await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True, True)
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "booking_id": booking.id,
+        "subtotal_amount": float(booking.subtotal_amount),
+        "gst_amount": float(booking.gst_amount),
+        "gst_rate": float(effective_gst_rate),
+        "service_charge": float(booking.service_charge),
+        "service_charge_rate": float(effective_sc_rate),
+        "gateway_fee": float(booking.gateway_fee),
+        "gateway_fee_rate": float(effective_gw_rate),
+        "total_amount": float(booking.total_amount),
+        "paid_amount": float(booking.paid_amount),
+        "remaining_balance": float(booking.remaining_balance),
+        "pricing_snapshot": booking.pricing_snapshot,
+    }

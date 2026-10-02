@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, text, delete
+from sqlalchemy import select, func, or_, text, delete, update
+from pydantic import BaseModel as PyBaseModel
 from typing import List, Optional
 from pathlib import Path
 import uuid
@@ -151,7 +152,7 @@ async def list_packages(
         selectinload(Package.variants),
         selectinload(Package.transport_options)
     )
-    query = query.order_by(Package.order_priority.desc(), Package.created_at.desc()).limit(limit).offset(offset)
+    query = query.order_by(Package.order_priority.asc(), Package.id.asc()).limit(limit).offset(offset)
     
     result = await db.execute(query)
     items = result.scalars().all()
@@ -359,6 +360,40 @@ async def remove_package_from_category(
     return {"removed": package_id}
 
 router.include_router(category_router)
+
+
+class PackageReorderItem(PyBaseModel):
+    id: int
+    order_priority: int
+
+
+@router.put("/reorder", status_code=200)
+async def reorder_packages(
+    items: List[PackageReorderItem],
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin)
+):
+    """Bulk update display order / priority for packages."""
+    if not items:
+        return {"updated": 0}
+        
+    for item in items:
+        await db.execute(
+            update(Package)
+            .where(Package.id == item.id)
+            .values(order_priority=item.order_priority)
+        )
+    await db.commit()
+    
+    # Invalidate all package and category caches
+    from app.core.memory_cache import clear_mem_cache
+    clear_mem_cache()
+    await clear_cache_prefix_async("packages:")
+    await clear_cache_prefix_async("pkg_cat_")
+    from app.utils.cache import trigger_frontend_revalidation
+    trigger_frontend_revalidation(tags=["packages", "categories"])
+    
+    return {"updated": len(items)}
 
 
 @router.get("/{package_id}", response_model=PackageDetailResponse)
@@ -577,6 +612,8 @@ async def update_package(
     }
     await sse_manager.broadcast_event("package", str(package.id), "ENTITY_STATUS_UPDATE", sse_payload)
         
+    from app.core.memory_cache import clear_mem_cache
+    clear_mem_cache()
     clear_cache_prefix("packages:list:")
     clear_cache_prefix(f"packages:detail:{old_slug}")
     clear_cache_prefix(f"packages:detail:{package.slug}")

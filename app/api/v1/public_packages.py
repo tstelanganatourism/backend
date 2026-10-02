@@ -1,7 +1,10 @@
+import logging
 from typing import Optional, List
 from datetime import date, timedelta
 from decimal import Decimal
 from fastapi import APIRouter, Depends, Query, HTTPException, Response, status
+
+logger = logging.getLogger(__name__)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_, text
 from sqlalchemy.orm import selectinload, joinedload
@@ -126,6 +129,7 @@ async def get_packages(
                     Package.is_active,
                     Package.is_featured,
                     Package.is_student_package,
+                    Package.order_priority,
                     Package.starting_price,
                     Package.min_passengers,
                     func.array_remove(func.array_agg(func.distinct(Tag.name)), None).label("tags_list")
@@ -187,6 +191,7 @@ async def get_packages(
                     is_active=pkg.is_active,
                     is_featured=pkg.is_featured,
                     is_student_package=pkg.is_student_package,
+                    order_priority=pkg.order_priority,
                     min_passengers=pkg.min_passengers or 1,
                     tags=pkg.tags_list or [],
                     starting_price=pkg.starting_price,
@@ -306,7 +311,12 @@ async def get_package_category(
     if not cat:
         raise HTTPException(status_code=404, detail="Category not found")
     packages_dto = []
-    for pkg in cat.packages:
+    # Sort category packages by order_priority ascending, then id ascending
+    sorted_cat_packages = sorted(
+        cat.packages,
+        key=lambda p: (p.order_priority if p.order_priority is not None else 9999, p.id)
+    )
+    for pkg in sorted_cat_packages:
         if not (pkg.status == PublishStatus.PUBLISHED and not pkg.deleted_at):
             continue
         active_variants = [v for v in pkg.variants if v.is_active and not v.deleted_at]
@@ -316,6 +326,7 @@ async def get_package_category(
             cover_image_url=pkg.cover_image_url, video_url=getattr(pkg, 'video_url', None),
             is_active=pkg.is_active, is_featured=pkg.is_featured,
             is_student_package=getattr(pkg, 'is_student_package', False),
+            order_priority=pkg.order_priority,
             tags=[t.name for t in pkg.tags], starting_price=pkg.starting_price,
             variants=[PackageVariantPublicDTO(
                 id=v.id, title=v.title, adult_price=v.adult_price, child_price=v.child_price,
