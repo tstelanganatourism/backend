@@ -5,7 +5,8 @@ from sqlalchemy.orm import selectinload
 from decimal import Decimal
 
 from app.db.session import AsyncSessionLocal
-from app.models.package import Package, PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption, PackageMealItem, PackageExtra, PackageCategory, Tag, package_tags
+from app.models.package import Package, PackageVariant, PackageGalleryImage, PackageItineraryDay, PackageHighlight, PackageInclusion, PackageExclusion, PackageBoardingPoint, PackageFAQ, PackagePolicy, PackageTransportOption, PackageMealItem, PackageExtra, PackageCategory, package_tags
+from app.models.tag import Tag
 from app.models.room import Room, RoomVariant, RoomGalleryImage, RoomHighlight, RoomFAQ, RoomPolicy, RoomCategory
 from app.models.enums import PublishStatus
 from app.schemas.public import (
