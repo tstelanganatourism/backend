@@ -252,16 +252,23 @@ from app.services.redis_client import get_redis
 # --- Rate Limiting Middleware (Phase-4) --------------------------------------
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    client_ip = request.client.host if request.client else "unknown"
+    # Extract real client IP through reverse proxies (Vercel, Cloudflare, Render)
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    else:
+        client_ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
+
     if client_ip in ("127.0.0.1", "localhost", "::1"):
         return await call_next(request)
 
     path = request.url.path
-    
+
     # Exempt routes (health, API documentation, and static assets)
     static_extensions = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf")
     if (
         path.startswith("/health")
+        or path.startswith("/ping")
         or path.startswith("/docs")
         or path.startswith("/openapi.json")
         or path.startswith("/static")
@@ -271,15 +278,25 @@ async def rate_limit_middleware(request: Request, call_next):
         return await call_next(request)
 
     # Determine route-based thresholds
-    limit = 100        # Public browsing: 100 requests/min/IP
+    limit = 200        # Public browsing default: 200 requests/min/IP
     category = "public"
 
-    # OTP resend: 5-10 requests/min/IP -> set to 10
-    if "/admin/resend-otp" in path or "/resend-otp" in path:
+    # Admin operations: generous threshold for management operations
+    if path.startswith("/api/v1/admin"):
+        if "/admin/resend-otp" in path:
+            limit = 10
+            category = "otp_resend"
+        elif "/admin/login" in path or "/admin/verify-otp" in path:
+            limit = 20
+            category = "admin_login_otp"
+        else:
+            limit = 600
+            category = "admin_portal"
+
+    elif "/admin/resend-otp" in path or "/resend-otp" in path:
         limit = 10
         category = "otp_resend"
-    
-    # Admin login / OTP routes: 10-20 requests/min/IP -> set to 20
+
     elif (
         "/admin/login" in path
         or "/admin/verify-otp" in path
@@ -289,11 +306,24 @@ async def rate_limit_middleware(request: Request, call_next):
     ):
         limit = 20
         category = "admin_login_otp"
-        
-    # Booking checkout: 20-30 requests/min/IP -> set to 30
-    elif "/bookings" in path or "/payments" in path:
-        limit = 30
+
+    # Only actual payment/booking creation (POST/PUT checkout actions) should be throttled to checkout limit
+    elif request.method in ("POST", "PUT") and ("/bookings" in path or "/payments" in path or "/checkout" in path):
+        limit = 60
         category = "checkout"
+
+    # Check if request has an authenticated Admin token — admins get high allowance across all routes
+    auth_header = request.headers.get("authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            from app.core.security import decode_token
+            token_str = auth_header.split(" ", 1)[1]
+            token_payload = decode_token(token_str, expected_type="access")
+            if token_payload.get("role") == "ADMIN":
+                limit = max(limit, 600)
+                category = "admin_authenticated"
+        except Exception:
+            pass
 
     key = f"ratelimit:{client_ip}:{category}"
 
@@ -304,13 +334,14 @@ async def rate_limit_middleware(request: Request, call_next):
             pipe.incr(key)
             pipe.expire(key, 60, nx=True)
             res = await pipe.execute()
-            
+
         current = res[0]
         if current > limit:
             logger.warning(f"Rate limit exceeded for IP {client_ip} on {path} (Category: {category}, Current: {current}, Limit: {limit})")
             return Response(
-                content="Too Many Requests",
+                content='{"detail": "Too many requests. Please slow down and try again shortly."}',
                 status_code=429,
+                media_type="application/json",
             )
     except Exception as e:
         logger.error(f"Rate Limiter Redis Error: {e}")
