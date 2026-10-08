@@ -272,6 +272,41 @@ async def list_admin_bookings(
             }
 
     from datetime import datetime, timedelta
+    from app.models.payment import Payment
+
+    # Batch-load payments for all bookings on current page
+    booking_ids = [b.id for b in bookings]
+    payments_map: dict = {}
+    if booking_ids:
+        p_res = await db.execute(
+            select(Payment)
+            .where(Payment.booking_id.in_(booking_ids), Payment.deleted_at.is_(None))
+            .order_by(Payment.created_at.asc())
+        )
+        for p in p_res.scalars().all():
+            if p.booking_id not in payments_map:
+                payments_map[p.booking_id] = []
+            collected_by_label = p.collected_by_label
+            if not collected_by_label:
+                if p.collected_by_type == "RAZORPAY":
+                    collected_by_label = "PhonePe (Legacy)"
+                elif p.collected_by_type == "PHONEPE":
+                    collected_by_label = "PhonePe"
+                elif p.collected_by_type == "CASHFREE":
+                    collected_by_label = "Cashfree"
+                else:
+                    collected_by_label = "Admin (Cash)"
+            payments_map[p.booking_id].append({
+                "id": p.id,
+                "amount": float(p.amount),
+                "payment_method": p.payment_method,
+                "status": p.status.value if hasattr(p.status, "value") else str(p.status),
+                "collected_by_type": p.collected_by_type,
+                "collected_by_label": collected_by_label,
+                "payment_reference_id": p.payment_reference_id,
+                "created_at": p.created_at.isoformat() if p.created_at else None,
+            })
+
     items = []
     for b in bookings:
         customer = user_map.get(b.user_id) if b.user_id else None
@@ -357,6 +392,36 @@ async def list_admin_bookings(
             "primary_passenger_name": (
                 next((p.full_name for p in b.passengers if p.is_primary), None)
                 or (b.passengers[0].full_name if b.passengers else None)
+            ),
+            "passengers": [
+                {
+                    "id": p.id,
+                    "full_name": p.full_name,
+                    "age": p.age,
+                    "gender": p.gender.value if hasattr(p.gender, "value") else str(p.gender) if p.gender else None,
+                    "phone": p.phone,
+                    "relationship": p.relationship,
+                    "is_primary": p.is_primary,
+                }
+                for p in b.passengers
+            ],
+            "payment_ledger": (
+                payments_map.get(b.id, [])
+                if payments_map.get(b.id)
+                else (
+                    [{
+                        "id": 0,
+                        "amount": float(b.paid_amount),
+                        "payment_method": "ADMIN_MANUAL" if b.source.value == "ADMIN_DIRECT" or b.agent_id else "ONLINE",
+                        "status": "CAPTURED",
+                        "collected_by_type": "ADMIN" if b.source.value == "ADMIN_DIRECT" else "ONLINE",
+                        "collected_by_label": "Admin Direct Booking" if b.source.value == "ADMIN_DIRECT" else "Verified Booking Payment",
+                        "payment_reference_id": f"TXN_{b.public_id}",
+                        "created_at": b.created_at.isoformat() if b.created_at else None,
+                    }]
+                    if float(b.paid_amount or 0) > 0
+                    else []
+                )
             ),
             "pricing_snapshot": b.pricing_snapshot,
         })

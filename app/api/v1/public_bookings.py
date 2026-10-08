@@ -8,12 +8,16 @@ import uuid
 from decimal import Decimal
 from loguru import logger
 import asyncio
+import hmac
+import hashlib
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.package import PackageVariantInventory, PackageVariant, Package, PackageBoardingPoint, PackageTransportOption
 from app.models.room import Room, RoomSlotInventory, RoomVariant
 from app.models.booking import Booking, BookingPassenger, BookingStayDate
-from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType, PublishStatus
+from app.models.enums import BookingSource, BookingStatus, UserRole, GenderType, PublishStatus, PaymentStatus
+from app.models.payment import Payment
 from app.models.user import User
 from app.models.coupon import Coupon
 from app.middleware.auth import get_current_user_optional, require_agent, get_current_user
@@ -1750,9 +1754,6 @@ async def get_booking_details(
     # Fast in-memory cache check (< 0.1ms)
     cached_entry = _mem_get(f"booking_detail_full:{public_id}")
     if cached_entry is not None:
-        import hmac, hashlib
-        from app.core.config import settings
-        from app.models.enums import UserRole
         is_agent_owner = (
             current_user is not None
             and current_user.role == UserRole.AGENT
@@ -2000,8 +2001,6 @@ async def get_booking_details(
     )
 
     # ─── Build Payment Ledger ─────────────────────────────────────────────────
-    from app.models.payment import Payment
-    from app.models.enums import PaymentStatus
     payment_ledger_stmt = select(Payment).where(
         Payment.booking_id == b.id,
         Payment.deleted_at.is_(None)
@@ -2010,10 +2009,6 @@ async def get_booking_details(
     raw_payments = p_result.scalars().all()
 
     # ─── Commission Gate: Only for owning agent or admin ─────────────────────
-    import hmac
-    import hashlib
-    from app.core.config import settings
-
     is_agent_owner = (
         current_user is not None
         and current_user.role == UserRole.AGENT
