@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Backgrou
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from decimal import Decimal
+import asyncio
 import uuid
 import json
 from loguru import logger

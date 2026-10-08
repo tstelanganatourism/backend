@@ -399,9 +399,9 @@ async def list_admin_bookings(
                     "full_name": p.full_name,
                     "age": p.age,
                     "gender": p.gender.value if hasattr(p.gender, "value") else str(p.gender) if p.gender else None,
-                    "phone": p.phone,
-                    "relationship": p.relationship,
-                    "is_primary": p.is_primary,
+                    "phone": getattr(p, "phone_number", None),
+                    "relationship": getattr(p, "relationship_to_lead", None),
+                    "is_primary": bool(p.is_primary),
                 }
                 for p in b.passengers
             ],
@@ -412,10 +412,10 @@ async def list_admin_bookings(
                     [{
                         "id": 0,
                         "amount": float(b.paid_amount),
-                        "payment_method": "ADMIN_MANUAL" if b.source.value == "ADMIN_DIRECT" or b.agent_id else "ONLINE",
+                        "payment_method": "ADMIN_MANUAL" if getattr(b.source, 'value', str(b.source)) == "ADMIN_DIRECT" or b.agent_id else "ONLINE",
                         "status": "CAPTURED",
-                        "collected_by_type": "ADMIN" if b.source.value == "ADMIN_DIRECT" else "ONLINE",
-                        "collected_by_label": "Admin Direct Booking" if b.source.value == "ADMIN_DIRECT" else "Verified Booking Payment",
+                        "collected_by_type": "ADMIN" if getattr(b.source, 'value', str(b.source)) == "ADMIN_DIRECT" else "ONLINE",
+                        "collected_by_label": "Admin Direct Booking" if getattr(b.source, 'value', str(b.source)) == "ADMIN_DIRECT" else "Verified Booking Payment",
                         "payment_reference_id": f"TXN_{b.public_id}",
                         "created_at": b.created_at.isoformat() if b.created_at else None,
                     }]
