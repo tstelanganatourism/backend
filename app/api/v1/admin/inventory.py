@@ -33,7 +33,7 @@ from app.schemas.inventory import (
     PackageInventoryUpdateRequest,
 )
 from app.utils.audit import log_action
-from app.utils.cache import clear_cache_prefix, ttl_cache_get_or_set
+from app.utils.cache import clear_cache_prefix, ttl_cache_get_or_set, _mem_get, _mem_set
 
 router = APIRouter(
     prefix="/inventory",
@@ -56,14 +56,20 @@ def _compute_row(row: PackageVariantInventory) -> PackageInventoryRow:
     )
 
 
+_variant_pkg_meta: dict = {}
+
 async def _clear_package_cache_for_variant(db: AsyncSession, variant_id: int) -> None:
     import asyncio
-    result = await db.execute(
-        select(Package.id, Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
-            PackageVariant.id == variant_id
+    row = _variant_pkg_meta.get(variant_id)
+    if not row:
+        result = await db.execute(
+            select(Package.id, Package.slug).join(PackageVariant, PackageVariant.package_id == Package.id).where(
+                PackageVariant.id == variant_id
+            )
         )
-    )
-    row = result.first()
+        row = result.first()
+        if row:
+            _variant_pkg_meta[variant_id] = (row[0], row[1])
     if row:
         pkg_id, slug = row
         clear_cache_prefix("packages:list:")
@@ -270,25 +276,27 @@ async def get_variant_calendar(
         to_date = date(year, mon + 1, 1) - timedelta(days=1)
 
     cache_key = f"inventory:packages:{variant_id}:{month}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
 
-    async def _fetch():
-        query = (
-            select(PackageVariantInventory)
-            .where(
-                and_(
-                    PackageVariantInventory.variant_id == variant_id,
-                    PackageVariantInventory.date >= from_date,
-                    PackageVariantInventory.date <= to_date,
-                    PackageVariantInventory.deleted_at.is_(None),
-                )
+    query = (
+        select(PackageVariantInventory)
+        .where(
+            and_(
+                PackageVariantInventory.variant_id == variant_id,
+                PackageVariantInventory.date >= from_date,
+                PackageVariantInventory.date <= to_date,
+                PackageVariantInventory.deleted_at.is_(None),
             )
-            .order_by(PackageVariantInventory.date.asc())
         )
-        result = await db.execute(query)
-        rows = result.scalars().all()
-        return [_compute_row(r) for r in rows]
-
-    return await _fetch()
+        .order_by(PackageVariantInventory.date.asc())
+    )
+    result = await db.execute(query)
+    rows = result.scalars().all()
+    computed_rows = [_compute_row(r) for r in rows]
+    _mem_set(cache_key, computed_rows, 30)
+    return computed_rows
 
 
 # ─── Update a single date ─────────────────────────────────────────────────────
@@ -346,22 +354,6 @@ async def update_inventory_row(
     for key, value in updates.items():
         setattr(row, key, value)
 
-    await db.commit()
-    await db.refresh(row)
-    
-    # Broadcast SSE for Admin Inventory Edit
-    from app.utils.sse import sse_manager, build_package_sse_payload
-    from sqlalchemy.orm import joinedload
-    variant_res = await db.execute(
-        select(PackageVariant)
-        .options(joinedload(PackageVariant.package))
-        .where(PackageVariant.id == variant_id)
-    )
-    variant = variant_res.scalar_one_or_none()
-    if variant:
-        sse_payload = build_package_sse_payload(variant, row, inv_date)
-        await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
-
     await log_action(
         db=db,
         user_id=current_admin.id,
@@ -371,11 +363,34 @@ async def update_inventory_row(
         details={"date": str(inv_date), "variant_id": variant_id, **updates},
     )
     await db.commit()
-    from app.utils.cache import clear_cache_prefix_async
-    await clear_cache_prefix_async(f"inventory:packages:{variant_id}")
-    await _clear_package_cache_for_variant(db, variant_id)
 
-    return _compute_row(row)
+    clear_cache_prefix(f"inventory:packages:{variant_id}")
+    res_row = _compute_row(row)
+
+    async def _bg_update_tasks():
+        try:
+            import asyncio
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                from app.utils.sse import sse_manager, build_package_sse_payload
+                from sqlalchemy.orm import joinedload
+                variant_res = await bg_db.execute(
+                    select(PackageVariant)
+                    .options(joinedload(PackageVariant.package))
+                    .where(PackageVariant.id == variant_id)
+                )
+                variant = variant_res.scalar_one_or_none()
+                if variant:
+                    sse_payload = build_package_sse_payload(variant, row, inv_date)
+                    await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
+                await _clear_package_cache_for_variant(bg_db, variant_id)
+        except Exception:
+            pass
+
+    import asyncio
+    asyncio.create_task(_bg_update_tasks())
+
+    return res_row
 
 
 # ─── Delete a single date row ─────────────────────────────────────────────────
@@ -415,7 +430,6 @@ async def delete_inventory_row(
 
     from sqlalchemy import func
     row.deleted_at = func.now()
-    await db.commit()
 
     await log_action(
         db=db,
@@ -426,21 +440,29 @@ async def delete_inventory_row(
         details={"date": str(inv_date), "variant_id": variant_id},
     )
     await db.commit()
-    
-    # Broadcast SSE for Admin Inventory Delete
-    from sqlalchemy.orm import joinedload
-    variant_res = await db.execute(select(PackageVariant).options(joinedload(PackageVariant.package)).where(PackageVariant.id == variant_id))
-    variant = variant_res.scalar_one_or_none()
-    if variant:
-        from app.utils.sse import sse_manager, build_package_sse_payload
-        sse_payload = build_package_sse_payload(variant, None, inv_date)
-        sse_payload["available"] = 0
-        sse_payload["is_closed"] = True
-        await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
 
-    from app.utils.cache import clear_cache_prefix_async
-    await clear_cache_prefix_async(f"inventory:packages:{variant_id}")
-    await _clear_package_cache_for_variant(db, variant_id)
+    clear_cache_prefix(f"inventory:packages:{variant_id}")
+
+    async def _bg_delete_tasks():
+        try:
+            import asyncio
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                from sqlalchemy.orm import joinedload
+                variant_res = await bg_db.execute(select(PackageVariant).options(joinedload(PackageVariant.package)).where(PackageVariant.id == variant_id))
+                variant = variant_res.scalar_one_or_none()
+                if variant:
+                    from app.utils.sse import sse_manager, build_package_sse_payload
+                    sse_payload = build_package_sse_payload(variant, None, inv_date)
+                    sse_payload["available"] = 0
+                    sse_payload["is_closed"] = True
+                    await sse_manager.broadcast_event("package", str(variant.package_id), "INVENTORY_UPDATE", sse_payload)
+                await _clear_package_cache_for_variant(bg_db, variant_id)
+        except Exception:
+            pass
+
+    import asyncio
+    asyncio.create_task(_bg_delete_tasks())
     return None
 
 
@@ -792,23 +814,25 @@ async def get_room_calendar(
     )
 
     cache_key = f"inventory:rooms:{room_variant_id}:{month}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
 
-    async def _fetch():
-        result = await db.execute(
-            select(RoomSlotInventory)
-            .where(
-                and_(
-                    RoomSlotInventory.room_variant_id == room_variant_id,
-                    RoomSlotInventory.date >= from_date,
-                    RoomSlotInventory.date <= to_date,
-                    RoomSlotInventory.deleted_at.is_(None),
-                )
+    result = await db.execute(
+        select(RoomSlotInventory)
+        .where(
+            and_(
+                RoomSlotInventory.room_variant_id == room_variant_id,
+                RoomSlotInventory.date >= from_date,
+                RoomSlotInventory.date <= to_date,
+                RoomSlotInventory.deleted_at.is_(None),
             )
-            .order_by(RoomSlotInventory.date.asc())
         )
-        return [_compute_room_row(r) for r in result.scalars().all()]
-
-    return await _fetch()
+        .order_by(RoomSlotInventory.date.asc())
+    )
+    computed_rows = [_compute_room_row(r) for r in result.scalars().all()]
+    _mem_set(cache_key, computed_rows, 30)
+    return computed_rows
 
 
 # ─── Update a single room variant date ────────────────────────────────────────
@@ -863,9 +887,6 @@ async def update_room_inventory_row(
     for key, value in updates.items():
         setattr(row, key, value)
 
-    await db.commit()
-    await db.refresh(row)
-
     await log_action(
         db=db,
         user_id=current_admin.id,
@@ -874,48 +895,55 @@ async def update_room_inventory_row(
         entity_id=str(row.id),
         details={"date": str(row.date), "room_variant_id": row.room_variant_id, "slot_id": slot_id, **updates},
     )
-    
-    from app.utils.cache import clear_cache_prefix_async
-    await clear_cache_prefix_async(f"inventory:rooms:{row.room_variant_id}")
-    await clear_cache_prefix_async("rooms:")
-    from app.services.redis_client import invalidate_cached_availability
-    
-    # Need to find the slug for this room variant
-    room_result = await db.execute(
-        select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
-            RoomVariant.id == row.room_variant_id
-        )
-    )
-    slug_row = room_result.first()
-    if slug_row:
-        slug = slug_row[0]
-        room_id = slug_row[1]
-        await clear_cache_prefix_async(f"rooms:detail:{slug}")
-        import asyncio
-        asyncio.create_task(invalidate_cached_availability(slug))
-        from app.utils.cache import trigger_frontend_revalidation
-        trigger_frontend_revalidation(tags=[f"room-{slug}"])
-        
-        # Broadcast SSE for Admin Inventory Edit
-        import time
-        from app.core.timezone import get_ist_now
-        from app.utils.sse import sse_manager
-        sse_payload = {
-            "version": int(time.time() * 1000),
-            "timestamp": get_ist_now().isoformat(),
-            "room_id": room_id,
-            "travel_date": str(row.date),
-            "available": row.total_rooms - (row.booked_rooms + row.reserved_rooms),
-            "reserved": row.reserved_rooms,
-            "booked": row.booked_rooms,
-            "is_closed": row.is_closed,
-            "variant_id": row.room_variant_id,
-            "slot_start": str(row.slot_start),
-            "slot_end": str(row.slot_end)
-        }
-        await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
-        
-    return _compute_room_row(row)
+    await db.commit()
+
+    clear_cache_prefix(f"inventory:rooms:{row.room_variant_id}")
+    clear_cache_prefix("rooms:")
+    res_row = _compute_room_row(row)
+
+    async def _bg_room_update():
+        try:
+            import asyncio
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                room_result = await bg_db.execute(
+                    select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+                        RoomVariant.id == row.room_variant_id
+                    )
+                )
+                slug_row = room_result.first()
+                if slug_row:
+                    slug, room_id = slug_row[0], slug_row[1]
+                    clear_cache_prefix(f"rooms:detail:{slug}")
+                    from app.services.redis_client import invalidate_cached_availability
+                    await invalidate_cached_availability(slug)
+                    from app.utils.cache import trigger_frontend_revalidation
+                    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+
+                    import time
+                    from app.core.timezone import get_ist_now
+                    from app.utils.sse import sse_manager
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "room_id": room_id,
+                        "travel_date": str(row.date),
+                        "available": row.total_rooms - (row.booked_rooms + row.reserved_rooms),
+                        "reserved": row.reserved_rooms,
+                        "booked": row.booked_rooms,
+                        "is_closed": row.is_closed,
+                        "variant_id": row.room_variant_id,
+                        "slot_start": str(row.slot_start),
+                        "slot_end": str(row.slot_end)
+                    }
+                    await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
+        except Exception:
+            pass
+
+    import asyncio
+    asyncio.create_task(_bg_room_update())
+
+    return res_row
 
 
 # ─── Delete a single room variant date row ────────────────────────────────────
@@ -953,18 +981,11 @@ async def delete_room_inventory_row(
 
     room_variant_id = row.room_variant_id
     date_str = str(row.date)
-    
-    # Fetch slug for invalidation
-    room_result = await db.execute(
-        select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
-            RoomVariant.id == room_variant_id
-        )
-    )
-    slug_row = room_result.first()
+    slot_start_str = str(row.slot_start)
+    slot_end_str = str(row.slot_end)
 
     from sqlalchemy import func
     row.deleted_at = func.now()
-    await db.commit()
 
     await log_action(
         db=db,
@@ -974,39 +995,52 @@ async def delete_room_inventory_row(
         entity_id=str(slot_id),
         details={"date": date_str, "room_variant_id": room_variant_id},
     )
-    
-    from app.utils.cache import clear_cache_prefix_async
-    await clear_cache_prefix_async(f"inventory:rooms:{room_variant_id}")
-    await clear_cache_prefix_async("rooms:")
-    if slug_row:
-        slug = slug_row[0]
-        room_id = slug_row[1]
-        await clear_cache_prefix_async(f"rooms:detail:{slug}")
-        from app.services.redis_client import invalidate_cached_availability
-        import asyncio
-        asyncio.create_task(invalidate_cached_availability(slug))
-        from app.utils.cache import trigger_frontend_revalidation
-        trigger_frontend_revalidation(tags=[f"room-{slug}"])
-        
-        # Broadcast SSE for Admin Inventory Delete
-        import time
-        from app.core.timezone import get_ist_now
-        from app.utils.sse import sse_manager
-        sse_payload = {
-            "version": int(time.time() * 1000),
-            "timestamp": get_ist_now().isoformat(),
-            "room_id": room_id,
-            "travel_date": date_str,
-            "available": 0,
-            "reserved": 0,
-            "booked": 0,
-            "is_closed": True,
-            "variant_id": room_variant_id,
-            "slot_start": str(row.slot_start),
-            "slot_end": str(row.slot_end)
-        }
-        await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
+    await db.commit()
 
+    clear_cache_prefix(f"inventory:rooms:{room_variant_id}")
+    clear_cache_prefix("rooms:")
+
+    async def _bg_room_delete():
+        try:
+            import asyncio
+            from app.db.session import AsyncSessionLocal
+            async with AsyncSessionLocal() as bg_db:
+                room_result = await bg_db.execute(
+                    select(Room.slug, Room.id).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+                        RoomVariant.id == room_variant_id
+                    )
+                )
+                slug_row = room_result.first()
+                if slug_row:
+                    slug, room_id = slug_row[0], slug_row[1]
+                    clear_cache_prefix(f"rooms:detail:{slug}")
+                    from app.services.redis_client import invalidate_cached_availability
+                    await invalidate_cached_availability(slug)
+                    from app.utils.cache import trigger_frontend_revalidation
+                    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+
+                    import time
+                    from app.core.timezone import get_ist_now
+                    from app.utils.sse import sse_manager
+                    sse_payload = {
+                        "version": int(time.time() * 1000),
+                        "timestamp": get_ist_now().isoformat(),
+                        "room_id": room_id,
+                        "travel_date": date_str,
+                        "available": 0,
+                        "reserved": 0,
+                        "booked": 0,
+                        "is_closed": True,
+                        "variant_id": room_variant_id,
+                        "slot_start": slot_start_str,
+                        "slot_end": slot_end_str
+                    }
+                    await sse_manager.broadcast_event("room", str(room_id), "INVENTORY_UPDATE", sse_payload)
+        except Exception:
+            pass
+
+    import asyncio
+    asyncio.create_task(_bg_room_delete())
 
     return None
 
@@ -1184,6 +1218,11 @@ async def get_transport_inventory_calendar(
     last_day = cal_mod.monthrange(year, mon)[1]
     to_date = date(year, mon, last_day)
 
+    cache_key = f"inventory:transport:{package_id}:{month}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
+
     # All transport options for this package
     opts_res = await db.execute(
         select(PackageTransportOption).where(
@@ -1193,7 +1232,9 @@ async def get_transport_inventory_calendar(
     )
     opts = opts_res.scalars().all()
     if not opts:
-        return {"options": [], "dates": {}}
+        res_empty = {"options": [], "dates": {}}
+        _mem_set(cache_key, res_empty, 30)
+        return res_empty
 
     opt_map = {o.id: o for o in opts}
     opt_ids = [o.id for o in opts]
@@ -1229,7 +1270,9 @@ async def get_transport_inventory_calendar(
         for o in opts
     ]
 
-    return {"options": options_out, "dates": dates}
+    res_data = {"options": options_out, "dates": dates}
+    _mem_set(cache_key, res_data, 30)
+    return res_data
 
 
 @router.patch("/transport/slots/{slot_id}", response_model=TransportInventoryRow)
@@ -1277,22 +1320,31 @@ async def update_transport_inventory_slot(
         row.price_override = payload.price_override if payload.price_override > 0 else None
 
     await db.commit()
-    await db.refresh(row)
-    
-    from app.utils.sse import broadcast_transport_update
-    await broadcast_transport_update(db, row.transport_option_id, row.date)
-    
-    from app.models.package import Package
-    from app.services.redis_client import invalidate_cached_availability
-    from app.utils.cache import trigger_frontend_revalidation
+    clear_cache_prefix("inventory:transport:")
+    res_out = TransportInventoryRow.from_orm_with_option(row, opt)
+
+    async def _bg_transport_update():
+        try:
+            import asyncio
+            from app.db.session import AsyncSessionLocal
+            from app.utils.sse import broadcast_transport_update
+            from app.models.package import Package
+            from app.services.redis_client import invalidate_cached_availability
+            from app.utils.cache import trigger_frontend_revalidation
+            async with AsyncSessionLocal() as bg_db:
+                await broadcast_transport_update(bg_db, row.transport_option_id, row.date)
+                if opt:
+                    pkg = await bg_db.scalar(select(Package).where(Package.id == opt.package_id))
+                    if pkg:
+                        await invalidate_cached_availability(pkg.slug)
+                        trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
+        except Exception:
+            pass
+
     import asyncio
-    if opt:
-        pkg = await db.scalar(select(Package).where(Package.id == opt.package_id))
-        if pkg:
-            asyncio.create_task(invalidate_cached_availability(pkg.slug))
-            trigger_frontend_revalidation(tags=[f"package-{pkg.slug}"])
-            
-    return TransportInventoryRow.from_orm_with_option(row, opt)
+    asyncio.create_task(_bg_transport_update())
+
+    return res_out
 
 
 @router.post("/transport/slots", response_model=TransportInventoryRow)

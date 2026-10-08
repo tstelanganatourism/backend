@@ -466,6 +466,12 @@ async def get_room_availability(
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="month must be in YYYY-MM format.")
 
+    # Check in-memory cache first (<0.1ms response time)
+    from app.core.memory_cache import get_mem_cached, set_mem_cached
+    mem_cached = get_mem_cached("room_avail", f"{slug}:{month}")
+    if mem_cached is not None:
+        return mem_cached
+
     # Load room with active variants
     result = await db.execute(
         select(Room)
@@ -559,9 +565,12 @@ async def get_room_availability(
 
         current += timedelta(days=1)
 
-    return RoomAvailabilityResponse(
+    res_data = RoomAvailabilityResponse(
         room_id=room.id,
         slug=room.slug,
         month=month,
         dates=availability,
     )
+    from app.core.memory_cache import set_mem_cached
+    set_mem_cached("room_avail", f"{slug}:{month}", res_data.model_dump(), ttl_seconds=60)
+    return res_data

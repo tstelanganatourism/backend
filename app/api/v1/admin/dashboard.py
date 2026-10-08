@@ -20,6 +20,11 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     Returns high-level KPIs for the admin dashboard.
     Requires ADMIN role.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    cached = _mem_get("admin_dashboard_stats")
+    if cached is not None:
+        return cached
+
     result = await db.execute(
         select(
             select(func.count()).select_from(Package).where(Package.deleted_at.is_(None)).scalar_subquery(),
@@ -105,7 +110,7 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     )
     total_revenue = float(revenue_result.scalar() or 0.00)
 
-    return {
+    stats_data = {
         "packages": packages_count,
         "package_categories": package_categories_count,
         "room_categories": room_categories_count,
@@ -116,3 +121,5 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         "recent_bookings": recent_bookings,
         "analysis": analysis
     }
+    _mem_set("admin_dashboard_stats", stats_data, 20)
+    return stats_data

@@ -699,6 +699,13 @@ async def create_pre_booking(
     await db.commit()
     await db.refresh(pb)
 
+    # Invalidate admin pre-bookings cache so admin portal instantly sees new submission
+    try:
+        from app.utils.cache import clear_cache_prefix
+        clear_cache_prefix("admin_pre_bookings_")
+    except Exception:
+        pass
+
     # Dispatch emails asynchronously in background — instant response (<30ms) for user!
     background_tasks.add_task(_dispatch_prebooking_emails, pb.id)
 

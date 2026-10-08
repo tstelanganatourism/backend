@@ -85,6 +85,13 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     """List all tourist users with optional search, filtering, and sorting."""
+    is_default = (not search and not status_filter and (not sort_by or sort_by == "created_at") and (not sort_order or sort_order.lower() == "desc"))
+    if is_default:
+        from app.utils.cache import _mem_get
+        cached = _mem_get(f"admin_users_list:{limit}:{offset}")
+        if cached is not None:
+            return cached
+
     # Count Query
     count_query = select(func.count(User.id)).where(
         User.role == UserRole.USER,
@@ -161,12 +168,16 @@ async def list_users(
             )
         )
 
-    return {
+    res_data = {
         "items": items,
         "total": total_count,
         "page": (offset // limit) + 1 if limit > 0 else 1,
         "size": limit
     }
+    if is_default:
+        from app.utils.cache import _mem_set
+        _mem_set(f"admin_users_list:{limit}:{offset}", res_data, ttl_seconds=20)
+    return res_data
 
 @router.get("/{user_id}", response_model=AdminUserDetailResponse)
 async def get_user_detail(
@@ -343,6 +354,8 @@ async def delete_user(
         details={"full_name": user_obj.full_name, "email": user_obj.email},
     )
     await db.commit()
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix("admin_users_list:")
 
     return None
 
@@ -395,6 +408,8 @@ async def toggle_user_status(
         details={"full_name": user_obj.full_name, "new_status": new_status},
     )
     await db.commit()
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix("admin_users_list:")
 
     return AdminUserResponse(
         id=user_obj.id,
@@ -486,6 +501,8 @@ async def update_user_profile(
         details={"full_name": user_obj.full_name, "email": user_obj.email, "phone_number": user_obj.phone_number},
     )
     await db.commit()
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix("admin_users_list:")
 
     return AdminUserResponse(
         id=user_obj.id,

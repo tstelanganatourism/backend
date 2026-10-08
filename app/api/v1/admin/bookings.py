@@ -24,6 +24,36 @@ router = APIRouter(
 )
 
 
+def _invalidate_booking_caches(booking: Optional[Booking] = None):
+    try:
+        from app.utils.cache import clear_cache_prefix
+        clear_cache_prefix("admin_bookings_")
+        clear_cache_prefix("admin_dashboard_")
+        clear_cache_prefix("user_summary:")
+        clear_cache_prefix("user_bookings:")
+        clear_cache_prefix("agent_summary:")
+        clear_cache_prefix("agent_bookings:")
+        clear_cache_prefix("packages:list:")
+        clear_cache_prefix("packages:detail:")
+        clear_cache_prefix("rooms:list:")
+        clear_cache_prefix("rooms:detail:")
+        clear_cache_prefix("availability:")
+        clear_cache_prefix("room_avail:")
+        if booking:
+            if getattr(booking, "variant_id", None):
+                clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
+            if getattr(booking, "room_variant_id", None):
+                clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+            if getattr(booking, "user_id", None):
+                clear_cache_prefix(f"user_summary:{booking.user_id}")
+                clear_cache_prefix(f"user_bookings:{booking.user_id}")
+            if getattr(booking, "agent_id", None):
+                clear_cache_prefix(f"agent_summary:{booking.agent_id}")
+                clear_cache_prefix(f"agent_bookings:{booking.agent_id}")
+    except Exception:
+        pass
+
+
 @router.get("")
 async def list_admin_bookings(
     db: AsyncSession = Depends(get_db),
@@ -42,6 +72,14 @@ async def list_admin_bookings(
     """
     Paginated admin booking listing. Never exposes commission data.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = None
+    if not any([search, status_filter, source_filter, target_filter, agent_id, variant_id, room_variant_id, start_date, end_date]):
+        cache_key = f"admin_bookings_list:{limit}:{offset}"
+        cached = _mem_get(cache_key)
+        if cached is not None:
+            return cached
+
     base_query = select(Booking).where(Booking.deleted_at.is_(None))
 
     if agent_id is not None:
@@ -323,12 +361,15 @@ async def list_admin_bookings(
             "pricing_snapshot": b.pricing_snapshot,
         })
 
-    return {
+    res_data = {
         "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
     }
+    if cache_key:
+        _mem_set(cache_key, res_data, 15)
+    return res_data
 
 
 @router.get("/summary")
@@ -341,6 +382,12 @@ async def get_bookings_summary(
     Returns aggregated booking KPIs for the admin bookings page header.
     Uses raw DB enum string values to avoid alias confusion.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    summary_cache_key = f"admin_bookings_summary:{start_date}:{end_date}"
+    cached_summary = _mem_get(summary_cache_key)
+    if cached_summary is not None:
+        return cached_summary
+
     from sqlalchemy import case, literal
     
     base_cond = [Booking.deleted_at.is_(None)]
@@ -387,12 +434,14 @@ async def get_bookings_summary(
     )
     row = result.one()
 
-    return {
+    summary_data = {
         "total": row.total or 0,
         "confirmed": int(row.confirmed or 0),
         "pending": int(row.pending or 0),
         "revenue": float(row.revenue or 0),
     }
+    _mem_set(summary_cache_key, summary_data, 15)
+    return summary_data
 
 
 # ─── Admin Print Report ───────────────────────────────────────────────────────
@@ -1221,14 +1270,8 @@ async def admin_create_booking(
     for opt_id in transport_options_to_broadcast:
         await broadcast_transport_update(db, opt_id, travel_date)
 
-    # Immediately invalidate L1+L2 cache so availability is reflected
-    from app.utils.cache import clear_cache_prefix
-    if request.target_type == 'package':
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix("packages:detail:")
-    elif request.target_type == 'room':
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
+    # Immediately invalidate all related booking, availability, and inventory caches
+    _invalidate_booking_caches(booking)
 
     # Pre-capture primitive values before commit so background task never touches detached booking attributes
     b_id_val = booking.id
@@ -1348,6 +1391,7 @@ async def mark_booking_refunded(
         
     booking.status = BookingStatus.REFUNDED
     await db.commit()
+    _invalidate_booking_caches(booking)
     
     return {"status": "success", "message": f"Booking {booking.public_id} marked as refunded."}
 
@@ -1593,16 +1637,8 @@ async def admin_cancel_booking(
     for opt_id in transport_options_to_broadcast:
         await broadcast_transport_update(db, opt_id, booking.travel_date)
     
-    # Immediately invalidate L1+L2 cache so freed seats are reflected to all visitors
-    from app.utils.cache import clear_cache_prefix
-    if booking.variant_id:
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix("packages:detail:")
-        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
-    elif booking.room_variant_id:
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
-        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+    # Immediately invalidate all related booking, availability, and inventory caches
+    _invalidate_booking_caches(booking)
 
     if sse_payload:
         from app.utils.sse import sse_manager
@@ -1807,6 +1843,9 @@ async def _do_record_cash_payment(
         from loguru import logger
         logger.warning(f"Could not enqueue confirmation SMS for admin cash payment on {booking.public_id}: {_sms_err}")
 
+    # Immediately invalidate all booking, summary, and dashboard caches
+    _invalidate_booking_caches(booking)
+
     return {
         "status": "success",
         "message": f"Payment of ₹{float(record_amount):,.2f} recorded for booking {booking.public_id}.",
@@ -1834,6 +1873,11 @@ async def get_transport_planning(
     - Per-booking detail with customer name and their chosen vehicles
     """
     from datetime import datetime, date, timedelta
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = f"admin_transport_planning:{start_date}:{end_date}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
 
     # Parse date range — default to today..today+30
     today = date.today()
@@ -2046,11 +2090,13 @@ async def get_transport_planning(
             "package_groups": package_group_list,
         })
 
-    return {
+    tp_res = {
         "start_date": start_dt.isoformat(),
         "end_date": end_dt.isoformat(),
         "date_groups": date_groups,
     }
+    _mem_set(cache_key, tp_res, 30)
+    return tp_res
 
 
 # --- Reschedule / Postpone Endpoints ---
@@ -2175,15 +2221,7 @@ async def admin_process_postpone(
             await broadcast_transport_update(db, opt_id, slot_date)
             
     # Invalidate cache
-    from app.utils.cache import clear_cache_prefix
-    if booking.variant_id:
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix("packages:detail:")
-        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
-    elif booking.room_variant_id:
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
-        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+    _invalidate_booking_caches(booking)
         
     return {"status": "success", "message": f"Booking postponed to {new_date.isoformat()} successfully."}
 
@@ -2238,15 +2276,7 @@ async def admin_change_booking_date(
             await broadcast_transport_update(db, opt_id, slot_date)
             
     # Invalidate cache
-    from app.utils.cache import clear_cache_prefix
-    if booking.variant_id:
-        clear_cache_prefix("packages:list:")
-        clear_cache_prefix("packages:detail:")
-        clear_cache_prefix(f"inventory:packages:{booking.variant_id}")
-    elif booking.room_variant_id:
-        clear_cache_prefix("rooms:list:")
-        clear_cache_prefix("rooms:detail:")
-        clear_cache_prefix(f"inventory:rooms:{booking.room_variant_id}")
+    _invalidate_booking_caches(booking)
         
     return {"status": "success", "message": f"Booking travel date successfully updated to {payload.new_travel_date.isoformat()}."}
 
@@ -2563,6 +2593,9 @@ async def admin_adjust_booking_taxes(
         await arq_pool.enqueue_job("process_post_booking_documents_task", booking.id, True, True)
     except Exception:
         pass
+
+    # Immediately invalidate caches
+    _invalidate_booking_caches(booking)
 
     return {
         "status": "success",

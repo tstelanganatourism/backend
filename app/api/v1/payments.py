@@ -415,6 +415,7 @@ async def _finalize_draft(
             if arq_pool:
                 await arq_pool.enqueue_job("process_post_booking_documents_task", b_id, is_fully_paid)
                 logger.info(f"Enqueued post-booking documents task to ARQ for booking {p_id}")
+                return
         except Exception as arq_err:
             logger.warning(f"ARQ enqueue skipped for booking {p_id}: {arq_err}")
 
@@ -603,6 +604,27 @@ async def verify_status(
     elif draft.target_type == 'room':
         clear_cache_prefix("rooms:list:")
         clear_cache_prefix("rooms:detail:")
+        from app.services.redis_client import invalidate_cached_availability
+        import asyncio
+        if draft.room_variant_id:
+            from app.models.room import Room, RoomVariant
+            r_res = await db.execute(
+                select(Room.slug).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+                    RoomVariant.id == draft.room_variant_id
+                )
+            )
+            r_slug = r_res.scalar_one_or_none()
+            if r_slug:
+                asyncio.create_task(invalidate_cached_availability(r_slug))
+
+    clear_cache_prefix("admin_bookings")
+    clear_cache_prefix("admin_dashboard")
+    if draft.user_id:
+        clear_cache_prefix(f"user_summary:{draft.user_id}")
+        clear_cache_prefix(f"user_bookings:{draft.user_id}")
+    if draft.agent_id:
+        clear_cache_prefix(f"agent_summary:{draft.agent_id}")
+        clear_cache_prefix(f"agent_bookings:{draft.agent_id}")
 
     from app.utils.sse import sse_manager
     for p in sse_payloads:
@@ -770,6 +792,27 @@ async def phonepe_webhook(
                 elif target_type == 'room':
                     clear_cache_prefix("rooms:list:")
                     clear_cache_prefix("rooms:detail:")
+                    from app.services.redis_client import invalidate_cached_availability
+                    import asyncio
+                    if draft.room_variant_id:
+                        from app.models.room import Room, RoomVariant
+                        r_res = await db.execute(
+                            select(Room.slug).join(RoomVariant, RoomVariant.room_id == Room.id).where(
+                                RoomVariant.id == draft.room_variant_id
+                            )
+                        )
+                        r_slug = r_res.scalar_one_or_none()
+                        if r_slug:
+                            asyncio.create_task(invalidate_cached_availability(r_slug))
+
+                clear_cache_prefix("admin_bookings")
+                clear_cache_prefix("admin_dashboard")
+                if draft.user_id:
+                    clear_cache_prefix(f"user_summary:{draft.user_id}")
+                    clear_cache_prefix(f"user_bookings:{draft.user_id}")
+                if draft.agent_id:
+                    clear_cache_prefix(f"agent_summary:{draft.agent_id}")
+                    clear_cache_prefix(f"agent_bookings:{draft.agent_id}")
 
                 from app.utils.sse import sse_manager
                 for p in sse_payloads:

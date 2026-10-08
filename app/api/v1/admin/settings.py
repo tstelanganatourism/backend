@@ -37,12 +37,18 @@ class SystemSettingsUpdateDTO(BaseModel):
 @router.get("", response_model=SystemSettingsUpdateDTO)
 async def get_settings(db: AsyncSession = Depends(get_db)):
     """Retrieve the global system settings. Returns an empty object if none exist."""
+    from app.utils.cache import _mem_get, _mem_set
+    cached = _mem_get("system_settings_data")
+    if cached is not None:
+        return cached
+
     result = await db.execute(select(SystemSettings).limit(1))
     settings_record = result.scalar_one_or_none()
     
     if not settings_record:
         return SystemSettingsUpdateDTO() # Return empty if not initialized
     
+    _mem_set("system_settings_data", settings_record, ttl_seconds=60)
     return settings_record
 
 @router.put("", response_model=SystemSettingsUpdateDTO)
@@ -78,6 +84,10 @@ async def update_settings(
         details=body.model_dump(exclude_unset=True)
     )
     await db.commit() # Commit the log
+    
+    from app.utils.cache import clear_cache_prefix
+    clear_cache_prefix("system_settings")
+    clear_cache_prefix("settings")
     
     return settings_record
 

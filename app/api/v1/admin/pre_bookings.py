@@ -7,12 +7,13 @@ import urllib.parse
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, or_, desc
+from sqlalchemy import select, func, or_, desc, case
 
 from app.db.session import get_db
 from app.middleware.auth import require_admin
 from app.models.pre_booking import PreBooking
 from app.models.user import User
+from app.utils.cache import _mem_get, _mem_set, clear_cache_prefix
 
 router = APIRouter(
     prefix="/pre-bookings",
@@ -96,6 +97,13 @@ async def list_pre_bookings(
     offset: int = Query(0, ge=0),
 ):
     """List all pre-booking leads with filters and pagination."""
+    cache_key = None
+    if not any([search, is_confirmed is not None, is_contacted is not None, package_id, travel_date]):
+        cache_key = f"admin_pre_bookings_list:{limit}:{offset}"
+        cached = _mem_get(cache_key)
+        if cached is not None:
+            return cached
+
     q = select(PreBooking).where(PreBooking.deleted_at.is_(None))
 
     if search and search.strip():
@@ -124,12 +132,15 @@ async def list_pre_bookings(
     result = await db.execute(q)
     items = result.scalars().all()
 
-    return {
+    out = {
         "total": total,
         "items": [_serialize(pb) for pb in items],
         "limit": limit,
         "offset": offset,
     }
+    if cache_key:
+        _mem_set(cache_key, out, 20)
+    return out
 
 
 @router.get("/stats")
@@ -137,41 +148,30 @@ async def get_pre_booking_stats(
     db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(require_admin),
 ):
-    """Quick stats for the admin dashboard widget."""
-    base = select(func.count(PreBooking.id)).where(PreBooking.deleted_at.is_(None))
-    total_res = await db.execute(base)
-    total = total_res.scalar() or 0
+    """Quick stats for the admin dashboard widget in a single SQL query."""
+    stats_key = "admin_pre_bookings_stats"
+    cached_stats = _mem_get(stats_key)
+    if cached_stats is not None:
+        return cached_stats
 
-    pending_res = await db.execute(
-        select(func.count(PreBooking.id)).where(
-            PreBooking.deleted_at.is_(None),
-            PreBooking.is_confirmed == False,  # noqa: E712
-        )
-    )
-    pending = pending_res.scalar() or 0
+    stmt = select(
+        func.count(PreBooking.id).label("total"),
+        func.count(case((PreBooking.is_confirmed == False, 1))).label("pending"),
+        func.count(case((PreBooking.is_confirmed == True, 1))).label("confirmed"),
+        func.count(case((PreBooking.is_contacted == False, 1))).label("not_contacted"),
+    ).where(PreBooking.deleted_at.is_(None))
 
-    not_contacted_res = await db.execute(
-        select(func.count(PreBooking.id)).where(
-            PreBooking.deleted_at.is_(None),
-            PreBooking.is_contacted == False,  # noqa: E712
-        )
-    )
-    not_contacted = not_contacted_res.scalar() or 0
+    res = await db.execute(stmt)
+    row = res.first()
 
-    confirmed_res = await db.execute(
-        select(func.count(PreBooking.id)).where(
-            PreBooking.deleted_at.is_(None),
-            PreBooking.is_confirmed == True,  # noqa: E712
-        )
-    )
-    confirmed = confirmed_res.scalar() or 0
-
-    return {
-        "total": total,
-        "pending": pending,
-        "confirmed": confirmed,
-        "not_contacted": not_contacted,
+    stats_out = {
+        "total": row.total if row else 0,
+        "pending": row.pending if row else 0,
+        "confirmed": row.confirmed if row else 0,
+        "not_contacted": row.not_contacted if row else 0,
     }
+    _mem_set(stats_key, stats_out, 20)
+    return stats_out
 
 
 @router.get("/{pb_id}")
@@ -220,6 +220,7 @@ async def update_pre_booking(
 
     await db.commit()
     await db.refresh(pb)
+    clear_cache_prefix("admin_pre_bookings_")
     return _serialize(pb)
 
 
@@ -240,4 +241,5 @@ async def delete_pre_booking(
 
     pb.deleted_at = get_ist_now()
     await db.commit()
+    clear_cache_prefix("admin_pre_bookings_")
     return None

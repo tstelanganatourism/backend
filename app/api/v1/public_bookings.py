@@ -1410,39 +1410,40 @@ async def get_agent_dashboard_summary(
     """
     Fetch high-level KPIs for the logged-in agent's sales and earnings dashboard.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = f"agent_summary:{current_user.id}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
+
     from app.models.booking import BookingPassenger
     from app.core.timezone import get_ist_now
-    from sqlalchemy import func
+    from sqlalchemy import func, case
     
-    # 1. Fetch bookings
-    query = (
-        select(Booking)
+    now = get_ist_now()
+    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    paid_cond = Booking.status.in_([BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID])
+
+    # 1. Single aggregate query for bookings & earnings
+    kpi_query = (
+        select(
+            func.count(Booking.id).label("booking_count"),
+            func.coalesce(func.sum(case((paid_cond, Booking.agent_commission), else_=0)), 0).label("total_earnings"),
+            func.coalesce(func.sum(case((paid_cond & (Booking.created_at >= start_of_month), Booking.agent_commission), else_=0)), 0).label("this_month_earnings"),
+        )
         .where(
             Booking.agent_id == current_user.id,
             Booking.deleted_at.is_(None)
         )
     )
-    result = await db.execute(query)
-    bookings = result.scalars().all()
-    
-    booking_count = len(bookings)
-    
-    # 2. Earnings Math
-    now = get_ist_now()
-    start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    
-    total_earnings = Decimal("0.00")
-    this_month_earnings = Decimal("0.00")
-    
-    paid_statuses = {BookingStatus.FULLY_PAID, BookingStatus.PARTIAL_PAID}
-    for b in bookings:
-        if b.status in paid_statuses:
-            comm = b.agent_commission or Decimal("0.00")
-            total_earnings += comm
-            if b.created_at and b.created_at >= start_of_month:
-                this_month_earnings += comm
-                
-    # 3. Passenger Count (Total Customers)
+    kpi_res = await db.execute(kpi_query)
+    kpi_row = kpi_res.first()
+
+    booking_count = kpi_row.booking_count if kpi_row else 0
+    total_earnings = float(kpi_row.total_earnings) if kpi_row else 0.0
+    this_month_earnings = float(kpi_row.this_month_earnings) if kpi_row else 0.0
+
+    # 2. Passenger Count (Total Customers)
     passenger_query = (
         select(func.count(BookingPassenger.id))
         .join(Booking, Booking.id == BookingPassenger.booking_id)
@@ -1453,13 +1454,15 @@ async def get_agent_dashboard_summary(
     )
     p_result = await db.execute(passenger_query)
     total_customers = p_result.scalar_one() or 0
-            
-    return {
+
+    data = {
         "booking_count": booking_count,
-        "total_earnings": float(total_earnings),
-        "this_month_earnings": float(this_month_earnings),
+        "total_earnings": total_earnings,
+        "this_month_earnings": this_month_earnings,
         "total_customers": total_customers
     }
+    _mem_set(cache_key, data, ttl_seconds=20)
+    return data
 
 @router.get("/agent/bookings")
 async def get_agent_bookings(
@@ -1471,6 +1474,11 @@ async def get_agent_bookings(
     """
     Fetch recent bookings for the logged-in agent, strictly sanitizing commission details.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = f"agent_bookings:{current_user.id}:{limit}:{offset}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
 
     query = (
         select(
@@ -1562,6 +1570,7 @@ async def get_agent_bookings(
             "pricing_snapshot": b.pricing_snapshot,
         })
         
+    _mem_set(cache_key, sanitized_items, ttl_seconds=15)
     return sanitized_items
 
 @router.get("/user/dashboard-summary")
@@ -1572,44 +1581,56 @@ async def get_tourist_dashboard_summary(
     """
     Fetch high-level KPIs for the logged-in tourist's dashboard.
     """
-    query = (
-        select(Booking)
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = f"user_summary:{current_user.id}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
+
+    from datetime import date
+    from sqlalchemy import func, case
+    today = date.today()
+    paid_cond = Booking.status == BookingStatus.FULLY_PAID
+
+    stmt = (
+        select(
+            func.count(Booking.id).label("booking_count"),
+            func.count(case((paid_cond & (Booking.travel_date < today), 1))).label("past_trips"),
+            func.count(case((paid_cond & (Booking.travel_date >= today), 1))).label("upcoming_trips"),
+        )
         .where(
             Booking.user_id == current_user.id,
             Booking.deleted_at.is_(None),
             Booking.status != BookingStatus.PENDING
         )
     )
-    result = await db.execute(query)
-    bookings = result.scalars().all()
-    
-    booking_count = len(bookings)
-    
-    past_trips = 0
-    upcoming_trips = 0
-    from datetime import date
-    today = date.today()
-    for b in bookings:
-        if b.status == BookingStatus.FULLY_PAID:
-            if b.travel_date < today:
-                past_trips += 1
-            else:
-                upcoming_trips += 1
-                
-    return {
-        "booking_count": booking_count,
-        "past_trips": past_trips,
-        "upcoming_trips": upcoming_trips
+    res = await db.execute(stmt)
+    row = res.first()
+
+    data = {
+        "booking_count": row.booking_count if row else 0,
+        "past_trips": row.past_trips if row else 0,
+        "upcoming_trips": row.upcoming_trips if row else 0
     }
+    _mem_set(cache_key, data, ttl_seconds=20)
+    return data
 
 @router.get("/user/bookings")
 async def get_tourist_bookings(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     """
     Fetch recent bookings for the logged-in tourist.
     """
+    from app.utils.cache import _mem_get, _mem_set
+    cache_key = f"user_bookings:{current_user.id}:{limit}:{offset}"
+    cached = _mem_get(cache_key)
+    if cached is not None:
+        return cached
+
     query = (
         select(
             Booking, 
@@ -1635,6 +1656,8 @@ async def get_tourist_bookings(
             Booking.status != BookingStatus.PENDING
         )
         .order_by(Booking.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     result = await db.execute(query)
     rows = result.all()
@@ -1703,6 +1726,7 @@ async def get_tourist_bookings(
             "is_rescheduled": any((r.status.value if hasattr(r.status, "value") else str(r.status)) == "APPROVED" for r in b.postpone_requests),
         })
         
+    _mem_set(cache_key, sanitized_items, ttl_seconds=15)
     return sanitized_items
 
 
@@ -1720,8 +1744,40 @@ async def get_booking_details(
     Commission fields are ONLY included when the authenticated user owns the booking as an agent or is an admin.
     Public users and tourists never receive agent_commission or agent_payable.
     """
-    from app.utils.cache import set_no_store_headers
+    from app.utils.cache import set_no_store_headers, _mem_get, _mem_set
     set_no_store_headers(response)
+
+    # Fast in-memory cache check (< 0.1ms)
+    cached_entry = _mem_get(f"booking_detail_full:{public_id}")
+    if cached_entry is not None:
+        import hmac, hashlib
+        from app.core.config import settings
+        from app.models.enums import UserRole
+        is_agent_owner = (
+            current_user is not None
+            and current_user.role == UserRole.AGENT
+            and cached_entry.get("agent_id") == current_user.id
+        )
+        is_admin = current_user is not None and current_user.role == UserRole.ADMIN
+        is_valid_secret = False
+        if secret:
+            secret_key = settings.SECRET_KEY or 'tsaptourismpapikondalubadhrachalam'
+            expected = hmac.new(
+                secret_key.encode('utf-8'),
+                public_id.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            if hmac.compare_digest(secret, expected):
+                is_valid_secret = True
+        show_comm = is_agent_owner or is_admin or is_valid_secret
+        if show_comm:
+            return cached_entry
+        else:
+            cached_copy = dict(cached_entry)
+            cached_copy["agent_commission"] = None
+            cached_copy["agent_payable"] = None
+            cached_copy["invoice_secret"] = None
+            return cached_copy
     
     from app.models.room import Room, RoomVariant
     query = (
@@ -2146,6 +2202,7 @@ async def get_booking_details(
             "processed_at": latest_postpone.processed_at.isoformat() if latest_postpone.processed_at else None,
         }
         
+    _mem_set(f"booking_detail_full:{public_id}", result_dict, 60)
     return result_dict
 
 class CancellationRequestInput(BaseModel):
@@ -2218,7 +2275,14 @@ async def request_booking_cancellation(
         status=CancellationStatus.PENDING
     )
     db.add(cancel_req)
-    await db.commit()
+    from app.utils.cache import _mem_delete_prefix
+    _mem_delete_prefix(f"booking_detail_full:{public_id}")
+    if booking.user_id:
+        _mem_delete_prefix(f"user_summary:{booking.user_id}")
+        _mem_delete_prefix(f"user_bookings:{booking.user_id}")
+    if booking.agent_id:
+        _mem_delete_prefix(f"agent_summary:{booking.agent_id}")
+        _mem_delete_prefix(f"agent_bookings:{booking.agent_id}")
 
     return {
         "status": "success",
@@ -2305,6 +2369,14 @@ async def request_booking_postpone(
     )
     db.add(postpone_req)
     await db.commit()
+    from app.utils.cache import _mem_delete_prefix
+    _mem_delete_prefix(f"booking_detail_full:{public_id}")
+    if booking.user_id:
+        _mem_delete_prefix(f"user_summary:{booking.user_id}")
+        _mem_delete_prefix(f"user_bookings:{booking.user_id}")
+    if booking.agent_id:
+        _mem_delete_prefix(f"agent_summary:{booking.agent_id}")
+        _mem_delete_prefix(f"agent_bookings:{booking.agent_id}")
 
     return {
         "status": "success",

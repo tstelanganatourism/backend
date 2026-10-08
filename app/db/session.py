@@ -4,33 +4,25 @@ from app.core.config import settings
 
 import sys
 
+import os
 # ─── Detect environment ───────────────────────────────────────────────────────
-# If FRONTEND_URL points to localhost, we are running locally for development.
-# This lets us apply a minimal connection pool so local dev never eats into
-# the production database's connection ceiling (Aiven free tier: ~15 max).
-is_local_dev = "localhost" in (settings.FRONTEND_URL or "")
+# True production runs on Render or has ENVIRONMENT='production'
+is_production = settings.ENVIRONMENT == "production" or os.getenv("RENDER") is not None
+is_local_dev = not is_production
 
 # Determine if we are running as a background worker (arq command)
 is_worker = any("arq" in arg or "worker" in arg for arg in sys.argv)
 
 # ─── Connection pool configuration ───────────────────────────────────────────
-#
-# Aiven Free Tier: ~15 total connections, last few reserved for SUPERUSER.
-#
-# LOCAL DEV  → bare minimum (1 each) so local dev never hogs prod slots.
-#              Total local: 2 connections max.
-#
-# PRODUCTION → generous pool for real traffic:
-#   Web server : pool_size=5, max_overflow=3  →  8 max connections
-#   ARQ worker : pool_size=2, max_overflow=1  →  3 max connections
-#   Total prod : 11 connections max  (4 left as superuser headroom)
-#
+# Total Postgres ceiling on Aiven free tier is 20 connections max.
+# We keep pool sizes lean, timeouts tight (5s), and statement/idle timeouts low
+# so connections are released instantly and never cause queue blockades.
 if is_local_dev:
     pool_kwargs = {
-        "pool_size": 10,
-        "max_overflow": 20,
-        "pool_timeout": 10,
-        "pool_recycle": 300,
+        "pool_size": 3,
+        "max_overflow": 2,
+        "pool_timeout": 5,
+        "pool_recycle": 180,
         "pool_pre_ping": True,
     }
 elif is_worker:
@@ -38,19 +30,17 @@ elif is_worker:
     pool_kwargs = {
         "pool_size": 2,
         "max_overflow": 1,
-        "pool_timeout": 30,
-        "pool_recycle": 600,
+        "pool_timeout": 5,
+        "pool_recycle": 180,
         "pool_pre_ping": True,
     }
 else:
     # 🌍 Production web server ───────────────────────────────────────────────
-    # Safely allocate connections for production (pool_size=6, max_overflow=4 = 10 total)
-    # This leaves 3 connections for the ARQ worker and 2 for superusers (15 total limit)
     pool_kwargs = {
-        "pool_size": 6,
-        "max_overflow": 4,
-        "pool_timeout": 30,
-        "pool_recycle": 600,
+        "pool_size": 5,
+        "max_overflow": 3,
+        "pool_timeout": 5,
+        "pool_recycle": 180,
         "pool_pre_ping": True,
     }
 
@@ -60,7 +50,11 @@ engine = create_async_engine(
     echo=settings.SQL_ECHO,
     connect_args={
         "prepared_statement_cache_size": 0,
-        "server_settings": {"jit": "off"}
+        "server_settings": {
+            "jit": "off",
+            "idle_in_transaction_session_timeout": "5000",
+            "statement_timeout": "15000"
+        }
     },
     **pool_kwargs
 )

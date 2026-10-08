@@ -157,7 +157,22 @@ async def set_cached_availability(slug: str, month: str, data: dict, ttl_seconds
         pass
 
 async def invalidate_cached_availability(slug: str) -> None:
-    """Invalidate all cached availability keys for a package slug."""
+    """Invalidate all cached availability keys for a package or room slug."""
+    try:
+        from app.core.memory_cache import invalidate_mem_cached
+        invalidate_mem_cached("pkg_avail", f"{slug}:")
+        invalidate_mem_cached("room_avail", f"{slug}:")
+    except Exception:
+        pass
+
+    try:
+        from app.utils.cache import clear_cache_prefix
+        clear_cache_prefix(f"availability:{slug}:")
+        clear_cache_prefix(f"room_avail:{slug}:")
+        clear_cache_prefix("availability:")
+    except Exception:
+        pass
+
     try:
         client = get_redis()
         cursor = 0

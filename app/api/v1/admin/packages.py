@@ -131,6 +131,13 @@ async def list_packages(
     db: AsyncSession = Depends(get_db)
 ):
     """List all non-deleted packages with optional search and status filtering."""
+    is_default = (not search and not status_filter)
+    if is_default:
+        from app.utils.cache import _mem_get
+        cached = _mem_get(f"packages:admin_list:{limit}:{offset}")
+        if cached is not None:
+            return cached
+
     base_query = select(Package).where(Package.deleted_at.is_(None))
     
     if search:
@@ -175,12 +182,16 @@ async def list_packages(
         for item in items:
             item.active_booking_count = 0
     
-    return {
+    res_data = {
         "items": items,
         "total": total_count,
         "page": (offset // limit) + 1 if limit > 0 else 1,
         "size": limit
     }
+    if is_default:
+        from app.utils.cache import _mem_set
+        _mem_set(f"packages:admin_list:{limit}:{offset}", res_data, ttl_seconds=20)
+    return res_data
 
 def full_package_options():
     return (

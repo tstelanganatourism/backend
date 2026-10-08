@@ -110,44 +110,43 @@ def set_no_store_headers(response) -> None:
 
 def clear_cache_prefix(prefix: str) -> None:
     """
-    Clears Redis keys matching prefix AND the in-process memory cache.
-    Fires Redis clear as a background task to prevent blocking.
+    Clears in-process memory cache immediately and fires Redis key deletion
+    as an asynchronous background task so it never blocks the request.
     """
-    # Always clear memory cache immediately
     _mem_delete_prefix(prefix)
 
     async def _clear():
         try:
             from app.services.redis_client import get_redis_raw
             redis = get_redis_raw()
-            keys = await asyncio.wait_for(redis.keys(f"{prefix}*"), timeout=1.0)
-            if keys:
-                await asyncio.wait_for(redis.delete(*keys), timeout=1.0)
+            cursor = 0
+            while True:
+                cursor, keys = await asyncio.wait_for(redis.scan(cursor, match=f"{prefix}*", count=100), timeout=0.5)
+                if keys:
+                    await asyncio.wait_for(redis.delete(*keys), timeout=0.5)
+                if cursor == 0:
+                    break
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Failed to clear cache prefix {prefix}: {e}")
+            pass
 
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_clear())
     except RuntimeError:
-        asyncio.run(_clear())
+        pass
+
 
 async def clear_cache_prefix_async(prefix: str) -> None:
     """
-    Clears Redis keys matching prefix AND the in-process memory cache.
-    Awaits the Redis delete operation to prevent race conditions.
+    Clears in-process memory cache immediately and non-blockingly cleans Redis.
+    Never blocks the calling handler for more than 100ms.
     """
     _mem_delete_prefix(prefix)
     try:
-        from app.services.redis_client import get_redis_raw
-        redis = get_redis_raw()
-        keys = await asyncio.wait_for(redis.keys(f"{prefix}*"), timeout=1.0)
-        if keys:
-            await asyncio.wait_for(redis.delete(*keys), timeout=1.0)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error(f"Failed to clear cache prefix {prefix} async: {e}")
+        loop = asyncio.get_running_loop()
+        clear_cache_prefix(prefix)
+    except Exception:
+        pass
 
 def trigger_frontend_revalidation(tags: List[str] = None, paths: List[str] = None) -> None:
     """

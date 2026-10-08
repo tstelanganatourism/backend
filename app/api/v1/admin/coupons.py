@@ -9,7 +9,7 @@ from app.schemas.coupon import CouponCreate, CouponUpdate, CouponResponse
 from app.middleware.auth import require_admin
 from app.models.user import User
 from app.utils.audit import log_action
-from app.utils.cache import clear_cache_prefix
+from app.utils.cache import clear_cache_prefix, _mem_get, _mem_set
 
 router = APIRouter(
     prefix="/coupons",
@@ -23,6 +23,11 @@ async def list_coupons(
     db: AsyncSession = Depends(get_db)
 ):
     """List all coupons with optional search filtering by code."""
+    if not search:
+        cached = _mem_get("coupons:admin_list")
+        if cached is not None:
+            return cached
+
     query = select(Coupon).where(Coupon.deleted_at.is_(None))
     
     if search:
@@ -31,7 +36,10 @@ async def list_coupons(
     query = query.order_by(Coupon.created_at.desc())
     
     result = await db.execute(query)
-    return result.scalars().all()
+    items = result.scalars().all()
+    if not search:
+        _mem_set("coupons:admin_list", items, ttl_seconds=30)
+    return items
 
 @router.get("/{coupon_id}", response_model=CouponResponse)
 async def get_coupon(
