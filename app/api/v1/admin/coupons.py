@@ -9,6 +9,7 @@ from app.schemas.coupon import CouponCreate, CouponUpdate, CouponResponse
 from app.middleware.auth import require_admin
 from app.models.user import User
 from app.utils.audit import log_action
+from app.utils.cache import clear_cache_prefix
 
 router = APIRouter(
     prefix="/coupons",
@@ -85,6 +86,8 @@ async def create_coupon(
         details={"code": coupon.code, "discount_type": coupon.discount_type, "discount_value": float(coupon.discount_value)}
     )
     await db.commit()
+    clear_cache_prefix("coupons:")
+    clear_cache_prefix("promotions:")
     
     return coupon
 
@@ -133,6 +136,8 @@ async def update_coupon(
         details={k: float(v) if isinstance(v, float) else v for k, v in update_data.items()}
     )
     await db.commit()
+    clear_cache_prefix("coupons:")
+    clear_cache_prefix("promotions:")
     
     return coupon
 
@@ -164,5 +169,7 @@ async def delete_coupon(
         details={"code": coupon.code}
     )
     await db.commit()
+    clear_cache_prefix("coupons:")
+    clear_cache_prefix("promotions:")
     
     return None
