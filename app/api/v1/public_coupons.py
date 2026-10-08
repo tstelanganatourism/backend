@@ -116,12 +116,14 @@ async def get_active_coupons(
             if val_until and val_until < now:
                 continue
 
-            is_global = not c.applicable_package_ids and not c.applicable_room_ids
+            is_global = (not c.applicable_package_ids and not c.applicable_room_ids) or \
+                        (-1 in (c.applicable_package_ids or [])) or \
+                        (-1 in (c.applicable_room_ids or []))
             if is_global:
                 global_coupons.append(c)
-            elif target_type == 'PACKAGE' and target_id in (c.applicable_package_ids or []):
+            elif target_type == 'PACKAGE' and (target_id in (c.applicable_package_ids or []) or -1 in (c.applicable_package_ids or [])):
                 specific_coupons.append(c)
-            elif target_type == 'ROOM' and target_id in (c.applicable_room_ids or []):
+            elif target_type == 'ROOM' and (target_id in (c.applicable_room_ids or []) or -1 in (c.applicable_room_ids or [])):
                 specific_coupons.append(c)
 
         valid_coupons = specific_coupons + global_coupons
