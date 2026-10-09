@@ -517,6 +517,10 @@ async def create_package(
             default=0
         )
     
+    from app.models.enums import DocumentGenerationStatus
+    package.brochure_generation_status = DocumentGenerationStatus.MISSING
+    package.generated_brochure_url = None
+
     db.add(package)
     await db.commit()
     
@@ -893,12 +897,26 @@ async def get_brochure_validation(
     if package.gallery and len(package.gallery) < 1:
         warnings.append(f"Standard layout expects at least 1 gallery image. Currently has {len(package.gallery)}.")
         
+    from datetime import datetime, timezone, timedelta
     from app.models.enums import DocumentGenerationStatus
     active_brochure_url = package.brochure_pdf_url or package.generated_brochure_url
     effective_status = package.brochure_generation_status
 
-    # If the package has an active brochure and is not actively processing, report AVAILABLE
-    if active_brochure_url and effective_status not in [DocumentGenerationStatus.GENERATING, DocumentGenerationStatus.QUEUED]:
+    # Auto-recover stale QUEUED or GENERATING tasks stuck for more than 2 minutes
+    now = datetime.now(timezone.utc)
+    updated_at = package.updated_at
+    if updated_at:
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        is_stale = (now - updated_at) > timedelta(minutes=2)
+    else:
+        is_stale = True
+
+    if is_stale and effective_status in [DocumentGenerationStatus.QUEUED, DocumentGenerationStatus.GENERATING]:
+        effective_status = DocumentGenerationStatus.AVAILABLE if active_brochure_url else DocumentGenerationStatus.MISSING
+        package.brochure_generation_status = effective_status
+        await db.commit()
+    elif active_brochure_url and effective_status not in [DocumentGenerationStatus.GENERATING]:
         effective_status = DocumentGenerationStatus.AVAILABLE
 
     return {
