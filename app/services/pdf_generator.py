@@ -498,6 +498,46 @@ def generate_reportlab_brochure_from_dict(pkg: dict) -> bytes:
         elements.append(t_prices)
         elements.append(Spacer(1, 8))
 
+    # Add-on Extras & Fresh-Up Services (Food, Rooms, Upgrades)
+    has_extras = pkg.get('has_refreshments') or (pkg.get('extras') and len(pkg['extras']) > 0)
+    if has_extras:
+        elements.append(Paragraph("Fresh-Up Rooms &amp; Add-on Extras", section_heading))
+        extra_rows = [[
+            Paragraph("<b>Add-on / Service Name</b>", table_header_style),
+            Paragraph("<b>Details / Menu Description</b>", table_header_style),
+            Paragraph("<b>Adult Rate</b>", table_header_style),
+            Paragraph("<b>Child Rate</b>", table_header_style),
+        ]]
+        if pkg.get('has_refreshments'):
+            ref_adult = f"₹{pkg.get('refreshment_adult_price', 0)}" if pkg.get('refreshment_adult_price') else "—"
+            ref_child = f"₹{pkg.get('refreshment_child_price', 0)}" if pkg.get('refreshment_child_price') else "—"
+            extra_rows.append([
+                Paragraph("Fresh-Up Room Stay (Bath &amp; Change)", table_cell_style),
+                Paragraph("Optional room facility for morning arrival freshening up", table_cell_style),
+                Paragraph(ref_adult, table_cell_style),
+                Paragraph(ref_child, table_cell_style),
+            ])
+        for ex in pkg.get('extras', []):
+            ex_adult = f"₹{ex.get('adult_price', 0)}" if ex.get('adult_price') else "—"
+            ex_child = f"₹{ex.get('child_price', 0)}" if ex.get('child_price') else "—"
+            extra_rows.append([
+                Paragraph(safe_para_text(ex.get('title', '')), table_cell_style),
+                Paragraph(safe_para_text(ex.get('description', '') or '—'), table_cell_style),
+                Paragraph(ex_adult, table_cell_style),
+                Paragraph(ex_child, table_cell_style),
+            ])
+        t_extras = Table(extra_rows, colWidths=[180, 200, 70, 70])
+        t_extras.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), PRIMARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_extras)
+        elements.append(Spacer(1, 8))
+
     # Itinerary
     if pkg.get('itinerary'):
         elements.append(Paragraph("Tour Itinerary", section_heading))
