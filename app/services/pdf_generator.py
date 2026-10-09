@@ -153,10 +153,14 @@ async def generate_package_brochure_task(ctx, package_id: int):
             package.brochure_generation_status = DocumentGenerationStatus.GENERATING
             await db.commit()
             
+            frontend_url = settings.FRONTEND_URL.rstrip('/') if settings.FRONTEND_URL else "https://tstelanganatourism.com"
             if settings.ENVIRONMENT == "development":
-                frontend_url = "http://localhost:3000"
-            else:
-                frontend_url = settings.FRONTEND_URL.rstrip('/')
+                import urllib.request
+                try:
+                    urllib.request.urlopen("http://localhost:3000", timeout=1)
+                    frontend_url = "http://localhost:3000"
+                except Exception:
+                    logger.info("Localhost:3000 not reachable, falling back to live frontend URL for brochure rendering.")
             print_url = f"{frontend_url}/print/package/{package.slug}"
             pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
             

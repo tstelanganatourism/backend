@@ -834,22 +834,8 @@ async def publish_package(
     import logging
     logger = logging.getLogger(__name__)
 
-    if settings.ENVIRONMENT == "development":
-        logger.info(f"Local development mode: triggering brochure generation task for package {package.id} inline via FastAPI BackgroundTasks.")
-        background_tasks.add_task(generate_package_brochure_task, None, package.id)
-    else:
-        try:
-            from app.worker import get_arq_pool
-            import uuid
-            arq_pool = await get_arq_pool()
-            await arq_pool.enqueue_job(
-                "generate_package_brochure_task", 
-                package.id, 
-                _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
-            )
-        except Exception as e:
-            logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
-            background_tasks.add_task(generate_package_brochure_task, None, package.id)
+    logger.info(f"Triggering brochure generation task for package {package.id} inline via FastAPI BackgroundTasks.")
+    background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
     # Re-query the package with all options to prevent expired attributes during Pydantic serialization
     refresh_query = select(Package).where(Package.id == package.id).options(*full_package_options())
@@ -982,28 +968,34 @@ async def regenerate_brochure(
     import logging
     logger = logging.getLogger(__name__)
 
-    if settings.ENVIRONMENT == "development":
-        logger.info(f"Local development: triggering brochure regeneration for package {package.id} inline via FastAPI BackgroundTasks.")
-        background_tasks.add_task(generate_package_brochure_task, None, package.id)
-    else:
-        try:
-            from app.worker import get_arq_pool
-            import uuid
-            arq_pool = await get_arq_pool()
-            await arq_pool.enqueue_job(
-                "generate_package_brochure_task", 
-                package.id, 
-                _job_id=f"brochure_pkg_{package.id}_{uuid.uuid4().hex[:8]}"
-            )
-        except Exception as e:
-            logger.warning(f"ARQ enqueuing failed, falling back to inline FastAPI BackgroundTasks: {e}")
-            background_tasks.add_task(generate_package_brochure_task, None, package.id)
+    logger.info(f"Triggering brochure regeneration for package {package.id} inline via FastAPI BackgroundTasks.")
+    background_tasks.add_task(generate_package_brochure_task, None, package.id)
     
     await log_action(db, current_admin.id, "REGENERATE_BROCHURE", "Package", str(package.id), {"title": package.title})
     await db.commit()
     clear_cache_prefix(f"packages:detail:{package.slug}")
     
     return {"message": "Brochure regeneration started."}
+
+@router.post("/{package_id}/reset-brochure-status")
+async def reset_brochure_status(
+    package_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    Reset stuck brochure generation status so admin can re-trigger or upload manually.
+    """
+    package = await db.get(Package, package_id)
+    if not package:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+        
+    from app.models.enums import DocumentGenerationStatus
+    package.brochure_generation_status = DocumentGenerationStatus.FAILED
+    await db.commit()
+    await log_action(db, current_admin.id, "RESET_BROCHURE_STATUS", "Package", str(package.id), {"title": package.title})
+    clear_cache_prefix(f"packages:detail:{package.slug}")
+    return {"message": "Brochure status reset.", "status": package.brochure_generation_status}
 
 @router.get("/{package_id}/future-bookings")
 async def get_future_bookings(
