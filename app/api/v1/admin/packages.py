@@ -981,7 +981,7 @@ async def regenerate_brochure(
 async def reset_brochure_status(
     package_id: int,
     db: AsyncSession = Depends(get_db),
-    current_admin: AdminUser = Depends(get_current_admin),
+    current_admin: User = Depends(require_admin),
 ):
     """
     Reset stuck brochure generation status so admin can re-trigger or upload manually.
