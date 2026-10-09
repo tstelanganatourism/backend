@@ -1,5 +1,5 @@
 # Use the official Playwright Python base image with pre-installed browser system dependencies
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
