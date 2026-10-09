@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     REDIS_URL: str
     
     # Frontend (for OAuth redirects and CORS)
-    FRONTEND_URL: str = "https://tstelanganatourism.com"
-    GOOGLE_REDIRECT_URI: Optional[str] = "https://tstelanganatourism.com/auth/callback/google"
+    FRONTEND_URL: str = "https://www.tstelanganatourism.com"
+    GOOGLE_REDIRECT_URI: Optional[str] = "https://www.tstelanganatourism.com/auth/callback/google"
     
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: Optional[str] = None

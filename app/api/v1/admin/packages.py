@@ -42,6 +42,51 @@ router = APIRouter(
     dependencies=[Depends(require_admin)]
 )
 
+async def purge_package_caches(package_id: Optional[int] = None, slugs: Optional[List[str]] = None) -> None:
+    """
+    Purges all layers of package caching:
+    1. In-process memory cache (_CACHE)
+    2. Redis & _mem_cache (clear_cache_prefix)
+    3. Next.js on-demand revalidation (trigger_frontend_revalidation)
+    """
+    try:
+        from app.core.memory_cache import clear_mem_cache
+        clear_mem_cache()
+    except Exception as e:
+        logger.warning(f"Failed to clear memory_cache: {e}")
+
+    try:
+        clear_cache_prefix("packages:")
+        clear_cache_prefix("carousel:")
+        clear_cache_prefix("pkg_cat_")
+        clear_cache_prefix("places:")
+    except Exception as e:
+        logger.warning(f"Failed to clear cache prefixes: {e}")
+
+    tags = ["packages", "categories", "package-categories"]
+    paths = ["/packages", "/"]
+    if package_id:
+        tags.append(f"package-{package_id}")
+    if slugs:
+        for s in slugs:
+            if s:
+                tags.extend([f"package:{s}", f"package-{s}"])
+                paths.append(f"/packages/{s}")
+
+    try:
+        from app.utils.cache import trigger_frontend_revalidation
+        trigger_frontend_revalidation(tags=list(set(tags)), paths=list(set(paths)))
+    except Exception as e:
+        logger.warning(f"Failed to trigger frontend revalidation: {e}")
+
+@router.post("/cache/clear")
+async def clear_packages_cache(
+    current_admin: User = Depends(require_admin)
+):
+    """Admin endpoint to flush all package and storefront caches immediately."""
+    await purge_package_caches()
+    return {"status": "success", "message": "All package caches purged and storefront revalidation triggered."}
+
 @router.post("/upload-image")
 async def upload_admin_image(
     file: UploadFile = File(...),
@@ -287,7 +332,7 @@ async def create_package_category(
     db.add(cat)
     await db.commit()
     await db.refresh(cat)
-    await clear_cache_prefix_async("packages:")
+    await purge_package_caches()
     return PackageCategoryResponse(
         id=cat.id, name=cat.name, slug=cat.slug,
         description=cat.description, cover_image_url=cat.cover_image_url,
@@ -310,7 +355,7 @@ async def update_package_category(
         setattr(cat, key, val)
     await db.commit()
     await db.refresh(cat)
-    await clear_cache_prefix_async("packages:")
+    await purge_package_caches()
     return PackageCategoryResponse(
         id=cat.id, name=cat.name, slug=cat.slug,
         description=cat.description, cover_image_url=cat.cover_image_url,
@@ -331,7 +376,7 @@ async def delete_package_category(
     from datetime import datetime, timezone
     cat.deleted_at = datetime.now(timezone.utc)
     await db.commit()
-    await clear_cache_prefix_async("packages:")
+    await purge_package_caches()
 
 @category_router.post("/{category_id}/packages", status_code=200)
 async def assign_packages_to_category(
@@ -351,7 +396,7 @@ async def assign_packages_to_category(
         if pkg.id not in existing_ids:
             cat.packages.append(pkg)
     await db.commit()
-    await clear_cache_prefix_async("packages:")
+    await purge_package_caches()
     return {"assigned": len(pkgs)}
 
 @category_router.delete("/{category_id}/packages/{package_id}", status_code=200)
@@ -397,12 +442,7 @@ async def reorder_packages(
     await db.commit()
     
     # Invalidate all package and category caches
-    from app.core.memory_cache import clear_mem_cache
-    clear_mem_cache()
-    await clear_cache_prefix_async("packages:")
-    await clear_cache_prefix_async("pkg_cat_")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=["packages", "categories"])
+    await purge_package_caches()
     
     return {"updated": len(items)}
 
@@ -493,9 +533,7 @@ async def create_package(
         entity_id=str(package.id),
         details={"title": package.title, "slug": package.slug}
     )
-    await db.commit()
-    clear_cache_prefix("packages:")
-    clear_cache_prefix("carousel:")
+    await purge_package_caches(package.id, [package.slug])
     
     return package
 
@@ -622,15 +660,7 @@ async def update_package(
         "status": package.status
     }
     await sse_manager.broadcast_event("package", str(package.id), "ENTITY_STATUS_UPDATE", sse_payload)
-        
-    from app.core.memory_cache import clear_mem_cache
-    clear_mem_cache()
-    clear_cache_prefix("packages:list:")
-    clear_cache_prefix(f"packages:detail:{old_slug}")
-    clear_cache_prefix(f"packages:detail:{package.slug}")
-    clear_cache_prefix("carousel:")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}", f"package:{old_slug}"])
+    await purge_package_caches(package.id, [old_slug, package.slug])
     
     # Reload package with all options to refresh expired attributes for Pydantic serialization
     refresh_query = select(Package).where(Package.id == package.id).options(*full_package_options())
@@ -680,10 +710,7 @@ async def delete_package(
     }
     await sse_manager.broadcast_event("package", str(package_id), "ENTITY_STATUS_UPDATE", sse_payload)
 
-    clear_cache_prefix("packages:list:")
-    clear_cache_prefix(f"packages:detail:{package.slug}")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}"])
+    await purge_package_caches(package_id, [package.slug])
     
     return None
 
@@ -795,11 +822,7 @@ async def publish_package(
         entity_id=str(package.id),
         details={"title": package.title, "status": "PUBLISHED"}
     )
-    await db.commit()
-    clear_cache_prefix("packages:list:")
-    clear_cache_prefix(f"packages:detail:{package.slug}")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=["packages", f"package:{package.slug}"])
+    await purge_package_caches(package.id, [package.slug])
     
     # ─── Document Architecture Trigger ─────────────────────────────
     from app.models.enums import DocumentGenerationStatus

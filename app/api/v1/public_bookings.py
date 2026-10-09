@@ -863,9 +863,9 @@ async def checkout(
     pricing_snapshot = {
         "subtotal_amount": str(subtotal_amount),
         "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
-        "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
+        "has_refreshment_addon": bool(getattr(parent_package, 'has_refreshments', False) and (getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False))) if 'parent_package' in locals() and parent_package else bool(getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False)),
         "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
-        "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
+        "has_food_addon": bool(getattr(parent_package, 'has_food_option', False) and (getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False))) if 'parent_package' in locals() and parent_package else bool(getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False)),
         "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
         "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
         "coupon_discount": str(coupon_discount),

@@ -151,12 +151,18 @@ async def clear_cache_prefix_async(prefix: str) -> None:
 def trigger_frontend_revalidation(tags: List[str] = None, paths: List[str] = None) -> None:
     """
     Triggers Next.js On-Demand Revalidation via Webhook.
-    Bypassed in development mode to avoid Next.js page compilation lags.
     """
-    if os.getenv("ENVIRONMENT", "development") == "development":
+    if os.getenv("ENVIRONMENT", "development") == "development" and not os.getenv("FORCE_REVALIDATE", ""):
         return
 
-    frontend_url = settings.FRONTEND_URL
+    frontend_url = getattr(settings, "FRONTEND_URL", "https://www.tstelanganatourism.com")
+    if not frontend_url:
+        frontend_url = "https://www.tstelanganatourism.com"
+    if not frontend_url.startswith("http"):
+        frontend_url = f"https://{frontend_url}"
+    if "tstelanganatourism.com" in frontend_url and "www.tstelanganatourism.com" not in frontend_url:
+        frontend_url = frontend_url.replace("tstelanganatourism.com", "www.tstelanganatourism.com")
+    frontend_url = frontend_url.rstrip("/")
     url = f"{frontend_url}/api/revalidate"
     payload = {
         "secret": os.getenv("REVALIDATE_SECRET", "ts-tourism-revalidate-2024"),
@@ -166,14 +172,20 @@ def trigger_frontend_revalidation(tags: List[str] = None, paths: List[str] = Non
     
     async def _ping():
         try:
-            async with httpx.AsyncClient() as client:
-                await client.post(url, json=payload, timeout=5.0)
+            from loguru import logger
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                resp = await client.post(url, json=payload, timeout=8.0)
+                logger.info(f"Frontend revalidate response {resp.status_code}: {resp.text}")
         except Exception as e:
-            pass
+            from loguru import logger
+            logger.warning(f"Frontend revalidation ping failed: {e}")
             
     # Fire and forget
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(_ping())
     except RuntimeError:
-        asyncio.run(_ping())
+        try:
+            asyncio.run(_ping())
+        except Exception:
+            pass

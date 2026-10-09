@@ -596,9 +596,9 @@ async def get_package_detail(
             )
 
     res = await ttl_cache_get_or_set(cache_key, PUBLIC_CACHE_TTL_SECONDS, load_package_detail)
-    set_mem_cached("package_detail", mem_key, res, ttl_seconds=3600 if not is_agent else 120)
+    set_mem_cached("package_detail", mem_key, res, ttl_seconds=60)
     if not is_agent:
-        set_mem_cached("package_detail", resolved_slug, res, ttl_seconds=3600)
+        set_mem_cached("package_detail", resolved_slug, res, ttl_seconds=60)
     return res
 
 
