@@ -88,11 +88,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to schedule cache warmup: {e}")
 
-    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery, memory cache warmer.")
+    # Start embedded ARQ worker inside FastAPI so background queues (brochures, emails, SMS)
+    # are always processed immediately, even on single-service deployments without a dedicated worker container.
+    arq_worker = None
+    arq_task = None
+    try:
+        from arq.worker import create_worker
+        from app.worker import WorkerSettings
+        arq_worker = create_worker(WorkerSettings)
+        arq_task = asyncio.create_task(arq_worker.main())
+        logger.info("Embedded ARQ background worker started inside FastAPI.")
+    except Exception as e:
+        logger.warning(f"Failed to start embedded ARQ worker: {e}")
+
+    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery, memory cache warmer, embedded ARQ worker.")
 
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
+    if arq_worker:
+        try:
+            await arq_worker.close()
+        except Exception:
+            pass
+    if arq_task:
+        arq_task.cancel()
+
     for task in (cleanup_task, cutoff_task, missed_emails_task):
         task.cancel()
         try:
