@@ -394,6 +394,215 @@ def generate_reportlab_brochure(package: Package) -> bytes:
     return buf.getvalue()
 
 
+def generate_reportlab_brochure_from_dict(pkg: dict) -> bytes:
+    """
+    Thread-safe version of generate_reportlab_brochure that works with plain Python dicts.
+    Use this when calling from asyncio.to_thread — SQLAlchemy models cannot be passed to threads.
+    Input: dict produced by _extract_package_data()
+    """
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    )
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
+    )
+    styles = getSampleStyleSheet()
+
+    PRIMARY      = colors.HexColor('#0f3d56')
+    SECONDARY    = colors.HexColor('#1a6b7a')
+    DARK_TEXT    = colors.HexColor('#1e293b')
+    MUTED_TEXT   = colors.HexColor('#64748b')
+    LIGHT_BG     = colors.HexColor('#f8fafc')
+    BORDER_COLOR = colors.HexColor('#e2e8f0')
+
+    title_style = ParagraphStyle('BrochureTitle2', parent=styles['Heading1'],
+        fontName='Helvetica-Bold', fontSize=16, leading=20, textColor=PRIMARY)
+    sub_title_style = ParagraphStyle('BrochureSubtitle2', parent=styles['Normal'],
+        fontName='Helvetica', fontSize=9, leading=13, textColor=MUTED_TEXT)
+    section_heading = ParagraphStyle('SectionHeading2', parent=styles['Heading2'],
+        fontName='Helvetica-Bold', fontSize=11, leading=15, textColor=PRIMARY,
+        spaceBefore=8, spaceAfter=5)
+    body_style = ParagraphStyle('BodyDark2', parent=styles['Normal'],
+        fontName='Helvetica', fontSize=8, leading=11, textColor=DARK_TEXT)
+    table_header_style = ParagraphStyle('TableHeader2', parent=styles['Normal'],
+        fontName='Helvetica-Bold', fontSize=8, leading=10, textColor=colors.white)
+    table_cell_style = ParagraphStyle('TableCell2', parent=styles['Normal'],
+        fontName='Helvetica', fontSize=7.5, leading=10, textColor=DARK_TEXT)
+
+    elements = []
+
+    # Header
+    header_data = [[
+        Paragraph("<b>TS BOAT TOURISM</b><br/><font size=7 color='#64748b'>Official Travel &amp; Boat Tour Partner | Telangana Tourism</font>",
+                  ParagraphStyle('H1b', parent=body_style, fontSize=11, leading=14, textColor=PRIMARY)),
+        Paragraph("<b>Hotline:</b> +91 99513 69573, +91 77801 19268<br/><b>Email:</b> tstelanganatourism@gmail.com<br/><b>Web:</b> www.tstelanganatourism.com",
+                  ParagraphStyle('H2b', parent=body_style, fontSize=7, leading=9.5, alignment=2, textColor=MUTED_TEXT))
+    ]]
+    t_header = Table(header_data, colWidths=[320, 200])
+    t_header.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    elements.append(t_header)
+    elements.append(HRFlowable(width="100%", thickness=2, color=PRIMARY, spaceAfter=8))
+
+    # Title & overview
+    elements.append(Paragraph(safe_para_text(pkg['title']), title_style))
+    region = f" • Region: {safe_para_text(pkg['region'])}" if pkg.get('region') else ""
+    elements.append(Paragraph(
+        f"<b>Duration:</b> {safe_para_text(pkg['duration'])}{region} • <b>Starting Fare:</b> ₹{pkg['starting_price']}",
+        sub_title_style))
+    elements.append(Spacer(1, 6))
+
+    if pkg.get('description'):
+        desc = safe_para_text(pkg['description'][:400]) + ("..." if len(pkg['description']) > 400 else "")
+        elements.append(Paragraph(desc, body_style))
+        elements.append(Spacer(1, 8))
+
+    # Variants / Pricing
+    if pkg.get('variants'):
+        elements.append(Paragraph("Package Categories &amp; Pricing", section_heading))
+        price_rows = [[
+            Paragraph("<b>Category / Variant</b>", table_header_style),
+            Paragraph("<b>Adult (Weekday)</b>", table_header_style),
+            Paragraph("<b>Child (Weekday)</b>", table_header_style),
+            Paragraph("<b>Adult (Weekend)</b>", table_header_style),
+            Paragraph("<b>Child (Weekend)</b>", table_header_style),
+        ]]
+        for v in pkg['variants']:
+            wknd_adult = f"₹{v['weekend_adult_price']}" if v.get('weekend_adult_price') else f"₹{v['adult_price']}"
+            wknd_child = f"₹{v['weekend_child_price']}" if v.get('weekend_child_price') else f"₹{v['child_price']}"
+            price_rows.append([
+                Paragraph(safe_para_text(v['title']), table_cell_style),
+                Paragraph(f"₹{v['adult_price']}", table_cell_style),
+                Paragraph(f"₹{v['child_price']}", table_cell_style),
+                Paragraph(wknd_adult, table_cell_style),
+                Paragraph(wknd_child, table_cell_style),
+            ])
+        t_prices = Table(price_rows, colWidths=[160, 90, 90, 90, 90])
+        t_prices.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), PRIMARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_prices)
+        elements.append(Spacer(1, 8))
+
+    # Itinerary
+    if pkg.get('itinerary'):
+        elements.append(Paragraph("Tour Itinerary", section_heading))
+        itin_rows = [[
+            Paragraph("<b>Day &amp; Time</b>", table_header_style),
+            Paragraph("<b>Activity / Stop</b>", table_header_style),
+            Paragraph("<b>Meal / Duration</b>", table_header_style),
+        ]]
+        for item in pkg['itinerary']:
+            timing_str = f"Day {item['day_number']}"
+            if item.get('timing'):
+                timing_str += f"<br/>{safe_para_text(item['timing'])}"
+            meal_str = "Meal Included" if item.get('meal_included') else "—"
+            if item.get('duration_at_stop'):
+                meal_str += f"<br/>{safe_para_text(item['duration_at_stop'])}"
+            act_text = f"<b>{safe_para_text(item['title'])}</b>"
+            desc = safe_para_text(item.get('description', ''))
+            if desc:
+                act_text += f"<br/><font size=6.5 color='#475569'>{desc[:140]}</font>"
+            itin_rows.append([
+                Paragraph(timing_str, table_cell_style),
+                Paragraph(act_text, table_cell_style),
+                Paragraph(meal_str, table_cell_style),
+            ])
+        t_itin = Table(itin_rows, colWidths=[80, 320, 120])
+        t_itin.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), SECONDARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_itin)
+        elements.append(Spacer(1, 8))
+
+    # Inclusions & Exclusions
+    if pkg.get('inclusions') or pkg.get('exclusions'):
+        elements.append(Paragraph("Inclusions &amp; Exclusions", section_heading))
+        inc_bullets = "<br/>".join([f"• {safe_para_text(i['label'])}" for i in pkg.get('inclusions', [])]) or "—"
+        exc_bullets = "<br/>".join([f"• {safe_para_text(e['label'])}" for e in pkg.get('exclusions', [])]) or "—"
+        inc_exc_data = [
+            [Paragraph("<b>INCLUSIONS</b>", ParagraphStyle('IH2', parent=table_header_style, textColor=colors.HexColor('#0f766e'))),
+             Paragraph("<b>EXCLUSIONS</b>", ParagraphStyle('EH2', parent=table_header_style, textColor=colors.HexColor('#b91c1c')))],
+            [Paragraph(inc_bullets, table_cell_style), Paragraph(exc_bullets, table_cell_style)]
+        ]
+        t_inc_exc = Table(inc_exc_data, colWidths=[260, 260])
+        t_inc_exc.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (0,0), colors.HexColor('#ccfbf1')),
+            ('BACKGROUND', (1,0), (1,0), colors.HexColor('#fee2e2')),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ]))
+        elements.append(t_inc_exc)
+        elements.append(Spacer(1, 8))
+
+    # Boarding Points
+    if pkg.get('boarding_points'):
+        elements.append(Paragraph("Boarding &amp; Departure Points", section_heading))
+        bp_rows = [[
+            Paragraph("<b>Point Name</b>", table_header_style),
+            Paragraph("<b>Departure Time</b>", table_header_style),
+            Paragraph("<b>Address / Landmark</b>", table_header_style),
+            Paragraph("<b>Contact</b>", table_header_style),
+        ]]
+        for bp in pkg['boarding_points']:
+            landmark_part = f"({bp['landmark']})" if bp.get('landmark') else ''
+            addr = f"{bp.get('address', '')} {landmark_part}".strip() or "Bhadrachalam Office"
+            bp_rows.append([
+                Paragraph(safe_para_text(bp['title']), table_cell_style),
+                Paragraph(safe_para_text(bp['departure_time']), table_cell_style),
+                Paragraph(safe_para_text(addr), table_cell_style),
+                Paragraph(safe_para_text(bp['contact_number']), table_cell_style),
+            ])
+        t_bp = Table(bp_rows, colWidths=[130, 80, 210, 100])
+        t_bp.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), PRIMARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_bp)
+        elements.append(Spacer(1, 8))
+
+    # Policies
+    if pkg.get('policies'):
+        elements.append(Paragraph("Important Guidelines &amp; Cancellation Policy", section_heading))
+        for pol in pkg['policies']:
+            pol_text = f"<b>{safe_para_text(pol['title'])}:</b> {safe_para_text(pol['description'])}"
+            elements.append(Paragraph(pol_text, ParagraphStyle('Pol2', parent=body_style, fontSize=7, leading=9)))
+            elements.append(Spacer(1, 2))
+        elements.append(Spacer(1, 6))
+
+    elements.append(HRFlowable(width="100%", thickness=1, color=BORDER_COLOR, spaceBefore=4, spaceAfter=4))
+    footer_text = "<b>TS Boat Tourism &amp; Papikondalu Tourism Services</b> | Official booking desk at Door No. 10-1-2/1, Om Shanthi Building Sataram, Bhadrachalam | Bookings &amp; Enquiries: +91 99513 69573, +91 77801 19268"
+    elements.append(Paragraph(footer_text, ParagraphStyle('Foot2', parent=body_style, fontSize=6.5, leading=8.5, textColor=MUTED_TEXT, alignment=1)))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 def sync_generate_pdf(url: str) -> bytes:
     """
     Synchronous wrapper to run generate_pdf_from_url in a dedicated thread.
@@ -408,6 +617,69 @@ def sync_generate_pdf(url: str) -> bytes:
         return loop.run_until_complete(generate_pdf_from_url(url))
     finally:
         loop.close()
+
+
+def _extract_package_data(package) -> dict:
+    """
+    Serialize a Package ORM object into a plain Python dict so it can be safely
+    passed to asyncio.to_thread (SQLAlchemy async models are NOT thread-safe).
+    All relationship lists are eagerly loaded before this call.
+    """
+    def _variant(v):
+        return {
+            "title": v.title or "Standard",
+            "adult_price": v.adult_price,
+            "child_price": v.child_price,
+            "weekend_adult_price": v.weekend_adult_price,
+            "weekend_child_price": v.weekend_child_price,
+            "is_active": v.is_active,
+        }
+
+    def _itinerary(i):
+        return {
+            "day_number": i.day_number,
+            "sort_order": i.sort_order,
+            "title": i.title or "",
+            "description": i.description or "",
+            "timing": i.timing or "",
+            "duration_at_stop": i.duration_at_stop or "",
+            "meal_included": bool(i.meal_included),
+        }
+
+    def _label(item):
+        return {"label": item.label or ""}
+
+    def _boarding(b):
+        return {
+            "title": b.title or "Bhadrachalam Office",
+            "departure_time": b.departure_time or "07:00 AM",
+            "address": b.address or "",
+            "landmark": b.landmark or "",
+            "contact_number": b.contact_number or "+91 99513 69573",
+        }
+
+    def _policy(p):
+        return {
+            "title": p.title or "",
+            "description": p.description or "",
+        }
+
+    region_val = package.region.value if hasattr(package.region, "value") else (package.region or "")
+
+    return {
+        "title": package.title or "Tour Package",
+        "slug": package.slug or "",
+        "duration": package.duration or "",
+        "region": region_val,
+        "description": package.description or "",
+        "starting_price": package.starting_price or 0,
+        "variants": [_variant(v) for v in (package.variants or [])],
+        "itinerary": sorted([_itinerary(i) for i in (package.itinerary or [])], key=lambda x: (x["day_number"], x["sort_order"])),
+        "inclusions": [_label(i) for i in (package.inclusions or [])],
+        "exclusions": [_label(e) for e in (package.exclusions or [])],
+        "boarding_points": [_boarding(b) for b in (package.boarding_points or [])],
+        "policies": [_policy(p) for p in (package.policies or [])],
+    }
 
 
 async def generate_package_brochure_task(ctx, package_id: int):
@@ -459,11 +731,21 @@ async def generate_package_brochure_task(ctx, package_id: int):
                     except Exception:
                         pass
                 print_url = f"{frontend_url}/print/package/{package.slug}"
-                pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
+                pdf_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(sync_generate_pdf, print_url),
+                    timeout=60.0
+                )
                 logger.info(f"Playwright generated brochure PDF for package {package.slug} successfully.")
             except Exception as pw_err:
                 logger.warning(f"Playwright PDF generation failed or unavailable ({pw_err}). Falling back to ReportLab vector PDF engine.")
-                pdf_bytes = await asyncio.to_thread(generate_reportlab_brochure, package)
+                # CRITICAL FIX: Serialize ORM object to plain dict BEFORE passing to thread.
+                # SQLAlchemy async models are NOT thread-safe and crash with MissingGreenlet
+                # when attributes are accessed from a worker thread.
+                package_dict = _extract_package_data(package)
+                pdf_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(generate_reportlab_brochure_from_dict, package_dict),
+                    timeout=30.0
+                )
                 logger.info(f"ReportLab generated brochure PDF for package {package.slug} successfully ({len(pdf_bytes)} bytes).")
 
             if not pdf_bytes:
@@ -486,31 +768,23 @@ async def generate_package_brochure_task(ctx, package_id: int):
             clear_cache_prefix(f"packages:detail:{package.slug}")
             logger.info(f"Successfully generated and uploaded brochure for package {package.slug}: {cloudinary_url}")
 
-        except (Exception, asyncio.CancelledError) as e:
+        except Exception as e:
             logger.exception(f"Failed to generate brochure for package {package_id}: {e}")
-
-            async def set_cleanup_status():
-                try:
-                    async with AsyncSessionLocal() as fail_db:
-                        fail_package = await fail_db.get(Package, package_id)
-                        if fail_package:
-                            # CRITICAL: If package already has an active brochure (manual upload or previous generated),
-                            # keep status as AVAILABLE so the user/admin isn't blocked by a failed regen attempt!
-                            if fail_package.brochure_pdf_url or fail_package.generated_brochure_url:
-                                fail_package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
-                                logger.info(f"Retained AVAILABLE status for package {package_id} because an active brochure exists.")
-                            else:
-                                fail_package.brochure_generation_status = DocumentGenerationStatus.FAILED
-                            await fail_db.commit()
-                except Exception as db_err:
-                    logger.error(f"Failed to update brochure status in cleanup for package {package_id}: {db_err}")
-
-            cleanup_task = asyncio.create_task(set_cleanup_status())
+            # IMPORTANT: Never re-raise from a FastAPI BackgroundTask — it leaves
+            # the task in a broken state and prevents DB status cleanup.
             try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                pass
-            raise e
+                async with AsyncSessionLocal() as fail_db:
+                    fail_package = await fail_db.get(Package, package_id)
+                    if fail_package:
+                        # If an active brochure exists, keep AVAILABLE so admin isn't blocked
+                        if fail_package.brochure_pdf_url or fail_package.generated_brochure_url:
+                            fail_package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
+                            logger.info(f"Retained AVAILABLE status for package {package_id} because an active brochure exists.")
+                        else:
+                            fail_package.brochure_generation_status = DocumentGenerationStatus.FAILED
+                        await fail_db.commit()
+            except Exception as db_err:
+                logger.error(f"Failed to update brochure status in cleanup for package {package_id}: {db_err}")
 
 
 async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None, is_postponement: bool = False):

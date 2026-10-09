@@ -902,21 +902,22 @@ async def get_brochure_validation(
     active_brochure_url = package.brochure_pdf_url or package.generated_brochure_url
     effective_status = package.brochure_generation_status
 
-    # Auto-recover stale QUEUED or GENERATING tasks stuck for more than 2 minutes
+    # Auto-recover stale QUEUED or GENERATING tasks stuck longer than our generation budget
+    # Budget: 60s Playwright timeout + 30s ReportLab timeout + 10s overhead = 100s max
     now = datetime.now(timezone.utc)
     updated_at = package.updated_at
     if updated_at:
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)
-        is_stale = (now - updated_at) > timedelta(minutes=2)
+        is_stale = (now - updated_at) > timedelta(seconds=100)
     else:
         is_stale = True
 
     if is_stale and effective_status in [DocumentGenerationStatus.QUEUED, DocumentGenerationStatus.GENERATING]:
-        effective_status = DocumentGenerationStatus.AVAILABLE if active_brochure_url else DocumentGenerationStatus.MISSING
+        effective_status = DocumentGenerationStatus.AVAILABLE if active_brochure_url else DocumentGenerationStatus.FAILED
         package.brochure_generation_status = effective_status
         await db.commit()
-    elif active_brochure_url and effective_status not in [DocumentGenerationStatus.GENERATING]:
+    elif active_brochure_url and effective_status not in [DocumentGenerationStatus.GENERATING, DocumentGenerationStatus.QUEUED]:
         effective_status = DocumentGenerationStatus.AVAILABLE
 
     return {
