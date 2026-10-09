@@ -584,10 +584,10 @@ async def get_package_detail(
                     item for item in pkg_meals
                     if not item.deleted_at and has_text(item.name)
                 ],
-                extras=[
-                    item for item in pkg_extras
-                    if not item.deleted_at and has_text(item.title)
-                ],
+                extras=sorted(
+                    [item for item in pkg_extras if not item.deleted_at and has_text(item.title)],
+                    key=lambda x: (x.sort_order if x.sort_order is not None else 99, x.id)
+                ),
                 agent_commission_type=agent_comm_type,
                 agent_commission_percentage=agent_comm_pct,
                 agent_commission_fixed_amount=agent_comm_fixed,
