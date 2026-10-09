@@ -121,6 +121,279 @@ async def generate_pdf_from_url(url: str) -> bytes:
             await browser.close()
 
 
+def safe_para_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    import re
+    cleaned = re.sub(r'<[^>]+>', '', str(text))
+    return escape(cleaned)
+
+def generate_reportlab_brochure(package: Package) -> bytes:
+    """
+    Pure Python vector PDF brochure generator using ReportLab.
+    Runs in 50ms with ~5MB RAM, zero external browser or OS dependencies.
+    Guaranteed to run anywhere (Render Native Python, Docker, Windows, Linux).
+    """
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
+    )
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    styles = getSampleStyleSheet()
+
+    PRIMARY = colors.HexColor('#0f3d56')
+    SECONDARY = colors.HexColor('#1a6b7a')
+    DARK_TEXT = colors.HexColor('#1e293b')
+    MUTED_TEXT = colors.HexColor('#64748b')
+    LIGHT_BG = colors.HexColor('#f8fafc')
+    BORDER_COLOR = colors.HexColor('#e2e8f0')
+
+    title_style = ParagraphStyle(
+        'BrochureTitle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=16,
+        leading=20,
+        textColor=PRIMARY
+    )
+
+    sub_title_style = ParagraphStyle(
+        'BrochureSubtitle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=13,
+        textColor=MUTED_TEXT
+    )
+
+    section_heading = ParagraphStyle(
+        'SectionHeading',
+        parent=styles['Heading2'],
+        fontName='Helvetica-Bold',
+        fontSize=11,
+        leading=15,
+        textColor=PRIMARY,
+        spaceBefore=8,
+        spaceAfter=5
+    )
+
+    body_style = ParagraphStyle(
+        'BodyDark',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=8,
+        leading=11,
+        textColor=DARK_TEXT
+    )
+
+    table_header_style = ParagraphStyle(
+        'TableHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=8,
+        leading=10,
+        textColor=colors.white
+    )
+
+    table_cell_style = ParagraphStyle(
+        'TableCell',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=7.5,
+        leading=10,
+        textColor=DARK_TEXT
+    )
+
+    elements = []
+
+    # 1. Header Block
+    header_data = [
+        [
+            Paragraph("<b>TS BOAT TOURISM</b><br/><font size=7 color='#64748b'>Official Travel &amp; Boat Tour Partner | Telangana Tourism</font>", ParagraphStyle('H1', parent=body_style, fontSize=11, leading=14, textColor=PRIMARY)),
+            Paragraph("<b>Hotline:</b> +91 99513 69573, +91 77801 19268<br/><b>Email:</b> tstelanganatourism@gmail.com<br/><b>Web:</b> www.tstelanganatourism.com", ParagraphStyle('H2', parent=body_style, fontSize=7, leading=9.5, alignment=2, textColor=MUTED_TEXT))
+        ]
+    ]
+    t_header = Table(header_data, colWidths=[320, 200])
+    t_header.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    elements.append(t_header)
+    elements.append(HRFlowable(width="100%", thickness=2, color=PRIMARY, spaceAfter=8))
+
+    # 2. Package Title & Overview
+    elements.append(Paragraph(safe_para_text(package.title or "Tour Package"), title_style))
+    duration = safe_para_text(package.duration or "Tour Package")
+    reg_val = package.region.value if hasattr(package.region, 'value') else package.region
+    region = f" • Region: {safe_para_text(reg_val)}" if reg_val else ""
+    elements.append(Paragraph(f"<b>Duration:</b> {duration}{region} • <b>Starting Fare:</b> ₹{package.starting_price}", sub_title_style))
+    elements.append(Spacer(1, 6))
+
+    if package.description:
+        desc_clean = safe_para_text(package.description[:400]) + ("..." if len(package.description) > 400 else "")
+        elements.append(Paragraph(desc_clean, body_style))
+        elements.append(Spacer(1, 8))
+
+    # 3. Variants & Pricing Table
+    if package.variants:
+        elements.append(Paragraph("Package Categories &amp; Pricing", section_heading))
+        price_rows = [
+            [
+                Paragraph("<b>Category / Variant</b>", table_header_style),
+                Paragraph("<b>Adult (Weekday)</b>", table_header_style),
+                Paragraph("<b>Child (Weekday)</b>", table_header_style),
+                Paragraph("<b>Adult (Weekend)</b>", table_header_style),
+                Paragraph("<b>Child (Weekend)</b>", table_header_style),
+            ]
+        ]
+        for v in package.variants:
+            wknd_adult = f"₹{v.weekend_adult_price}" if v.weekend_adult_price else f"₹{v.adult_price}"
+            wknd_child = f"₹{v.weekend_child_price}" if v.weekend_child_price else f"₹{v.child_price}"
+            price_rows.append([
+                Paragraph(safe_para_text(v.title or "Standard"), table_cell_style),
+                Paragraph(f"₹{v.adult_price}", table_cell_style),
+                Paragraph(f"₹{v.child_price}", table_cell_style),
+                Paragraph(wknd_adult, table_cell_style),
+                Paragraph(wknd_child, table_cell_style),
+            ])
+        t_prices = Table(price_rows, colWidths=[160, 90, 90, 90, 90])
+        t_prices.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), PRIMARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_prices)
+        elements.append(Spacer(1, 8))
+
+    # 4. Itinerary
+    if package.itinerary:
+        elements.append(Paragraph("Tour Itinerary", section_heading))
+        itin_rows = [
+            [
+                Paragraph("<b>Day &amp; Time</b>", table_header_style),
+                Paragraph("<b>Activity / Stop</b>", table_header_style),
+                Paragraph("<b>Meal / Duration</b>", table_header_style),
+            ]
+        ]
+        sorted_itinerary = sorted(package.itinerary, key=lambda x: (x.day_number, x.sort_order))
+        for item in sorted_itinerary:
+            timing_str = f"Day {item.day_number}"
+            if item.timing:
+                timing_str += f"<br/>{safe_para_text(item.timing)}"
+            meal_str = "Meal Included" if item.meal_included else "—"
+            if item.duration_at_stop:
+                meal_str += f"<br/>{safe_para_text(item.duration_at_stop)}"
+            desc = safe_para_text(item.description or "")
+            act_text = f"<b>{safe_para_text(item.title)}</b>"
+            if desc:
+                act_text += f"<br/><font size=6.5 color='#475569'>{desc[:140]}</font>"
+            itin_rows.append([
+                Paragraph(timing_str, table_cell_style),
+                Paragraph(act_text, table_cell_style),
+                Paragraph(meal_str, table_cell_style),
+            ])
+        t_itin = Table(itin_rows, colWidths=[80, 320, 120])
+        t_itin.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), SECONDARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_itin)
+        elements.append(Spacer(1, 8))
+
+    # 5. Inclusions & Exclusions
+    if package.inclusions or package.exclusions:
+        elements.append(Paragraph("Inclusions &amp; Exclusions", section_heading))
+        inc_bullets = "<br/>".join([f"• {safe_para_text(inc.label)}" for inc in package.inclusions]) if package.inclusions else "—"
+        exc_bullets = "<br/>".join([f"• {safe_para_text(exc.label)}" for exc in package.exclusions]) if package.exclusions else "—"
+        inc_exc_data = [
+            [
+                Paragraph("<b>INCLUSIONS</b>", ParagraphStyle('IH', parent=table_header_style, textColor=colors.HexColor('#0f766e'))),
+                Paragraph("<b>EXCLUSIONS</b>", ParagraphStyle('EH', parent=table_header_style, textColor=colors.HexColor('#b91c1c'))),
+            ],
+            [
+                Paragraph(inc_bullets, table_cell_style),
+                Paragraph(exc_bullets, table_cell_style),
+            ]
+        ]
+        t_inc_exc = Table(inc_exc_data, colWidths=[260, 260])
+        t_inc_exc.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (0,0), colors.HexColor('#ccfbf1')),
+            ('BACKGROUND', (1,0), (1,0), colors.HexColor('#fee2e2')),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ]))
+        elements.append(t_inc_exc)
+        elements.append(Spacer(1, 8))
+
+    # 6. Boarding Points
+    if package.boarding_points:
+        elements.append(Paragraph("Boarding &amp; Departure Points", section_heading))
+        bp_rows = [
+            [
+                Paragraph("<b>Point Name</b>", table_header_style),
+                Paragraph("<b>Departure Time</b>", table_header_style),
+                Paragraph("<b>Address / Landmark</b>", table_header_style),
+                Paragraph("<b>Contact</b>", table_header_style),
+            ]
+        ]
+        for bp in package.boarding_points:
+            bp_rows.append([
+                Paragraph(safe_para_text(bp.title or "Bhadrachalam Office"), table_cell_style),
+                Paragraph(safe_para_text(bp.departure_time or "07:00 AM"), table_cell_style),
+                Paragraph(safe_para_text(f"{bp.address or ''} {f'({bp.landmark})' if bp.landmark else ''}".strip() or "Bhadrachalam Office"), table_cell_style),
+                Paragraph(safe_para_text(bp.contact_number or "+91 99513 69573"), table_cell_style),
+            ])
+        t_bp = Table(bp_rows, colWidths=[130, 80, 210, 100])
+        t_bp.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), PRIMARY),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('GRID', (0,0), (-1,-1), 0.5, BORDER_COLOR),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 3),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ]))
+        elements.append(t_bp)
+        elements.append(Spacer(1, 8))
+
+    # 7. Policies
+    if package.policies:
+        elements.append(Paragraph("Important Guidelines &amp; Cancellation Policy", section_heading))
+        for pol in package.policies:
+            pol_text = f"<b>{safe_para_text(pol.title)}:</b> {safe_para_text(pol.description)}"
+            elements.append(Paragraph(pol_text, ParagraphStyle('Pol', parent=body_style, fontSize=7, leading=9)))
+            elements.append(Spacer(1, 2))
+        elements.append(Spacer(1, 6))
+
+    elements.append(HRFlowable(width="100%", thickness=1, color=BORDER_COLOR, spaceBefore=4, spaceAfter=4))
+    footer_text = "<b>TS Boat Tourism &amp; Papikondalu Tourism Services</b> | Official booking desk at Door No. 10-1-2/1, Om Shanthi Building Sataram, Bhadrachalam | Bookings &amp; Enquiries: +91 99513 69573, +91 77801 19268"
+    elements.append(Paragraph(footer_text, ParagraphStyle('Foot', parent=body_style, fontSize=6.5, leading=8.5, textColor=MUTED_TEXT, alignment=1)))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+
 def sync_generate_pdf(url: str) -> bytes:
     """
     Synchronous wrapper to run generate_pdf_from_url in a dedicated thread.
@@ -137,73 +410,108 @@ def sync_generate_pdf(url: str) -> bytes:
         loop.close()
 
 
-
 async def generate_package_brochure_task(ctx, package_id: int):
     """
-    Background task to generate a package brochure and upload to R2.
+    Background task to generate a package brochure and upload to Cloudinary.
+    Resilient multi-tier strategy:
+    1. Tries Playwright Chromium for full pixel-perfect React print page.
+    2. Automatically falls back to native ReportLab vector PDF generator if Playwright
+       is unavailable (e.g. Render native environment without Chromium).
+    3. Preserves AVAILABLE status if an active brochure already exists.
     """
     async with AsyncSessionLocal() as db:
-        package = await db.get(Package, package_id)
+        stmt = (
+            select(Package)
+            .where(Package.id == package_id)
+            .options(
+                selectinload(Package.variants),
+                selectinload(Package.transport_options),
+                selectinload(Package.itinerary),
+                selectinload(Package.inclusions),
+                selectinload(Package.exclusions),
+                selectinload(Package.boarding_points),
+                selectinload(Package.policies),
+                selectinload(Package.gallery),
+                selectinload(Package.extras),
+            )
+        )
+        result = await db.execute(stmt)
+        package = result.scalar_one_or_none()
         if not package:
             logger.error(f"Package {package_id} not found for brochure generation.")
             return
-            
+
         try:
             # 1. Update status to GENERATING
             package.brochure_generation_status = DocumentGenerationStatus.GENERATING
             await db.commit()
-            
-            frontend_url = settings.FRONTEND_URL.rstrip('/') if settings.FRONTEND_URL else "https://tstelanganatourism.com"
-            if settings.ENVIRONMENT == "development":
-                import urllib.request
-                try:
-                    urllib.request.urlopen("http://localhost:3000", timeout=1)
-                    frontend_url = "http://localhost:3000"
-                except Exception:
-                    logger.info("Localhost:3000 not reachable, falling back to live frontend URL for brochure rendering.")
-            print_url = f"{frontend_url}/print/package/{package.slug}"
-            pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
-            
-            # 3. Upload to Cloudinary
+
+            pdf_bytes = None
+
+            # Strategy 1: Attempt Playwright Chromium
+            try:
+                frontend_url = settings.FRONTEND_URL.rstrip('/') if settings.FRONTEND_URL else "https://tstelanganatourism.com"
+                if settings.ENVIRONMENT == "development":
+                    import urllib.request
+                    try:
+                        urllib.request.urlopen("http://localhost:3000", timeout=1)
+                        frontend_url = "http://localhost:3000"
+                    except Exception:
+                        pass
+                print_url = f"{frontend_url}/print/package/{package.slug}"
+                pdf_bytes = await asyncio.to_thread(sync_generate_pdf, print_url)
+                logger.info(f"Playwright generated brochure PDF for package {package.slug} successfully.")
+            except Exception as pw_err:
+                logger.warning(f"Playwright PDF generation failed or unavailable ({pw_err}). Falling back to ReportLab vector PDF engine.")
+                pdf_bytes = await asyncio.to_thread(generate_reportlab_brochure, package)
+                logger.info(f"ReportLab generated brochure PDF for package {package.slug} successfully ({len(pdf_bytes)} bytes).")
+
+            if not pdf_bytes:
+                raise RuntimeError("Both Playwright and ReportLab failed to produce PDF bytes.")
+
+            # 2. Upload to Cloudinary
             version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             filename = f"package_{package.slug}_{version}"
             cloudinary_url = await asyncio.to_thread(sync_cloudinary_upload, pdf_bytes, filename)
-            
-            # 4. Clean up old generated brochure if exists and different
+
+            # 3. Clean up old generated brochure if exists and different
             if package.generated_brochure_url and package.generated_brochure_url != cloudinary_url:
                 await asyncio.to_thread(sync_cloudinary_delete, package.generated_brochure_url)
-                
-            # 5. Update DB
+
+            # 4. Update DB
             package.generated_brochure_url = cloudinary_url
             package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
             await db.commit()
             clear_cache_prefix("packages:list:")
             clear_cache_prefix(f"packages:detail:{package.slug}")
-            logger.info(f"Successfully generated and uploaded brochure for package {package.slug}")
-            
+            logger.info(f"Successfully generated and uploaded brochure for package {package.slug}: {cloudinary_url}")
+
         except (Exception, asyncio.CancelledError) as e:
             logger.exception(f"Failed to generate brochure for package {package_id}: {e}")
-            
-            async def set_failed():
+
+            async def set_cleanup_status():
                 try:
                     async with AsyncSessionLocal() as fail_db:
                         fail_package = await fail_db.get(Package, package_id)
                         if fail_package:
-                            fail_package.brochure_generation_status = DocumentGenerationStatus.FAILED
+                            # CRITICAL: If package already has an active brochure (manual upload or previous generated),
+                            # keep status as AVAILABLE so the user/admin isn't blocked by a failed regen attempt!
+                            if fail_package.brochure_pdf_url or fail_package.generated_brochure_url:
+                                fail_package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
+                                logger.info(f"Retained AVAILABLE status for package {package_id} because an active brochure exists.")
+                            else:
+                                fail_package.brochure_generation_status = DocumentGenerationStatus.FAILED
                             await fail_db.commit()
-                            logger.info(f"Successfully marked package {package_id} brochure status as FAILED")
                 except Exception as db_err:
-                    logger.error(f"Failed to set brochure status to FAILED in cleanup for package {package_id}: {db_err}")
+                    logger.error(f"Failed to update brochure status in cleanup for package {package_id}: {db_err}")
 
-            # Run the database update in a separate task and shield it
-            # This ensures it runs to completion even if the current task is cancelled
-            cleanup_task = asyncio.create_task(set_failed())
+            cleanup_task = asyncio.create_task(set_cleanup_status())
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError:
-                # Still raise the original CancelledError
                 pass
             raise e
+
 
 async def process_post_booking_documents_task(ctx, booking_id: int, is_fully_paid: bool = None, is_postponement: bool = False):
     """

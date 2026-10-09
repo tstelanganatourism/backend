@@ -893,15 +893,23 @@ async def get_brochure_validation(
     if package.gallery and len(package.gallery) < 1:
         warnings.append(f"Standard layout expects at least 1 gallery image. Currently has {len(package.gallery)}.")
         
+    from app.models.enums import DocumentGenerationStatus
+    active_brochure_url = package.brochure_pdf_url or package.generated_brochure_url
+    effective_status = package.brochure_generation_status
+
+    # If the package has an active brochure and is not actively processing, report AVAILABLE
+    if active_brochure_url and effective_status not in [DocumentGenerationStatus.GENERATING, DocumentGenerationStatus.QUEUED]:
+        effective_status = DocumentGenerationStatus.AVAILABLE
+
     return {
         "is_valid": len(errors) == 0,
         "errors": errors,
         "warnings": warnings,
         "package_title": package.title,
-        "status": package.brochure_generation_status,
+        "status": effective_status,
         "generated_brochure_url": package.generated_brochure_url,
         "brochure_pdf_url": package.brochure_pdf_url,
-        "active_brochure_url": package.brochure_pdf_url or package.generated_brochure_url
+        "active_brochure_url": active_brochure_url
     }
 
 @router.post("/{package_id}/regenerate-brochure", status_code=status.HTTP_202_ACCEPTED)
@@ -977,6 +985,37 @@ async def regenerate_brochure(
     
     return {"message": "Brochure regeneration started."}
 
+class SaveBrochurePayload(PyBaseModel):
+    url: str
+
+@router.post("/{package_id}/save-generated-brochure")
+async def save_generated_brochure(
+    package_id: int,
+    payload: SaveBrochurePayload,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin)
+):
+    """
+    Directly save a client-generated or uploaded brochure URL to the package.
+    Immediately marks status as AVAILABLE and flushes caches.
+    """
+    package = await db.get(Package, package_id)
+    if not package:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
+
+    from app.models.enums import DocumentGenerationStatus
+    package.generated_brochure_url = payload.url.strip()
+    package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
+    await db.commit()
+    await log_action(db, current_admin.id, "SAVE_GENERATED_BROCHURE", "Package", str(package.id), {"url": payload.url})
+    clear_cache_prefix("packages:list:")
+    clear_cache_prefix(f"packages:detail:{package.slug}")
+    return {
+        "status": "AVAILABLE",
+        "generated_brochure_url": package.generated_brochure_url,
+        "message": "Brochure saved successfully and set to AVAILABLE."
+    }
+
 @router.post("/{package_id}/reset-brochure-status")
 async def reset_brochure_status(
     package_id: int,
@@ -991,11 +1030,13 @@ async def reset_brochure_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Package not found")
         
     from app.models.enums import DocumentGenerationStatus
-    package.brochure_generation_status = DocumentGenerationStatus.FAILED
+    active_url = package.brochure_pdf_url or package.generated_brochure_url
+    package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE if active_url else DocumentGenerationStatus.MISSING
     await db.commit()
     await log_action(db, current_admin.id, "RESET_BROCHURE_STATUS", "Package", str(package.id), {"title": package.title})
     clear_cache_prefix(f"packages:detail:{package.slug}")
     return {"message": "Brochure status reset.", "status": package.brochure_generation_status}
+
 
 @router.get("/{package_id}/future-bookings")
 async def get_future_bookings(
