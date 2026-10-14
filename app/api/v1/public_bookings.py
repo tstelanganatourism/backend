@@ -1822,6 +1822,11 @@ async def get_booking_details(
     package_title = row[1] if b.variant_id else row[3]
     variant_title = row[2] if b.variant_id else row[4]
     package_type = row[9] if b.variant_id else None
+    is_aptdc_manual = bool((b.pricing_snapshot or {}).get("booking_mode") == "APTDC_MANUAL")
+    if is_aptdc_manual:
+        package_title = b.pricing_snapshot.get("service_name") or "APTDC Tour Package"
+        variant_title = b.pricing_snapshot.get("package_type") or "TOUR PACKAGE"
+        package_type = "APTDC"
     
     room_checkin = None
     room_checkout = None
@@ -1946,7 +1951,15 @@ async def get_booking_details(
     boarding_point = None
     itinerary = []
     meals_list = []
-    if b.variant_id:
+    if is_aptdc_manual:
+        boarding_point = {
+            "title": b.pricing_snapshot.get("boarding_city") or "—",
+            "address": b.pricing_snapshot.get("boarding_point") or "—",
+            "landmark": "",
+            "departure_time": b.pricing_snapshot.get("journey_date_time") or "",
+            "contact_number": "",
+        }
+    elif b.variant_id:
         from app.models.package import PackageBoardingPoint, PackageItineraryDay
         variant = b.package_variant
         if variant:
@@ -2105,13 +2118,17 @@ async def get_booking_details(
         "variant_title": variant_title,
         "hotel_name": hotel_name,
         "package_type": package_type.value if hasattr(package_type, 'value') else str(package_type) if package_type else None,
-        "boarding_point": {
-            "title": boarding_point.title,
-            "address": boarding_point.address,
-            "landmark": boarding_point.landmark,
-            "departure_time": boarding_point.departure_time,
-            "contact_number": boarding_point.contact_number
-        } if boarding_point else None,
+        "boarding_point": (
+            boarding_point
+            if is_aptdc_manual
+            else {
+                "title": boarding_point.title,
+                "address": boarding_point.address,
+                "landmark": boarding_point.landmark,
+                "departure_time": boarding_point.departure_time,
+                "contact_number": boarding_point.contact_number,
+            }
+        ) if boarding_point else None,
         "room_checkin": room_checkin,
         "room_checkout": room_checkout,
         "room_checkout_date": room_checkout_date,

@@ -13,13 +13,14 @@ class Booking(BaseModel):
     source = Column(SQLEnum(BookingSource), default=BookingSource.PUBLIC, server_default="USER", nullable=False)
     customer_email = Column(String, nullable=True)  # Tourist email for direct/agent bookings
 
-    # Strict Mutually Exclusive Foreign Keys
+    # A booking targets one inventory-backed package/room, except for the
+    # administrator-only APTDC manual receipt flow which has neither target.
     room_variant_id = Column(ForeignKey("room_variants.id", ondelete="RESTRICT"), nullable=True, index=True)
     variant_id = Column(ForeignKey("package_variants.id", ondelete="RESTRICT"), nullable=True, index=True)
 
     __table_args__ = (
         CheckConstraint(
-            "(room_variant_id IS NOT NULL AND variant_id IS NULL) OR (room_variant_id IS NULL AND variant_id IS NOT NULL)",
+            "room_variant_id IS NULL OR variant_id IS NULL",
             name="chk_booking_target"
         ),
         Index("ix_bookings_created_at", "created_at"),

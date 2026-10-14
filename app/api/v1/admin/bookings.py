@@ -23,6 +23,9 @@ router = APIRouter(
     dependencies=[Depends(require_admin)]
 )
 
+APTDC_REFERENCE_GSTIN = "37AADCA9817H1ZH"
+APTDC_REFERENCE_STATE_CODE = "37"
+
 
 def _invalidate_booking_caches(booking: Optional[Booking] = None):
     try:
@@ -106,6 +109,8 @@ async def list_admin_bookings(
             base_query = base_query.where(Booking.room_variant_id.isnot(None))
         elif target_filter.upper() == "PACKAGE":
             base_query = base_query.where(Booking.variant_id.isnot(None))
+        elif target_filter.upper() == "APTDC":
+            base_query = base_query.where(Booking.room_variant_id.is_(None), Booking.variant_id.is_(None))
         elif target_filter.upper() in ("BOAT RIDE", "TOUR"):
             base_query = base_query.join(PackageVariant, Booking.variant_id == PackageVariant.id).join(Package, PackageVariant.package_id == Package.id).where(Package.type == "TOUR")
         elif target_filter.upper() in ("SIGHTSEEING", "TRIP"):
@@ -340,6 +345,12 @@ async def list_admin_bookings(
             if not room_checkin:
                 room_checkin = title_info.get("slot_start")
                 room_checkout = title_info.get("slot_end")
+        elif (b.pricing_snapshot or {}).get("booking_mode") == "APTDC_MANUAL":
+            title_info = {
+                "package_title": b.pricing_snapshot.get("service_name") or "APTDC Tour Package",
+                "variant_title": b.pricing_snapshot.get("package_type") or "TOUR PACKAGE",
+            }
+            package_type = "APTDC"
         else:
             title_info = {"package_title": "—", "variant_title": "—"}
 
@@ -733,6 +744,9 @@ class AdminCreateBookingRequest(BaseModel):
     # Booking mode: QUICK = only lead passenger details, rest auto-filled
     quick_booking: Optional[bool] = False
     coupon_code: Optional[str] = None
+    # Receipt layout selected by the admin. It lives in the immutable pricing
+    # snapshot so historical bookings always open with the layout they used.
+    receipt_style: Optional[str] = "STANDARD"
     # Tax & Surcharges overrides
     gst_rate: Optional[float] = None              # Percentage override (e.g. 0.0, 5.0, 18.0)
     gst_amount: Optional[float] = None            # Direct rupee amount override
@@ -740,6 +754,197 @@ class AdminCreateBookingRequest(BaseModel):
     service_charge_amount: Optional[float] = None # Direct rupee amount override
     gateway_fee_rate: Optional[float] = None      # Percentage override (e.g. 0.0, 1.0)
     gateway_fee_amount: Optional[float] = None    # Direct rupee amount override
+
+
+class AptdcPassengerInput(BaseModel):
+    full_name: str = Field(..., min_length=1, max_length=200)
+    gender: str = Field(..., min_length=1, max_length=10)
+    age: int = Field(..., ge=0, le=150)
+    fare: float = Field(..., ge=0)
+    net_fare: float = Field(..., ge=0)
+    seat_no: Optional[str] = Field(None, max_length=50)
+
+
+class AptdcCreateBookingRequest(BaseModel):
+    ticket_number: Optional[str] = Field(None, max_length=100)
+    service_name: str = Field(..., min_length=1, max_length=250)
+    package_type: str = Field(..., min_length=1, max_length=150)
+    coach_id_vehicle_no: str = Field(..., min_length=1, max_length=150)
+    coach_type_vehicle_type: str = Field(..., min_length=1, max_length=150)
+    journey_date_time: str = Field(..., min_length=1, max_length=50)
+    return_date_time: str = Field(..., min_length=1, max_length=50)
+    issue_date_time: str = Field(..., min_length=1, max_length=50)
+    boarding_city: str = Field(..., min_length=1, max_length=150)
+    alighting_city: str = Field(..., min_length=1, max_length=150)
+    boarding_point: str = Field(..., min_length=1, max_length=500)
+    alighting_point: str = Field(..., min_length=1, max_length=500)
+    state_code: str = Field(APTDC_REFERENCE_STATE_CODE, min_length=1, max_length=20)
+    gstin: str = Field(APTDC_REFERENCE_GSTIN, min_length=1, max_length=40)
+    extra_charges: float = Field(0, ge=0)
+    issued_by: str = Field(..., min_length=1, max_length=250)
+    issued_at: str = Field(..., min_length=1, max_length=250)
+    issued_phone: Optional[str] = Field(None, max_length=30)
+    passengers: List[AptdcPassengerInput] = Field(..., min_length=1, max_length=100)
+
+
+@router.post("/create-aptdc")
+async def admin_create_aptdc_booking(
+    request: AptdcCreateBookingRequest,
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """Create an administrator-entered APTDC receipt without touching inventory.
+
+    This is intentionally independent from normal tour/package bookings: all
+    information printed on the receipt is entered by the administrator and is
+    frozen in ``pricing_snapshot`` for the lifetime of the record.
+    """
+    import uuid
+    from app.models.enums import BookingStatus, BookingSource, GenderType, PaymentStatus
+    from app.models.payment import Payment
+
+    def parse_local_datetime(value: str, field_name: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=f"{field_name} must be a valid date and time.") from error
+
+    journey_at = parse_local_datetime(request.journey_date_time, "Journey date & time")
+    return_at = parse_local_datetime(request.return_date_time, "Return date & time")
+    issue_at = parse_local_datetime(request.issue_date_time, "Issue date & time")
+    if return_at < journey_at:
+        raise HTTPException(status_code=422, detail="Return date & time cannot be before journey date & time.")
+
+    passenger_rows = []
+    subtotal_amount = Decimal("0.00")
+    total_net_fare = Decimal("0.00")
+    child_count = 0
+
+    for passenger in request.passengers:
+        g_raw = (passenger.gender or "").strip().upper()
+        if g_raw in ("M", "MALE"):
+            gender = GenderType.MALE
+        elif g_raw in ("F", "FEMALE"):
+            gender = GenderType.FEMALE
+        elif g_raw in ("O", "OTHER"):
+            gender = GenderType.OTHER
+        else:
+            raise HTTPException(status_code=422, detail="Passenger gender must be MALE, FEMALE, or OTHER.")
+
+        fare = Decimal(str(passenger.fare)).quantize(Decimal("0.01"))
+        net_fare = Decimal(str(passenger.net_fare)).quantize(Decimal("0.01"))
+        subtotal_amount += fare
+        total_net_fare += net_fare
+        child_count += 1 if passenger.age <= 10 else 0
+        passenger_rows.append({
+            "full_name": passenger.full_name.strip(),
+            "gender": gender.value,
+            "age": passenger.age,
+            "fare": str(fare),
+            "net_fare": str(net_fare),
+            "seat_no": (passenger.seat_no or "").strip(),
+        })
+
+    extra_charges = Decimal(str(request.extra_charges)).quantize(Decimal("0.01"))
+    total_amount = total_net_fare + extra_charges
+    if total_amount < Decimal("0.00"):
+        raise HTTPException(status_code=422, detail="Ticket total cannot be negative.")
+
+    seq_result = await db.execute(text("SELECT nextval('booking_seq_aptdc')"))
+    sequence = seq_result.scalar_one()
+    public_id = (request.ticket_number or "").strip() or f"APTDC_{sequence}"
+    existing = await db.scalar(select(Booking.id).where(Booking.public_id == public_id))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="This PNR / Ticket No already exists.")
+
+    snapshot = {
+        "receipt_style": "APTDC",
+        "booking_mode": "APTDC_MANUAL",
+        "service_name": request.service_name.strip(),
+        "package_type": request.package_type.strip(),
+        "coach_id_vehicle_no": request.coach_id_vehicle_no.strip(),
+        "coach_type_vehicle_type": request.coach_type_vehicle_type.strip(),
+        "journey_date_time": journey_at.isoformat(),
+        "return_date_time": return_at.isoformat(),
+        "issue_date_time": issue_at.isoformat(),
+        "boarding_city": request.boarding_city.strip(),
+        "alighting_city": request.alighting_city.strip(),
+        "boarding_point": request.boarding_point.strip(),
+        "alighting_point": request.alighting_point.strip(),
+        "state_code": APTDC_REFERENCE_STATE_CODE,
+        "gstin": APTDC_REFERENCE_GSTIN,
+        "issued_by": request.issued_by.strip(),
+        "issued_at": request.issued_at.strip(),
+        "issued_phone": (request.issued_phone or "").strip(),
+        "passenger_details": passenger_rows,
+        "actual_fare": str(subtotal_amount),
+        "net_fare_before_extra_charges": str(total_net_fare),
+        "extra_charges": str(extra_charges),
+        "tourist_total": str(total_amount),
+        "subtotal_amount": str(subtotal_amount),
+        "gst_amount": "0.00",
+        "gateway_fee": "0.00",
+        "service_charge": "0.00",
+        "payment_method": "ADMIN_MANUAL",
+        "created_by_admin_id": current_admin.id,
+        "created_by_admin_email": current_admin.email,
+        "admin_name": current_admin.full_name,
+    }
+
+    booking = Booking(
+        public_id=public_id,
+        source=BookingSource.ADMIN_DIRECT,
+        travel_date=journey_at.date(),
+        adult_count=len(passenger_rows) - child_count,
+        child_count=child_count,
+        student_count=0,
+        subtotal_amount=subtotal_amount,
+        coupon_discount=Decimal("0.00"),
+        coupon_applied=None,
+        gst_amount=Decimal("0.00"),
+        gateway_fee=Decimal("0.00"),
+        service_charge=Decimal("0.00"),
+        total_amount=total_amount,
+        paid_amount=total_amount,
+        remaining_balance=Decimal("0.00"),
+        agent_commission=Decimal("0.00"),
+        status=BookingStatus.FULLY_PAID,
+        pricing_snapshot=snapshot,
+        has_refreshment_addon=False,
+    )
+    db.add(booking)
+    await db.flush()
+
+    for index, passenger in enumerate(passenger_rows):
+        db.add(BookingPassenger(
+            booking_id=booking.id,
+            full_name=passenger["full_name"],
+            age=passenger["age"],
+            gender=GenderType(passenger["gender"]),
+            relationship_to_lead="self" if index == 0 else None,
+            is_primary=index == 0,
+        ))
+
+    if total_amount > Decimal("0.00"):
+        db.add(Payment(
+            booking_id=booking.id,
+            payment_reference_id=f"APTDC_{booking.public_id}_{uuid.uuid4().hex[:8].upper()}",
+            amount=total_amount,
+            status=PaymentStatus.CAPTURED,
+            payment_method="ADMIN_MANUAL",
+            collected_by_type="ADMIN",
+            collected_by_user_id=current_admin.id,
+            collected_by_label=f"Admin: {current_admin.full_name}",
+        ))
+
+    await db.commit()
+    _invalidate_booking_caches(booking)
+    return {
+        "status": "success",
+        "public_id": booking.public_id,
+        "message": "APTDC booking receipt created successfully.",
+    }
+
 
 @router.post("/create")
 async def admin_create_booking(
@@ -1162,6 +1367,7 @@ async def admin_create_booking(
         "created_by_admin_email": current_admin.email,
         "admin_name": current_admin.full_name,
         "booking_mode": "QUICK" if request.quick_booking else "FULL",
+        "receipt_style": (getattr(request, 'receipt_style', None) or "STANDARD").upper(),
     }
     if transport_snapshot_items:
         pricing_snapshot["transport_selections"] = transport_snapshot_items
