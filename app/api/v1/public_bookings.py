@@ -121,10 +121,15 @@ async def checkout(
     from app.core.config import settings
     from app.models.enums import AccountStatus, UserRole
     
-    is_admin = current_user is not None and current_user.role == UserRole.ADMIN
-    if current_user and current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
+    if not current_user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Please log in with your phone number or email before making a booking."
+        )
+
+    is_admin = current_user.role == UserRole.ADMIN
+    if current_user.account_status in (AccountStatus.BLOCKED, AccountStatus.DISABLED):
         raise HTTPException(status_code=403, detail="Your account is suspended. You cannot make new bookings.")
-    # Development hook removed to prevent invoice math corruption.
 
     # Derive adult, child, and student counts safely
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
@@ -1278,7 +1283,7 @@ async def checkout(
 
     # --- Database Draft Persistence ---
     now = get_ist_now()
-    expires_at = now + timedelta(minutes=5)
+    expires_at = now + timedelta(minutes=20)
 
     payload_dump = request.model_dump(mode='json')
 
@@ -1635,6 +1640,22 @@ async def get_tourist_bookings(
     if cached is not None:
         return cached
 
+    from sqlalchemy import or_
+    from app.models.booking import BookingPassenger
+
+    # Build conditions to find bookings for this user:
+    # 1. Direct link (user_id == current_user.id) — normal case
+    # 2. Guest bookings: user_id IS NULL but customer_email matches
+    # 3. Guest bookings: user_id IS NULL but a passenger phone matches
+    user_phone = current_user.phone_number if hasattr(current_user, 'phone_number') else None
+    user_email = current_user.email
+
+    booking_conditions = [Booking.user_id == current_user.id]
+    if user_email:
+        booking_conditions.append(
+            (Booking.user_id.is_(None)) & (Booking.customer_email == user_email)
+        )
+
     query = (
         select(
             Booking, 
@@ -1655,7 +1676,7 @@ async def get_tourist_bookings(
         .options(selectinload(Booking.stay_dates))
         .options(selectinload(Booking.postpone_requests))
         .where(
-            Booking.user_id == current_user.id,
+            or_(*booking_conditions),
             Booking.deleted_at.is_(None),
             Booking.status != BookingStatus.PENDING
         )
@@ -1665,6 +1686,70 @@ async def get_tourist_bookings(
     )
     result = await db.execute(query)
     rows = result.all()
+
+    # Also find guest bookings by passenger phone (separate query to avoid complex join)
+    guest_by_phone_ids = set()
+    if user_phone:
+        from app.models.booking import BookingPassenger as BP
+        phone_match_res = await db.execute(
+            select(BP.booking_id).where(
+                BP.phone_number == user_phone
+            ).distinct()
+        )
+        phone_match_ids = [row[0] for row in phone_match_res.all()]
+        if phone_match_ids:
+            # Fetch those bookings that aren't already in the result
+            already_found_ids = {row[0].id for row in rows}
+            extra_ids = [bid for bid in phone_match_ids if bid not in already_found_ids]
+            if extra_ids:
+                extra_query = (
+                    select(
+                        Booking, 
+                        Package.title, 
+                        PackageVariant.title,
+                        Room.lodge_name,
+                        RoomVariant.variant_name,
+                        Room.slot_start,
+                        Room.slot_end,
+                        PackageBoardingPoint.departure_time
+                    )
+                    .outerjoin(PackageVariant, Booking.variant_id == PackageVariant.id)
+                    .outerjoin(Package, PackageVariant.package_id == Package.id)
+                    .outerjoin(PackageBoardingPoint, (PackageBoardingPoint.package_id == Package.id) & (PackageBoardingPoint.sort_order == 0))
+                    .outerjoin(RoomVariant, Booking.room_variant_id == RoomVariant.id)
+                    .outerjoin(Room, RoomVariant.room_id == Room.id)
+                    .options(selectinload(Booking.passengers))
+                    .options(selectinload(Booking.stay_dates))
+                    .options(selectinload(Booking.postpone_requests))
+                    .where(
+                        Booking.id.in_(extra_ids),
+                        Booking.user_id.is_(None),
+                        Booking.deleted_at.is_(None),
+                        Booking.status != BookingStatus.PENDING
+                    )
+                )
+                extra_result = await db.execute(extra_query)
+                extra_rows = extra_result.all()
+                rows = list(rows) + list(extra_rows)
+                guest_by_phone_ids = {bid for bid in extra_ids}
+
+    # Retroactively link guest bookings to this user account so future lookups are instant
+    try:
+        all_guest_booking_ids = []
+        for row in rows:
+            b = row[0]
+            if b.user_id is None:
+                all_guest_booking_ids.append(b.id)
+                b.user_id = current_user.id  # Link for future lookups
+        if all_guest_booking_ids:
+            await db.commit()
+            from app.utils.cache import clear_cache_prefix
+            clear_cache_prefix(f"user_bookings:{current_user.id}")
+    except Exception as _link_err:
+        logger.warning(f"Failed to retroactively link guest bookings for user {current_user.id}: {_link_err}")
+        await db.rollback()
+
+
     
     sanitized_items = []
     from datetime import datetime, timedelta

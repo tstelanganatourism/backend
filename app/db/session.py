@@ -19,9 +19,9 @@ is_worker = any("arq" in arg or "worker" in arg for arg in sys.argv)
 # so connections are released instantly and never cause queue blockades.
 if is_local_dev:
     pool_kwargs = {
-        "pool_size": 3,
+        "pool_size": 4,
         "max_overflow": 2,
-        "pool_timeout": 5,
+        "pool_timeout": 30,
         "pool_recycle": 180,
         "pool_pre_ping": True,
     }
@@ -30,16 +30,16 @@ elif is_worker:
     pool_kwargs = {
         "pool_size": 2,
         "max_overflow": 1,
-        "pool_timeout": 5,
+        "pool_timeout": 30,
         "pool_recycle": 180,
         "pool_pre_ping": True,
     }
 else:
     # 🌍 Production web server ───────────────────────────────────────────────
     pool_kwargs = {
-        "pool_size": 5,
+        "pool_size": 4,
         "max_overflow": 3,
-        "pool_timeout": 5,
+        "pool_timeout": 30,
         "pool_recycle": 180,
         "pool_pre_ping": True,
     }

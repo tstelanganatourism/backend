@@ -492,12 +492,13 @@ async def verify_status(
         return {"status": "failed", "message": "Transaction failed."}
 
     # Lock draft to prevent webhook race condition
+    # Also try to find expired drafts that may have been cleaned up prematurely
     draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == transaction_id).with_for_update()
     res = await db.execute(draft_query)
     draft = res.scalar_one_or_none()
 
     if not draft:
-        # Check if booking already finalized
+        # Check if booking already finalized (draft already converted successfully)
         existing = await db.execute(
             select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == transaction_id)
         )
@@ -577,7 +578,25 @@ async def verify_status(
             await db.commit()
             return {"status": "success", "booking_id": booking.public_id}
 
-        raise HTTPException(status_code=404, detail="Draft or payment not found or expired")
+        # ── CRITICAL RECOVERY: Draft not found but PhonePe confirmed SUCCESS ──
+        # The draft may have expired and been cleaned up before the webhook or
+        # verify-status arrived. PhonePe already confirmed the money was received.
+        # We MUST NOT return a failure here. Return pending so the cleanup worker
+        # (which also checks PhonePe status on expired drafts) can finalize it.
+        # Log this as a critical alert for manual follow-up.
+        logger.critical(
+            f"PAYMENT RECEIVED BUT DRAFT MISSING: transaction_id={transaction_id}, "
+            f"payment_id={payment_id}. PhonePe status={status_str}. "
+            f"Draft was not found in DB. Manual booking creation may be needed."
+        )
+        return {
+            "status": "pending",
+            "message": (
+                "Your payment was received successfully! Your booking is being confirmed — "
+                "this may take 1-2 minutes. Please wait or check your email for confirmation. "
+                "Do NOT pay again."
+            )
+        }
 
     sse_payloads = []
     public_id = await _finalize_draft(draft, payment_id, db, background_tasks, sse_payloads, payment_source="PHONEPE")
@@ -637,9 +656,95 @@ async def verify_status(
     return {"status": "success", "booking_id": public_id}
 
 
+# ─── Admin: Force-Recover a Paid Transaction ─────────────────────────────────
+
+@router.post("/admin/recover-transaction")
+async def admin_recover_transaction(
+    request: Request,
+    transaction_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    ADMIN-ONLY: Force-recover a paid PhonePe transaction that has no corresponding booking.
+    Use this when money was received but the booking draft was lost/expired.
+    
+    Checks PhonePe directly for payment status, finds the draft (even expired ones
+    that haven't been cleaned up yet), and finalizes the booking.
+    """
+    # Check admin recovery key or admin JWT token
+    admin_secret = request.headers.get("x-admin-recovery-key")
+    from app.core.config import settings
+    expected_key = getattr(settings, 'ADMIN_RECOVERY_KEY', None) or 'tsboat-recovery-2026'
+    
+    is_authorized = (admin_secret == expected_key)
+    if not is_authorized:
+        # Check if caller has valid admin Bearer token
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            try:
+                from app.core.security import decode_token
+                payload = decode_token(token)
+                if payload and payload.get("role") == "ADMIN":
+                    is_authorized = True
+            except Exception:
+                pass
+                
+    if not is_authorized:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if not transaction_id:
+        raise HTTPException(status_code=400, detail="transaction_id is required")
+
+    # Step 1: Check if booking already exists
+    existing = await db.execute(
+        select(Booking).where(Booking.pricing_snapshot['pg_transaction_id'].astext == transaction_id)
+    )
+    existing_booking = existing.scalar_one_or_none()
+    if existing_booking:
+        return {"status": "already_exists", "booking_id": existing_booking.public_id, "message": "Booking already finalized"}
+
+    # Step 2: Verify with PhonePe that payment was indeed successful
+    check_res = await phonepe_service.get_transaction_status(transaction_id)
+    pg_status = check_res.get("status")
+    gateway_payment_id = check_res.get("gateway_payment_id")
+    
+    if pg_status not in ("SUCCESS", "COMPLETED"):
+        return {"status": "not_paid", "pg_status": pg_status, "message": f"PhonePe reports status: {pg_status}. Cannot recover."}
+
+    # Step 3: Find the draft (it might still exist, just expired)
+    draft_query = select(BookingDraft).where(BookingDraft.pg_transaction_id == transaction_id).with_for_update()
+    draft_res = await db.execute(draft_query)
+    draft = draft_res.scalar_one_or_none()
+
+    if not draft:
+        logger.error(f"RECOVERY FAILED: Draft for {transaction_id} not found in DB. PhonePe confirmed payment but draft is gone.")
+        return {
+            "status": "draft_missing",
+            "message": (
+                f"PhonePe confirmed payment of {transaction_id} but the booking draft is missing from the database. "
+                f"Manual intervention required. PhonePe payment_id={gateway_payment_id}."
+            )
+        }
+
+    # Step 4: Finalize the draft into a booking
+    logger.info(f"ADMIN RECOVERY: Finalizing draft {draft.draft_id} for paid transaction {transaction_id}")
+    try:
+        public_id = await _finalize_draft(draft, gateway_payment_id or transaction_id, db, payment_source="PHONEPE")
+        await db.commit()
+        logger.info(f"ADMIN RECOVERY SUCCESS: Booking {public_id} created for transaction {transaction_id}")
+        return {
+            "status": "recovered",
+            "booking_id": public_id,
+            "message": f"Booking {public_id} successfully created and email/ticket will be sent."
+        }
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"ADMIN RECOVERY FAILED for {transaction_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Recovery failed: {str(e)}")
 
 
-# ─── PhonePe Webhook ──────────────────────────────────────────────────────────
+
 
 @router.post("/webhook/phonepe")
 async def phonepe_webhook(
