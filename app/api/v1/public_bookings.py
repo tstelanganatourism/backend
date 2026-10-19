@@ -164,9 +164,8 @@ async def checkout(
                             raise HTTPException(status_code=400, detail="Primary passenger must be an adult (18+) for quick booking")
                         if not p.phone:
                             raise HTTPException(status_code=400, detail="Phone number is required for the primary passenger")
-                        if not p.aadhaar or not p.aadhaar.strip():
-                            raise HTTPException(status_code=400, detail="Aadhaar is required for the primary passenger")
-                        if not is_valid_aadhaar(p.aadhaar.strip()):
+                        # Aadhaar number is optional during online booking (mandatory physical ID verified at counter)
+                        if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
                             raise HTTPException(status_code=400, detail="Invalid Aadhaar format for the primary passenger")
                     else:
                         # Student package: Aadhaar/phone are optional but validate format if provided
@@ -340,16 +339,9 @@ async def checkout(
                         raise HTTPException(status_code=400, detail=f"Adult passenger {i+1} must be at least 11 years old")
                     if i == 0 and not p.phone:
                         raise HTTPException(status_code=400, detail="Phone number is required for the primary adult passenger")
-                # Aadhaar validation: optional for children <=10, mandatory for 11+
-                is_child_age = p.age <= 10
-                if not is_child_age:
-                    if not p.aadhaar or not p.aadhaar.strip():
-                        raise HTTPException(status_code=400, detail=f"Aadhaar is required for passenger {i+1} (age 11+)")
-                    if not is_valid_aadhaar(p.aadhaar.strip()):
-                        raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
-                else:
-                    if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
-                        raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
+                # Aadhaar validation: optional during online booking (mandatory physical ID verified at counter)
+                if p.aadhaar and p.aadhaar.strip() and not is_valid_aadhaar(p.aadhaar.strip()):
+                    raise HTTPException(status_code=400, detail=f"Invalid Aadhaar format for passenger {i+1}")
         elif not request.quick_booking and is_student_pkg:
             # Student packages: Aadhaar optional but validate format if provided
             for i, p in enumerate(request.passengers):
@@ -2273,6 +2265,8 @@ async def get_booking_details(
         # Immutable payment history — always returned
         "payment_ledger": payment_ledger,
         "pricing_snapshot": b.pricing_snapshot,
+        "has_refreshment_addon": getattr(b, 'has_refreshment_addon', False),
+        "has_food_addon": getattr(b, 'has_food_addon', False),
     }
     
     # Include cancellation details if present
