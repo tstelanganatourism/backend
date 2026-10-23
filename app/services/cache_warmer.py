@@ -18,14 +18,14 @@ from app.schemas.public import (
 from app.core.memory_cache import set_mem_cached
 
 DEFAULT_CATEGORY_IMAGES = {
-    "papikondalu-tour-packages": "https://res.cloudinary.com/r929tquv/image/upload/v1785917181/ts_boat_tourism/images/haotjawjrhmnnzvm7yqz.webp",
-    "pochavaram-to-papikondalu-tour": "https://res.cloudinary.com/r929tquv/image/upload/v1784613500/ts_boat_tourism/packages/xolfujndmsrwgk22xqu2.jpg",
-    "bhadrachalam-packages": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1786268860/ts_boat_tourism/gallery/boats/q6md8goirybznxvajwet.png",
+    "papikondalu-tour-packages": "https://media.tstelanganatourism.com/gallery/photos/2T9A7843.webp",
+    "pochavaram-to-papikondalu-tour": "https://media.tstelanganatourism.com/gallery/photos/2T9A7862.webp",
+    "bhadrachalam-packages": "https://media.tstelanganatourism.com/gallery/photos/2T9A8805.webp",
 }
 
 DEFAULT_ROOM_CATEGORY_IMAGES = {
-    "bhadrachalam-accommodations": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1786273972/9b475911-9c60-4bf6-9ffb-b9f1802275a2_k6zmkd.jpg",
-    "papikondalu-forest-huts": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1784613514/ts_boat_tourism/packages/zkxrdmxykszetgupmi8d.jpg",
+    "bhadrachalam-accommodations": "https://media.tstelanganatourism.com/gallery/photos/2T9A8482.webp",
+    "papikondalu-forest-huts": "https://media.tstelanganatourism.com/gallery/photos/2T9A8471.webp",
 }
 
 def has_text(value: object) -> bool:

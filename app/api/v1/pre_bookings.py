@@ -179,7 +179,7 @@ def _user_email_html(pb: PreBooking) -> str:
             <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 12px auto;">
               <tr>
                 <td align="center">
-                  <img src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="70" height="70" alt="TS Boat Tourism" style="display:block; width:70px; height:70px; border-radius:50%; border:2px solid rgba(255,255,255,0.25); margin:0 auto; object-fit:cover;">
+                  <img src="https://media.tstelanganatourism.com/brand/apple-touch-icon.png" width="70" height="70" alt="TS Boat Tourism" style="display:block; width:70px; height:70px; border-radius:50%; border:2px solid rgba(255,255,255,0.25); margin:0 auto; object-fit:cover;">
                 </td>
               </tr>
             </table>
@@ -430,7 +430,7 @@ def _admin_email_html(pb: PreBooking) -> str:
             <table role="presentation" border="0" cellpadding="0" cellspacing="0" style="margin:0 auto 10px auto;">
               <tr>
                 <td align="center">
-                  <img src="https://res.cloudinary.com/r929tquv/image/upload/v1784630155/tsboat_logo_apple_touch.jpg" width="64" height="64" alt="TS Boat Tourism" style="display:block; width:64px; height:64px; border-radius:50%; border:2px solid rgba(255,255,255,0.25); margin:0 auto; object-fit:cover;">
+                  <img src="https://media.tstelanganatourism.com/brand/apple-touch-icon.png" width="64" height="64" alt="TS Boat Tourism" style="display:block; width:64px; height:64px; border-radius:50%; border:2px solid rgba(255,255,255,0.25); margin:0 auto; object-fit:cover;">
                 </td>
               </tr>
             </table>

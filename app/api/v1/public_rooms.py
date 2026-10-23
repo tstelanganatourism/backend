@@ -226,8 +226,8 @@ async def get_rooms(
 # ── Public Room Category Endpoints (must be BEFORE /{slug} route) ─────────────
 
 DEFAULT_ROOM_CATEGORY_IMAGES = {
-    "bhadrachalam-accommodations": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1786273972/9b475911-9c60-4bf6-9ffb-b9f1802275a2_k6zmkd.jpg",
-    "papikondalu-forest-huts": "https://res.cloudinary.com/r929tquv/image/upload/f_auto,q_auto,w_1200/v1784613514/ts_boat_tourism/packages/zkxrdmxykszetgupmi8d.jpg",
+    "bhadrachalam-accommodations": "https://media.tstelanganatourism.com/gallery/photos/2T9A8482.webp",
+    "papikondalu-forest-huts": "https://media.tstelanganatourism.com/gallery/photos/2T9A8471.webp",
 }
 
 @router.get("/categories", response_model=List[RoomCategoryPublicDTO], tags=["Public Discovery - Room Categories"])

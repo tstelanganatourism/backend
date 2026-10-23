@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
 
+    # Cloudflare R2 Storage
+    R2_ACCOUNT_ID: Optional[str] = None
+    R2_ACCESS_KEY_ID: Optional[str] = None
+    R2_SECRET_ACCESS_KEY: Optional[str] = None
+    R2_BUCKET_NAME: Optional[str] = "tsboat-media"
+    R2_PUBLIC_URL: Optional[str] = "https://pub-5d4166383761438e8adf5625d2697f39.r2.dev"
+    R2_CUSTOM_DOMAIN: Optional[str] = "https://media.tstelanganatourism.com"
+
     # PhonePe — IMPORTANT: Default is PRODUCTION. Always set PHONEPE_ENV=SANDBOX in .env for local/staging.
     PHONEPE_MERCHANT_ID: Optional[str] = None
     PHONEPE_CLIENT_ID: Optional[str] = None
