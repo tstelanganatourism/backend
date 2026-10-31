@@ -393,12 +393,8 @@ async def checkout(
         if not effective_selections and request.transport_option_id:
             effective_selections = [TransportSelection(option_id=request.transport_option_id, quantity=1)]
 
-        if parent_package.has_transport and not effective_selections:
-            raise HTTPException(
-                status_code=400,
-                detail="Transport selection is mandatory for this package."
-            )
-
+        # Transport options are add-ons — only validate and charge if selections are provided.
+        # Customers using their own vehicle / private transport can book boat packages without transport add-ons.
         if parent_package.has_transport and effective_selections:
             selected_opt_ids = [s.option_id for s in effective_selections]
             t_opts_res = await db.execute(
@@ -1315,7 +1311,8 @@ async def checkout(
 
         variant_title_val = None
         if request.target_type.lower() == 'package' and 'variant' in locals() and variant:
-            variant_title_val = variant.variant_name
+            # PackageVariant uses .title, not .variant_name (that's a RoomVariant field)
+            variant_title_val = getattr(variant, 'title', None) or getattr(variant, 'variant_name', None)
 
         funnel_log = CheckoutFunnelLog(
             session_id=session_id,

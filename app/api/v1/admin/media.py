@@ -174,6 +174,8 @@ async def upload_media(
         cloudinary_error_msg = "Cloudinary credentials not configured"
 
     # 3. Local disk fallback (/static/uploads)
+    # NOTE: This is a last-resort fallback. Files saved here are ephemeral on Render
+    # (lost on redeploy). Prefer fixing R2 credentials in Render dashboard.
     try:
         upload_dir = Path("app/static/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -181,9 +183,18 @@ async def upload_media(
         local_path = upload_dir / local_filename
         with open(local_path, "wb") as f:
             f.write(contents)
-        
-        local_url = f"/static/uploads/{local_filename}"
-        logger.info(f"Saved media locally to: {local_url}")
+
+        # Use absolute backend URL so cross-origin frontends (Vercel/Next.js) can display the image.
+        # A relative path like /static/... only works when the client is on the same domain as the backend.
+        backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
+        # Fallback: derive backend URL from known Render service URL or configured frontend
+        if not backend_base or "media.tstelanganatourism" not in backend_base:
+            backend_base = "https://backend-st7o.onrender.com"
+        local_url = f"{backend_base}/static/uploads/{local_filename}"
+        logger.warning(
+            f"[FALLBACK] Saved media locally. This file is EPHEMERAL and will be lost on redeploy. "
+            f"Please configure R2 credentials in Render dashboard. URL: {local_url}"
+        )
         return {
             "url": local_url,
             "public_id": local_filename,
