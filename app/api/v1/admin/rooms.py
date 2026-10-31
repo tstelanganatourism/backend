@@ -414,14 +414,25 @@ async def create_room(
     })
     room_data["slug"] = slug
     
+    # Auto-seed default office address & map if not specified
+    if not room_data.get("address"):
+        room_data["address"] = "Door No. 10-1-2/1, Ground Floor, Om Shanthi Building Sataram, Kalyana Mandapam Road, near SBI ATM, Bhadrachalam, Telangana 507111"
+    if not room_data.get("map_url"):
+        room_data["map_url"] = '<iframe src="https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3801.6249326203515!2d80.8842764!3d17.6679145!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3a36a9430aa06acf%3A0xc16caef81e0d09c9!2sTelangana%20Boat%20Tourism!5e0!3m2!1sen!2sin!4v1782409791475!5m2!1sen!2sin" width="600" height="450" style="border:0;" allowfullscreen="" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"></iframe>'
+
     room = Room(**room_data)
     
-    # Sync child relations
+    # Sync child relations (filtering out empty/blank entries)
+    valid_gallery = [g for g in (body.gallery or []) if getattr(g, 'image_url', None) and str(g.image_url).strip()]
+    valid_highlights = [h for h in (body.highlights or []) if getattr(h, 'title', None) and str(h.title).strip()]
+    valid_faqs = [f for f in (body.faqs or []) if getattr(f, 'question', None) and str(f.question).strip() and getattr(f, 'answer', None) and str(f.answer).strip()]
+    valid_policies = [p for p in (body.policies or []) if getattr(p, 'title', None) and str(p.title).strip() and getattr(p, 'description', None) and str(p.description).strip()]
+
     await sync_nested_relation(db, room, "variants", RoomVariant, body.variants)
-    await sync_nested_relation(db, room, "gallery", RoomGalleryImage, body.gallery)
-    await sync_nested_relation(db, room, "highlights", RoomHighlight, body.highlights)
-    await sync_nested_relation(db, room, "faqs", RoomFAQ, body.faqs)
-    await sync_nested_relation(db, room, "policies", RoomPolicy, body.policies)
+    await sync_nested_relation(db, room, "gallery", RoomGalleryImage, valid_gallery)
+    await sync_nested_relation(db, room, "highlights", RoomHighlight, valid_highlights)
+    await sync_nested_relation(db, room, "faqs", RoomFAQ, valid_faqs)
+    await sync_nested_relation(db, room, "policies", RoomPolicy, valid_policies)
 
     # Compute starting_price
     room.starting_price = min(
@@ -498,17 +509,21 @@ async def update_room(
     for key, value in update_data.items():
         setattr(room, key, value)
         
-    # Sync child relations if provided
+    # Sync child relations if provided (filtering out empty/blank entries)
     if body.variants is not None:
         await sync_nested_relation(db, room, "variants", RoomVariant, body.variants)
     if body.gallery is not None:
-        await sync_nested_relation(db, room, "gallery", RoomGalleryImage, body.gallery)
+        valid_gallery = [g for g in body.gallery if getattr(g, 'image_url', None) and str(g.image_url).strip()]
+        await sync_nested_relation(db, room, "gallery", RoomGalleryImage, valid_gallery)
     if body.highlights is not None:
-        await sync_nested_relation(db, room, "highlights", RoomHighlight, body.highlights)
+        valid_highlights = [h for h in body.highlights if getattr(h, 'title', None) and str(h.title).strip()]
+        await sync_nested_relation(db, room, "highlights", RoomHighlight, valid_highlights)
     if body.faqs is not None:
-        await sync_nested_relation(db, room, "faqs", RoomFAQ, body.faqs)
+        valid_faqs = [f for f in body.faqs if getattr(f, 'question', None) and str(f.question).strip() and getattr(f, 'answer', None) and str(f.answer).strip()]
+        await sync_nested_relation(db, room, "faqs", RoomFAQ, valid_faqs)
     if body.policies is not None:
-        await sync_nested_relation(db, room, "policies", RoomPolicy, body.policies)
+        valid_policies = [p for p in body.policies if getattr(p, 'title', None) and str(p.title).strip() and getattr(p, 'description', None) and str(p.description).strip()]
+        await sync_nested_relation(db, room, "policies", RoomPolicy, valid_policies)
 
     # Recompute starting_price
     room.starting_price = min(

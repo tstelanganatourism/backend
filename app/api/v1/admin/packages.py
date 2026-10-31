@@ -7,6 +7,7 @@ from pathlib import Path
 import uuid
 import logging
 from app.core.config import settings
+from app.services.r2_storage import r2_service
 from app.db.session import get_db
 from app.models.package import (
     Package,
@@ -100,6 +101,17 @@ async def upload_admin_image(
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="Empty image file.")
+
+    if r2_service.is_configured:
+        try:
+            ext = file.filename.split('.')[-1].lower() if '.' in file.filename else 'jpg'
+            safe_base = re.sub(r'[^a-zA-Z0-9_-]', '_', file.filename.rsplit('.', 1)[0])[:40]
+            object_key = f"ts_tours/cms/{safe_base}_{uuid.uuid4().hex[:10]}.{ext}"
+            await r2_service.upload_file(contents, object_key, content_type=file.content_type)
+            base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
+            return {"url": f"{base_url}/{object_key}"}
+        except Exception as e:
+            logger.warning(f"R2 upload failed in upload_admin_image: {e}")
 
     if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
         try:
@@ -491,17 +503,42 @@ async def create_package(
     
     package = Package(**package_data)
     
-    # Sync child relations before saving
+    # Sync child relations before saving (filtering empty entries)
+    valid_gallery = [g for g in (body.gallery or []) if getattr(g, 'image_url', None) and str(g.image_url).strip()]
+    valid_highlights = [h for h in (body.highlights or []) if getattr(h, 'title', None) and str(h.title).strip()]
+    valid_inclusions = [i for i in (body.inclusions or []) if getattr(i, 'label', None) and str(i.label).strip()]
+    valid_exclusions = [e for e in (body.exclusions or []) if getattr(e, 'label', None) and str(e.label).strip()]
+    valid_faqs = [f for f in (body.faqs or []) if getattr(f, 'question', None) and str(f.question).strip() and getattr(f, 'answer', None) and str(f.answer).strip()]
+    valid_policies = [p for p in (body.policies or []) if getattr(p, 'title', None) and str(p.title).strip() and getattr(p, 'description', None) and str(p.description).strip()]
+
     await sync_nested_relation(db, package, "variants", PackageVariant, body.variants)
     await sync_nested_relation(db, package, "transport_options", PackageTransportOption, body.transport_options)
-    await sync_nested_relation(db, package, "gallery", PackageGalleryImage, body.gallery)
+    await sync_nested_relation(db, package, "gallery", PackageGalleryImage, valid_gallery)
     await sync_nested_relation(db, package, "itinerary", PackageItineraryDay, body.itinerary)
-    await sync_nested_relation(db, package, "highlights", PackageHighlight, body.highlights)
-    await sync_nested_relation(db, package, "inclusions", PackageInclusion, body.inclusions)
-    await sync_nested_relation(db, package, "exclusions", PackageExclusion, body.exclusions)
-    await sync_nested_relation(db, package, "boarding_points", PackageBoardingPoint, body.boarding_points)
-    await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
-    await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
+    await sync_nested_relation(db, package, "highlights", PackageHighlight, valid_highlights)
+    await sync_nested_relation(db, package, "inclusions", PackageInclusion, valid_inclusions)
+    await sync_nested_relation(db, package, "exclusions", PackageExclusion, valid_exclusions)
+    
+    # Auto-seed default office boarding point if none provided
+    bp_data = body.boarding_points
+    if not bp_data:
+        from app.schemas.package import PackageBoardingPointInput
+        bp_data = [
+            PackageBoardingPointInput(
+                title="Bhadrachalam Office",
+                address="Door No. 10-1-2/1, Ground Floor, Om Shanthi Building Sataram, Kalyana Mandapam Road, near SBI ATM, Bhadrachalam, Telangana 507111",
+                contact_number="+91 99513 69573, +91 77801 19268",
+                departure_time="07:30 AM",
+                landmark="opp SBI ATM",
+                map_url='<iframe src="https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d3801.6249326203515!2d80.8842764!3d17.6679145!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x3a36a9430aa06acf%3A0xc16caef81e0d09c9!2sTelangana%20Boat%20Tourism!5e0!3m2!1sen!2sin!4v1782409791475!5m2!1sen!2sin" width="600" height="450" style="border:0;" allowfullscreen="" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"></iframe>',
+                pickup_instructions="Please report at our Bhadrachalam collection office 30 minutes before departure for ticket verification and boarding pass collection.",
+                return_drop_info="Drop-off at Bhadrachalam Office / Bus Stand",
+                sort_order=1
+            )
+        ]
+    await sync_nested_relation(db, package, "boarding_points", PackageBoardingPoint, bp_data)
+    await sync_nested_relation(db, package, "faqs", PackageFAQ, valid_faqs)
+    await sync_nested_relation(db, package, "policies", PackagePolicy, valid_policies)
     await sync_nested_relation(db, package, "meals", PackageMealItem, body.meals)
     await sync_nested_relation(db, package, "extras", PackageExtra, body.extras)
     
@@ -600,27 +637,33 @@ async def update_package(
             else DocumentGenerationStatus.MISSING
         )
         
-    # Sync child relations if provided in update payload
+    # Sync child relations if provided in update payload (filtering empty entries)
     if body.variants is not None:
         await sync_nested_relation(db, package, "variants", PackageVariant, body.variants)
     if getattr(body, "transport_options", None) is not None:
         await sync_nested_relation(db, package, "transport_options", PackageTransportOption, body.transport_options)
     if body.gallery is not None:
-        await sync_nested_relation(db, package, "gallery", PackageGalleryImage, body.gallery)
+        valid_gallery = [g for g in body.gallery if getattr(g, 'image_url', None) and str(g.image_url).strip()]
+        await sync_nested_relation(db, package, "gallery", PackageGalleryImage, valid_gallery)
     if body.itinerary is not None:
         await sync_nested_relation(db, package, "itinerary", PackageItineraryDay, body.itinerary)
     if body.highlights is not None:
-        await sync_nested_relation(db, package, "highlights", PackageHighlight, body.highlights)
+        valid_highlights = [h for h in body.highlights if getattr(h, 'title', None) and str(h.title).strip()]
+        await sync_nested_relation(db, package, "highlights", PackageHighlight, valid_highlights)
     if body.inclusions is not None:
-        await sync_nested_relation(db, package, "inclusions", PackageInclusion, body.inclusions)
+        valid_inclusions = [i for i in body.inclusions if getattr(i, 'label', None) and str(i.label).strip()]
+        await sync_nested_relation(db, package, "inclusions", PackageInclusion, valid_inclusions)
     if body.exclusions is not None:
-        await sync_nested_relation(db, package, "exclusions", PackageExclusion, body.exclusions)
+        valid_exclusions = [e for e in body.exclusions if getattr(e, 'label', None) and str(e.label).strip()]
+        await sync_nested_relation(db, package, "exclusions", PackageExclusion, valid_exclusions)
     if body.boarding_points is not None:
         await sync_nested_relation(db, package, "boarding_points", PackageBoardingPoint, body.boarding_points)
     if body.faqs is not None:
-        await sync_nested_relation(db, package, "faqs", PackageFAQ, body.faqs)
+        valid_faqs = [f for f in body.faqs if getattr(f, 'question', None) and str(f.question).strip() and getattr(f, 'answer', None) and str(f.answer).strip()]
+        await sync_nested_relation(db, package, "faqs", PackageFAQ, valid_faqs)
     if body.policies is not None:
-        await sync_nested_relation(db, package, "policies", PackagePolicy, body.policies)
+        valid_policies = [p for p in body.policies if getattr(p, 'title', None) and str(p.title).strip() and getattr(p, 'description', None) and str(p.description).strip()]
+        await sync_nested_relation(db, package, "policies", PackagePolicy, valid_policies)
     if body.meals is not None:
         await sync_nested_relation(db, package, "meals", PackageMealItem, body.meals)
     if body.extras is not None:

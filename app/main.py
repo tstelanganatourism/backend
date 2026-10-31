@@ -267,6 +267,14 @@ app.include_router(
     prefix="/api/v1/admin",
 )
 
+# ─── Static Files (Upload Fallback) ──────────────────────────────────────────
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+_static_dir = Path("app/static")
+_static_dir.mkdir(parents=True, exist_ok=True)
+(_static_dir / "uploads").mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
 from fastapi import Request, Response
 from app.services.redis_client import get_redis
 
