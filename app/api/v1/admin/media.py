@@ -144,34 +144,8 @@ async def upload_media(
         r2_error_msg = "R2 credentials not configured"
         logger.warning("R2 storage not configured — skipping R2 upload")
 
-    # 2. Secondary: Cloudinary (only if credentials are set AND the account is likely usable)
-    if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
-        try:
-            import cloudinary
-            import cloudinary.uploader
-            cloudinary_resource = "raw" if resource_type == "raw" else ("video" if resource_type == "video" else "image")
-            upload_result = cloudinary.uploader.upload(
-                contents,
-                folder=folder,
-                resource_type=cloudinary_resource,
-                public_id=f"{safe_base}_{unique_id}"
-            )
-            c_url = upload_result.get("secure_url") or upload_result.get("url")
-            if c_url:
-                logger.info(f"Successfully uploaded media to Cloudinary: {c_url}")
-                return {
-                    "url": c_url,
-                    "public_id": upload_result.get("public_id"),
-                    "format": upload_result.get("format", ext),
-                    "resource_type": resource_type,
-                    "width": upload_result.get("width", width),
-                    "height": upload_result.get("height", height)
-                }
-        except Exception as c_err:
-            cloudinary_error_msg = str(c_err)
-            logger.warning(f"Cloudinary upload failed: {c_err}")
-    else:
-        cloudinary_error_msg = "Cloudinary credentials not configured"
+    # 2. Cloudinary permanently bypassed (account disabled; R2 is primary high-speed global storage)
+    cloudinary_error_msg = "Cloudinary disabled - bypassed for Cloudflare R2" 
 
     # 3. Local disk fallback (/static/uploads)
     # NOTE: This is a last-resort fallback. Files saved here are ephemeral on Render

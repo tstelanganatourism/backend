@@ -113,24 +113,7 @@ async def upload_admin_image(
         except Exception as e:
             logger.warning(f"R2 upload failed in upload_admin_image: {e}")
 
-    if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
-        try:
-            import cloudinary
-            import cloudinary.uploader
-            cloudinary.config(
-                cloud_name=settings.CLOUDINARY_CLOUD_NAME,
-                api_key=settings.CLOUDINARY_API_KEY,
-                api_secret=settings.CLOUDINARY_API_SECRET,
-                secure=True
-            )
-            upload_result = cloudinary.uploader.upload(
-                contents,
-                folder="ts_boat_tourism/cms",
-                resource_type="image"
-            )
-            return {"url": upload_result.get("secure_url")}
-        except Exception as e:
-            logger.warning(f"Cloudinary upload failed: {e}")
+# Cloudinary completely bypassed (account disabled, R2 is primary)
 
     # Local fallback
     upload_dir = Path("app/static/uploads")
