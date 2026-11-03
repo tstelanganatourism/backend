@@ -46,9 +46,9 @@ class Settings(BaseSettings):
     CLOUDINARY_API_SECRET: Optional[str] = None
 
     # Cloudflare R2 Storage
-    R2_ACCOUNT_ID: Optional[str] = None
-    R2_ACCESS_KEY_ID: Optional[str] = None
-    R2_SECRET_ACCESS_KEY: Optional[str] = None
+    R2_ACCOUNT_ID: Optional[str] = "dc5b5538c7963bc0e8a8ec7bf499a33c"
+    R2_ACCESS_KEY_ID: Optional[str] = "b753b970dbcef05efc99fbe7b44a8667"
+    R2_SECRET_ACCESS_KEY: Optional[str] = "84e20e6224b23d1494858a208f0954110c1fb329838ca3c54d79aadcc479cb16"
     R2_BUCKET_NAME: Optional[str] = "tsboat-media"
     R2_PUBLIC_URL: Optional[str] = "https://pub-5d4166383761438e8adf5625d2697f39.r2.dev"
     R2_CUSTOM_DOMAIN: Optional[str] = "https://media.tstelanganatourism.com"

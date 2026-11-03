@@ -53,7 +53,7 @@ from app.utils.cache import clear_cache_prefix
 
 logger = logging.getLogger(__name__)
 
-AP_TOURISM_EMAIL_LOGO_URL = "https://res.cloudinary.com/dpdab3e97/image/upload/q_auto/f_auto/v1779358705/b66b077a-69fa-4625-8b49-9a168efde88f.png"
+AP_TOURISM_EMAIL_LOGO_URL = "https://media.tstelanganatourism.com/brand/logo.png"
 TS_TOURISM_EMAIL_LOGO_URL = "https://media.tstelanganatourism.com/brand/apple-touch-icon.png"
 
 async def generate_pdf_from_url(url: str) -> bytes:
