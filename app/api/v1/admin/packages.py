@@ -122,7 +122,10 @@ async def upload_admin_image(
     filepath = upload_dir / filename
     with open(filepath, "wb") as f:
         f.write(contents)
-    return {"url": f"/static/uploads/{filename}"}
+    backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
+    if not backend_base or "media.tstelanganatourism" not in backend_base:
+        backend_base = "https://backend-st7o.onrender.com"
+    return {"url": f"{backend_base}/static/uploads/{filename}"}
 
 def slugify(text: str) -> str:
     text = text.lower().strip()

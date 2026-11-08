@@ -791,22 +791,51 @@ async def generate_package_brochure_task(ctx, package_id: int):
             if not pdf_bytes:
                 raise RuntimeError("Both Playwright and ReportLab failed to produce PDF bytes.")
 
-            # 2. Upload to Cloudinary
+            # 2. Upload to Cloudflare R2 (primary) or Cloudinary (legacy fallback)
             version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            filename = f"package_{package.slug}_{version}"
-            cloudinary_url = await asyncio.to_thread(sync_cloudinary_upload, pdf_bytes, filename)
+            filename = f"package_{package.slug}_{version}.pdf"
+            brochure_url = None
+
+            from app.services.r2_storage import r2_service
+            if r2_service.is_configured:
+                try:
+                    object_key = f"ts_tours/brochures/{filename}"
+                    await r2_service.upload_file(pdf_bytes, object_key, content_type="application/pdf")
+                    base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
+                    brochure_url = f"{base_url}/{object_key}"
+                    logger.info(f"Successfully uploaded brochure to Cloudflare R2: {brochure_url}")
+                except Exception as r2_err:
+                    logger.warning(f"Failed to upload brochure to R2: {r2_err}")
+
+            if not brochure_url and settings.CLOUDINARY_CLOUD_NAME:
+                try:
+                    brochure_url = await asyncio.to_thread(sync_cloudinary_upload, pdf_bytes, filename.rsplit('.', 1)[0])
+                except Exception as c_err:
+                    logger.warning(f"Failed to upload brochure to Cloudinary: {c_err}")
+
+            if not brochure_url:
+                # Local fallback
+                from pathlib import Path
+                upload_dir = Path("app/static/uploads/brochures")
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                local_path = upload_dir / filename
+                with open(local_path, "wb") as f:
+                    f.write(pdf_bytes)
+                backend_base = (settings.R2_CUSTOM_DOMAIN or "https://backend-st7o.onrender.com").rstrip("/")
+                brochure_url = f"{backend_base}/static/uploads/brochures/{filename}"
 
             # 3. Clean up old generated brochure if exists and different
-            if package.generated_brochure_url and package.generated_brochure_url != cloudinary_url:
-                await asyncio.to_thread(sync_cloudinary_delete, package.generated_brochure_url)
+            if package.generated_brochure_url and package.generated_brochure_url != brochure_url:
+                if "cloudinary.com" in package.generated_brochure_url:
+                    await asyncio.to_thread(sync_cloudinary_delete, package.generated_brochure_url)
 
             # 4. Update DB
-            package.generated_brochure_url = cloudinary_url
+            package.generated_brochure_url = brochure_url
             package.brochure_generation_status = DocumentGenerationStatus.AVAILABLE
             await db.commit()
             clear_cache_prefix("packages:list:")
             clear_cache_prefix(f"packages:detail:{package.slug}")
-            logger.info(f"Successfully generated and uploaded brochure for package {package.slug}: {cloudinary_url}")
+            logger.info(f"Successfully generated and uploaded brochure for package {package.slug}: {brochure_url}")
 
         except Exception as e:
             logger.exception(f"Failed to generate brochure for package {package_id}: {e}")
