@@ -436,7 +436,15 @@ async def get_package_detail(
             exq = select(PackageExtra).where(PackageExtra.package_id == pkg.id, PackageExtra.deleted_at == None)
             tagsq = select(Tag).join(package_tags).where(package_tags.c.package_id == pkg.id, Tag.is_active == True)
 
-            pkg_variants = (await db.execute(vq)).scalars().all()
+            raw_variants = (await db.execute(vq)).scalars().all()
+            # Sort variants so Non-A/C boat variants are primary / default, AC boat variants secondary
+            pkg_variants = sorted(
+                raw_variants,
+                key=lambda v: (
+                    1 if (("a/c" in (v.title or "").lower() or "ac" in (v.title or "").lower()) and "non" not in (v.title or "").lower() and "cab" not in (v.title or "").lower()) else 0,
+                    v.adult_price or Decimal("0.00")
+                )
+            )
             pkg_gallery = (await db.execute(gq)).scalars().all()
             pkg_itinerary = (await db.execute(iq)).scalars().all()
             pkg_highlights = (await db.execute(hq)).scalars().all()
@@ -798,6 +806,29 @@ async def get_package_availability(
                 eff_student = None
                 eff_adult = max(Decimal("0.00"), (base_adult or Decimal("0.00")) + modifier)
                 eff_child = max(Decimal("0.00"), (base_child or Decimal("0.00")) + modifier)
+
+            # AC Boat dates are closed across all packages
+            v_title_lower = (variant.title or "").strip().lower()
+            is_ac_boat = ("a/c" in v_title_lower or "ac" in v_title_lower) and "non" not in v_title_lower and "cab" not in v_title_lower and "vehicle" not in v_title_lower
+            if is_ac_boat:
+                availability.append(
+                    PublicDateAvailability(
+                        date=current,
+                        variant_id=variant.id,
+                        variant_title=variant.title,
+                        adult_price=base_adult,
+                        child_price=base_child,
+                        effective_adult_price=eff_adult,
+                        effective_child_price=eff_child,
+                        student_price=base_student,
+                        effective_student_price=eff_student,
+                        available_seats=0,
+                        is_closed=True,
+                        status="CLOSED",
+                        transport_availability=None
+                    )
+                )
+                continue
 
             if inv is None:
                 # No inventory opened by admin yet for this date -> UNPUBLISHED / CLOSED

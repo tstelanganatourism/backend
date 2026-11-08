@@ -230,6 +230,16 @@ async def checkout(
         parent_package = variant.package
         target_id = parent_package.id
 
+        # ── AC Boat Closure Guard ─────────────────────────────────────────
+        # AC boat dates are closed across all boat tour packages.
+        v_title_lower = (variant.title or "").strip().lower()
+        is_ac_boat = ("a/c" in v_title_lower or "ac" in v_title_lower) and "non" not in v_title_lower and "cab" not in v_title_lower and "vehicle" not in v_title_lower
+        if is_ac_boat and not is_admin:
+            raise HTTPException(
+                status_code=400,
+                detail="A/C Boat bookings are currently closed for all packages. Please select Non-A/C boat."
+            )
+
         # 2. Fetch inventory row with SELECT FOR UPDATE
         inventory_query = (
             select(PackageVariantInventory)
@@ -393,8 +403,28 @@ async def checkout(
         if not effective_selections and request.transport_option_id:
             effective_selections = [TransportSelection(option_id=request.transport_option_id, quantity=1)]
 
-        # Transport options are add-ons — only validate and charge if selections are provided.
-        # Customers using their own vehicle / private transport can book boat packages without transport add-ons.
+        # Filter out invalid quantities (<= 0)
+        effective_selections = [s for s in effective_selections if s.quantity > 0]
+
+        # ── Mandatory Transport Validation ─────────────────────────────
+        # If the package has transport enabled and options exist, transport selection is STRICTLY MANDATORY.
+        # Booking without transport is only allowed if the package has NO transport options configured.
+        if parent_package.has_transport:
+            avail_opts_res = await db.execute(
+                select(PackageTransportOption).where(
+                    PackageTransportOption.package_id == parent_package.id,
+                    PackageTransportOption.deleted_at.is_(None)
+                )
+            )
+            available_transport_opts = avail_opts_res.scalars().all()
+
+            if available_transport_opts:
+                if not effective_selections:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Please select a transport option to continue. Transport selection is required for this package."
+                    )
+
         if parent_package.has_transport and effective_selections:
             selected_opt_ids = [s.option_id for s in effective_selections]
             t_opts_res = await db.execute(
