@@ -93,39 +93,58 @@ async def upload_admin_image(
     file: UploadFile = File(...),
     current_admin: User = Depends(require_admin)
 ):
-    """Upload an image file to Cloudinary (or local static fallback) and return secure URL."""
+    """Upload an image file to R2 (or local static fallback) via streaming spooled file."""
+    import gc
+    import os
+    import shutil
+
     allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="Only JPG, PNG, WEBP, and GIF images are allowed.")
 
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Empty image file.")
+    file_size = 0
+    try:
+        file.file.seek(0, os.SEEK_END)
+        file_size = file.file.tell()
+        file.file.seek(0)
+        if file_size <= 0:
+            raise HTTPException(status_code=400, detail="Empty image file.")
+        if file_size > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Image exceeds maximum allowed size of 20 MB.")
 
-    if r2_service.is_configured:
-        try:
-            ext = file.filename.split('.')[-1].lower() if '.' in file.filename else 'jpg'
-            safe_base = re.sub(r'[^a-zA-Z0-9_-]', '_', file.filename.rsplit('.', 1)[0])[:40]
-            object_key = f"ts_tours/cms/{safe_base}_{uuid.uuid4().hex[:10]}.{ext}"
-            await r2_service.upload_file(contents, object_key, content_type=file.content_type)
-            base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
-            return {"url": f"{base_url}/{object_key}"}
-        except Exception as e:
-            logger.warning(f"R2 upload failed in upload_admin_image: {e}")
+        original_filename = file.filename or "image.jpg"
+        if r2_service.is_configured:
+            try:
+                ext = original_filename.split('.')[-1].lower() if '.' in original_filename else 'jpg'
+                safe_base = re.sub(r'[^a-zA-Z0-9_-]', '_', original_filename.rsplit('.', 1)[0])[:40]
+                object_key = f"ts_tours/cms/{safe_base}_{uuid.uuid4().hex[:10]}.{ext}"
+                await r2_service.upload_file(
+                    file.file,
+                    object_key,
+                    content_type=file.content_type,
+                    content_length=file_size,
+                )
+                base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
+                return {"url": f"{base_url}/{object_key}"}
+            except Exception as e:
+                logger.warning(f"R2 upload failed in upload_admin_image: {e}")
 
-# Cloudinary completely bypassed (account disabled, R2 is primary)
-
-    # Local fallback
-    upload_dir = Path("app/static/uploads")
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"cms_{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = upload_dir / filename
-    with open(filepath, "wb") as f:
-        f.write(contents)
-    backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
-    if not backend_base or "media.tstelanganatourism" not in backend_base:
-        backend_base = "https://backend-st7o.onrender.com"
-    return {"url": f"{backend_base}/static/uploads/{filename}"}
+        # Local fallback (stream in chunks)
+        upload_dir = Path("app/static/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"cms_{uuid.uuid4().hex[:8]}_{Path(original_filename).name}"
+        filepath = upload_dir / filename
+        file.file.seek(0)
+        with open(filepath, "wb") as f:
+            shutil.copyfileobj(file.file, f, length=65536)
+        backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
+        if not backend_base or "media.tstelanganatourism" not in backend_base:
+            backend_base = "https://backend-st7o.onrender.com"
+        return {"url": f"{backend_base}/static/uploads/{filename}"}
+    finally:
+        await file.close()
+        if file_size > 1_048_576:
+            gc.collect()
 
 def slugify(text: str) -> str:
     text = text.lower().strip()

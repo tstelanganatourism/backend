@@ -1,15 +1,15 @@
-import multiprocessing
+import os
 
 # Bind Settings
-bind = "127.0.0.1:8000"
-backlog = 2048
+bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
+backlog = 512
 
 # Worker Process Architecture
-# Recommended: (2 * cores) + 1
-workers = (multiprocessing.cpu_count() * 2) + 1
+# Keep 1 worker by default on 512 MB containers; scale via WEB_CONCURRENCY only on larger instances.
+workers = int(os.getenv("WEB_CONCURRENCY", "1"))
 worker_class = "uvicorn.workers.UvicornWorker"
-worker_connections = 1000
-timeout = 30
+worker_connections = 256
+timeout = 60
 keepalive = 5
 
 # Logging Configurations

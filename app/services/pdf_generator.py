@@ -1,29 +1,33 @@
+import gc
 import logging
 import asyncio
 import sys
 from html import escape
 from typing import Optional
 from datetime import datetime, timezone
-from playwright.async_api import async_playwright
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
-import cloudinary
-import cloudinary.uploader
 
-# Cloudinary configuration is initialized globally when app loads, but we ensure it is ready
-if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
-    cloudinary.config(
-        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
-        api_key=settings.CLOUDINARY_API_KEY,
-        api_secret=settings.CLOUDINARY_API_SECRET,
-        secure=True
-    )
+
+def _ensure_cloudinary():
+    import cloudinary
+    import cloudinary.uploader
+    if settings.CLOUDINARY_CLOUD_NAME and settings.CLOUDINARY_API_KEY and settings.CLOUDINARY_API_SECRET:
+        cloudinary.config(
+            cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+            api_key=settings.CLOUDINARY_API_KEY,
+            api_secret=settings.CLOUDINARY_API_SECRET,
+            secure=True
+        )
+    return cloudinary.uploader
+
 
 def sync_cloudinary_upload(pdf_bytes: bytes, filename: str) -> str:
-    res = cloudinary.uploader.upload(
+    uploader = _ensure_cloudinary()
+    res = uploader.upload(
         pdf_bytes,
         folder="ts_tours/brochures",
         resource_type="raw",
@@ -31,10 +35,12 @@ def sync_cloudinary_upload(pdf_bytes: bytes, filename: str) -> str:
     )
     return res.get("secure_url")
 
+
 def sync_cloudinary_delete(url: str):
     if not url:
         return
     try:
+        uploader = _ensure_cloudinary()
         parts = url.split("/upload/")
         if len(parts) > 1:
             path_parts = parts[1].split("/")
@@ -43,7 +49,7 @@ def sync_cloudinary_delete(url: str):
             else:
                 public_id = "/".join(path_parts)
             # For raw file resource types, the extension is part of public_id
-            cloudinary.uploader.destroy(public_id, resource_type="raw")
+            uploader.destroy(public_id, resource_type="raw")
     except Exception as e:
         logger.error(f"Failed to delete Cloudinary PDF: {url}. Error: {e}")
 from app.models.package import Package
@@ -59,12 +65,16 @@ TS_TOURISM_EMAIL_LOGO_URL = "https://media.tstelanganatourism.com/brand/apple-to
 async def generate_pdf_from_url(url: str) -> bytes:
     """
     Spins up headless Chromium, navigates to the URL, and generates a PDF.
-    Used ONLY for package brochures (admin-triggered, one-time operations).
-    Booking tickets/invoices/forms use client-side printing instead.
+    Disabled by default on 512 MB instances (ENABLE_PLAYWRIGHT_PDF=False) because
+    Chromium consumes 250-450 MB RAM per launch and triggers OOM kills.
 
     CRITICAL: browser.close() is always called in the finally block to prevent
     Chromium zombie processes from leaking if navigation fails or times out.
     """
+    if not settings.ENABLE_PLAYWRIGHT_PDF:
+        raise RuntimeError("Playwright Chromium PDF is disabled in low-memory mode.")
+
+    from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -760,25 +770,29 @@ async def generate_package_brochure_task(ctx, package_id: int):
 
             pdf_bytes = None
 
-            # Strategy 1: Attempt Playwright Chromium
-            try:
-                frontend_url = settings.FRONTEND_URL.rstrip('/') if settings.FRONTEND_URL else "https://tstelanganatourism.com"
-                if settings.ENVIRONMENT == "development":
-                    import urllib.request
-                    try:
-                        urllib.request.urlopen("http://localhost:3000", timeout=1)
-                        frontend_url = "http://localhost:3000"
-                    except Exception:
-                        pass
-                print_url = f"{frontend_url}/print/package/{package.slug}"
-                pdf_bytes = await asyncio.wait_for(
-                    asyncio.to_thread(sync_generate_pdf, print_url),
-                    timeout=60.0
-                )
-                logger.info(f"Playwright generated brochure PDF for package {package.slug} successfully.")
-            except Exception as pw_err:
-                logger.warning(f"Playwright PDF generation failed or unavailable ({pw_err}). Falling back to ReportLab vector PDF engine.")
-                # CRITICAL FIX: Serialize ORM object to plain dict BEFORE passing to thread.
+            # Strategy 1: Only launch Playwright Chromium if explicitly enabled on high-RAM hosts.
+            # On 512 MB instances, use ReportLab directly (~5 MB RAM vs ~350 MB Chromium).
+            if settings.ENABLE_PLAYWRIGHT_PDF:
+                try:
+                    frontend_url = settings.FRONTEND_URL.rstrip('/') if settings.FRONTEND_URL else "https://tstelanganatourism.com"
+                    if settings.ENVIRONMENT == "development":
+                        import urllib.request
+                        try:
+                            urllib.request.urlopen("http://localhost:3000", timeout=1)
+                            frontend_url = "http://localhost:3000"
+                        except Exception:
+                            pass
+                    print_url = f"{frontend_url}/print/package/{package.slug}"
+                    pdf_bytes = await asyncio.wait_for(
+                        asyncio.to_thread(sync_generate_pdf, print_url),
+                        timeout=60.0
+                    )
+                    logger.info(f"Playwright generated brochure PDF for package {package.slug} successfully.")
+                except Exception as pw_err:
+                    logger.warning(f"Playwright PDF generation failed ({pw_err}). Falling back to ReportLab vector PDF engine.")
+
+            if not pdf_bytes:
+                # CRITICAL: Serialize ORM object to plain dict BEFORE passing to thread.
                 # SQLAlchemy async models are NOT thread-safe and crash with MissingGreenlet
                 # when attributes are accessed from a worker thread.
                 package_dict = _extract_package_data(package)
@@ -789,9 +803,9 @@ async def generate_package_brochure_task(ctx, package_id: int):
                 logger.info(f"ReportLab generated brochure PDF for package {package.slug} successfully ({len(pdf_bytes)} bytes).")
 
             if not pdf_bytes:
-                raise RuntimeError("Both Playwright and ReportLab failed to produce PDF bytes.")
+                raise RuntimeError("Failed to produce brochure PDF bytes.")
 
-            # 2. Upload to Cloudflare R2 (primary) or Cloudinary (legacy fallback)
+            # 2. Upload to Cloudflare R2 (primary) or local static fallback
             version = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
             filename = f"package_{package.slug}_{version}.pdf"
             brochure_url = None
@@ -807,12 +821,6 @@ async def generate_package_brochure_task(ctx, package_id: int):
                 except Exception as r2_err:
                     logger.warning(f"Failed to upload brochure to R2: {r2_err}")
 
-            if not brochure_url and settings.CLOUDINARY_CLOUD_NAME:
-                try:
-                    brochure_url = await asyncio.to_thread(sync_cloudinary_upload, pdf_bytes, filename.rsplit('.', 1)[0])
-                except Exception as c_err:
-                    logger.warning(f"Failed to upload brochure to Cloudinary: {c_err}")
-
             if not brochure_url:
                 # Local fallback
                 from pathlib import Path
@@ -823,6 +831,9 @@ async def generate_package_brochure_task(ctx, package_id: int):
                     f.write(pdf_bytes)
                 backend_base = (settings.R2_CUSTOM_DOMAIN or "https://backend-st7o.onrender.com").rstrip("/")
                 brochure_url = f"{backend_base}/static/uploads/brochures/{filename}"
+
+            del pdf_bytes
+            gc.collect()
 
             # 3. Clean up old generated brochure if exists and different
             if package.generated_brochure_url and package.generated_brochure_url != brochure_url:

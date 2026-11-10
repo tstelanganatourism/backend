@@ -13,12 +13,15 @@ This is fully idempotent: process_post_booking_documents_task internally checks
 the EmailLog before sending, so it will NEVER send a duplicate email.
 """
 
+import asyncio
 from loguru import logger
 from sqlalchemy import select, exists
 from datetime import datetime, timedelta, timezone
 
 from app.db.session import AsyncSessionLocal
 from app.core.config import settings
+
+_missed_emails_lock = asyncio.Lock()
 
 
 async def recover_missed_emails(ctx):
@@ -27,9 +30,26 @@ async def recover_missed_emails(ctx):
     their customer confirmation email OR their admin notification email, and
     re-trigger the post-booking task for each one (which is idempotent).
     """
+    if _missed_emails_lock.locked():
+        return
+    async with _missed_emails_lock:
+        await _run_recover_missed_emails(ctx)
+
+
+async def _run_recover_missed_emails(ctx):
     from app.models.booking import Booking, EmailLog
     from app.models.enums import BookingStatus
     from app.services.pdf_generator import process_post_booking_documents_task
+    from app.services.redis_client import get_redis
+
+    # Cooldown prevents duplicate scans during restart bursts / stale cron drain
+    try:
+        r = get_redis()
+        acquired = await r.set("missed_emails_scan_cooldown", "1", ex=60, nx=True)
+        if not acquired:
+            return
+    except Exception:
+        pass
 
     logger.info("[MissedEmails] Scanning for bookings missing confirmation or admin emails...")
 
@@ -58,7 +78,7 @@ async def recover_missed_emails(ctx):
             .scalar_subquery()
         )
 
-        # Find bookings missing customer email OR admin notification
+        # Find bookings missing customer email OR admin notification (bounded batch)
         stmt = (
             select(Booking)
             .where(
@@ -70,6 +90,7 @@ async def recover_missed_emails(ctx):
                     Booking.id.not_in(sent_admin_sq)
                 ),
             )
+            .limit(50)
         )
 
         result = await db.execute(stmt)

@@ -1,44 +1,76 @@
 import time
 import uuid
-import logging
-from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
 from loguru import logger
+from starlette.types import ASGIApp, Receive, Scope, Send, Message
 
-# Configure standard logging to redirect to loguru if needed, or rely directly on loguru
-class RequestIDMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # 1. Extract or generate unique Request ID
-        request_id = request.headers.get("X-Request-ID")
+
+class RequestIDMiddleware:
+    """
+    Pure ASGI Request-ID + timing observability middleware.
+    Avoids Starlette BaseHTTPMiddleware so large multipart uploads and SSE streams
+    pass straight through without buffering request/response bodies in memory.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = None
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"x-request-id":
+                request_id = value.decode("latin-1")
+                break
         if not request_id:
             request_id = uuid.uuid4().hex
 
-        # Store Request ID on request state for use in application endpoints if needed
-        request.state.request_id = request_id
+        scope.setdefault("state", {})["request_id"] = request_id
 
-        # 2. Measure execution time and log contextual request data
         start_time = time.perf_counter()
-        
-        # Exempt asset routes or health check logs from heavy logging if desired
-        path = request.url.path
-        is_asset = path.startswith(("/static", "/_next")) or path.endswith((".js", ".css", ".png", ".jpg", ".ico", ".svg"))
-        
-        # Bind the request ID to all loguru logs triggered during this async task context
+        method = scope.get("method", "GET")
+        path = scope.get("path", "")
+        client = scope.get("client")
+        client_host = client[0] if client else "unknown"
+        is_asset = path.startswith(("/static", "/_next")) or path.endswith(
+            (".js", ".css", ".png", ".jpg", ".ico", ".svg")
+        )
+        status_code = 500
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message.get("status", 200)
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("latin-1")))
+                message = {**message, "headers": headers}
+            await send(message)
+
         with logger.contextualize(request_id=request_id):
             if not is_asset:
-                logger.info("Incoming request: {} {} from {}", request.method, path, request.client.host if request.client else 'unknown')
+                logger.info("Incoming request: {} {} from {}", method, path, client_host)
 
             try:
-                response = await call_next(request)
+                await self.app(scope, receive, send_wrapper)
                 duration = time.perf_counter() - start_time
-                
                 if not is_asset:
-                    logger.info("Completed request: {} {} - Status: {} in {:.2f}ms", request.method, path, response.status_code, duration*1000)
-                
-                # Propagate Request ID back to the client in response headers
-                response.headers["X-Request-ID"] = request_id
-                return response
+                    logger.info(
+                        "Completed request: {} {} - Status: {} in {:.2f}ms",
+                        method,
+                        path,
+                        status_code,
+                        duration * 1000,
+                    )
             except Exception as e:
                 duration = time.perf_counter() - start_time
-                logger.error("Failed request: {} {} - Error: {} in {:.2f}ms", request.method, path, str(e), duration*1000, exc_info=True)
-                raise e
+                logger.error(
+                    "Failed request: {} {} - Error: {} in {:.2f}ms",
+                    method,
+                    path,
+                    str(e),
+                    duration * 1000,
+                    exc_info=True,
+                )
+                raise

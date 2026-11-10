@@ -42,23 +42,25 @@ async def shutdown(ctx):
 class WorkerSettings:
     functions = [generate_package_brochure_task, process_post_booking_documents_task, dispatch_sms_payload]
     cron_jobs = [
-        # Close today's inventory slots at 6 AM IST (runs every minute, idempotent via Redis key)
-        cron(perform_daily_cutoff, second=0, run_at_startup=True),
+        # Close today's inventory slots at/after 6 AM IST & send travel day reminders.
+        # Runs once on startup and every 15 minutes (instead of every minute).
+        cron(perform_daily_cutoff, minute={0, 15, 30, 45}, second=15, run_at_startup=True, max_tries=1, keep_result=0),
 
         # Recover any emails missed while the worker was down.
-        # Runs immediately on startup and then every 15 minutes.
-        cron(recover_missed_emails, minute={0, 15, 30, 45}, run_at_startup=True),
+        # Staggered at :05/:20/:35/:50 so it never contends with daily_cutoff.
+        cron(recover_missed_emails, minute={5, 20, 35, 50}, second=0, run_at_startup=True, max_tries=1, keep_result=0),
 
-        # Release inventory locked by expired/abandoned booking drafts.
-        # Runs every 5 minutes. Prevents seats being stuck as "reserved" forever.
-        cron(cleanup_expired_drafts, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, run_at_startup=False),
+        # Release inventory locked by expired/abandoned booking drafts every 2 minutes.
+        cron(cleanup_expired_drafts, minute=set(range(0, 60, 2)), second=30, run_at_startup=False, max_tries=1, keep_result=0),
     ]
     redis_settings = REDIS_SETTINGS
     on_startup = startup
     on_shutdown = shutdown
-    max_jobs = 3   # Must not exceed the ARQ worker's DB pool ceiling (pool_size=2, max_overflow=1)
-    max_tries = 3  # Retry up to 3 times if email sending fails
-    job_timeout = 300   # 300 seconds to handle slow Brevo, DB, or Playwright PDF generation
+    max_jobs = 3        # Must not exceed the DB pool ceiling
+    max_tries = 3       # Retry up to 3 times if email sending fails
+    job_timeout = 180   # 180 seconds max for slow external API calls
+    poll_delay = 2.0    # Poll Redis every 2s instead of 0.5s (4x less idle churn)
+    keep_result = 60    # Expire finished job payloads in 60s instead of 1h
 
 
 _pool = None

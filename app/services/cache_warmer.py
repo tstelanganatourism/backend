@@ -62,42 +62,79 @@ async def warmup_public_cache():
                 ))
             set_mem_cached("pkg_cats", "all", pkg_cats_out, ttl_seconds=3600)
 
-            # 2. Warm All Published Packages
+            # 2. Warm All Published Packages (batched queries to avoid N*13 query startup delay)
             pkg_query = select(Package).where(
                 Package.status == PublishStatus.PUBLISHED,
                 Package.deleted_at.is_(None)
             ).order_by(Package.order_priority.asc(), Package.id.desc())
             packages = (await db.execute(pkg_query)).scalars().all()
+            pkg_ids = [p.id for p in packages]
+
+            def _group_by_pkg(rows, attr="package_id"):
+                grouped = {}
+                for row in rows:
+                    grouped.setdefault(getattr(row, attr), []).append(row)
+                return grouped
+
+            variants_by_pkg = {}
+            gallery_by_pkg = {}
+            itinerary_by_pkg = {}
+            highlights_by_pkg = {}
+            inclusions_by_pkg = {}
+            exclusions_by_pkg = {}
+            boarding_by_pkg = {}
+            faqs_by_pkg = {}
+            policies_by_pkg = {}
+            transports_by_pkg = {}
+            meals_by_pkg = {}
+            extras_by_pkg = {}
+            tags_by_pkg = {}
+
+            if pkg_ids:
+                variants_by_pkg = _group_by_pkg((await db.execute(select(PackageVariant).where(PackageVariant.package_id.in_(pkg_ids), PackageVariant.is_active == True, PackageVariant.deleted_at.is_(None)))).scalars().all())
+                gallery_by_pkg = _group_by_pkg((await db.execute(select(PackageGalleryImage).where(PackageGalleryImage.package_id.in_(pkg_ids), PackageGalleryImage.deleted_at.is_(None)))).scalars().all())
+                itinerary_by_pkg = _group_by_pkg((await db.execute(select(PackageItineraryDay).where(PackageItineraryDay.package_id.in_(pkg_ids), PackageItineraryDay.deleted_at.is_(None)))).scalars().all())
+                highlights_by_pkg = _group_by_pkg((await db.execute(select(PackageHighlight).where(PackageHighlight.package_id.in_(pkg_ids), PackageHighlight.deleted_at.is_(None)))).scalars().all())
+                inclusions_by_pkg = _group_by_pkg((await db.execute(select(PackageInclusion).where(PackageInclusion.package_id.in_(pkg_ids), PackageInclusion.deleted_at.is_(None)))).scalars().all())
+                exclusions_by_pkg = _group_by_pkg((await db.execute(select(PackageExclusion).where(PackageExclusion.package_id.in_(pkg_ids), PackageExclusion.deleted_at.is_(None)))).scalars().all())
+                boarding_by_pkg = _group_by_pkg((await db.execute(select(PackageBoardingPoint).where(PackageBoardingPoint.package_id.in_(pkg_ids), PackageBoardingPoint.deleted_at.is_(None)))).scalars().all())
+                faqs_by_pkg = _group_by_pkg((await db.execute(select(PackageFAQ).where(PackageFAQ.package_id.in_(pkg_ids), PackageFAQ.deleted_at.is_(None)))).scalars().all())
+                policies_by_pkg = _group_by_pkg((await db.execute(select(PackagePolicy).where(PackagePolicy.package_id.in_(pkg_ids), PackagePolicy.deleted_at.is_(None)))).scalars().all())
+                transports_by_pkg = _group_by_pkg((await db.execute(select(PackageTransportOption).where(PackageTransportOption.package_id.in_(pkg_ids), PackageTransportOption.deleted_at.is_(None)))).scalars().all())
+                meals_by_pkg = _group_by_pkg((await db.execute(select(PackageMealItem).where(PackageMealItem.package_id.in_(pkg_ids), PackageMealItem.deleted_at.is_(None)))).scalars().all())
+                extras_by_pkg = _group_by_pkg((await db.execute(select(PackageExtra).where(PackageExtra.package_id.in_(pkg_ids), PackageExtra.deleted_at.is_(None)))).scalars().all())
+                tag_rows = (await db.execute(
+                    select(package_tags.c.package_id, Tag.name)
+                    .join(Tag, Tag.id == package_tags.c.tag_id)
+                    .where(package_tags.c.package_id.in_(pkg_ids), Tag.is_active == True)
+                )).all()
+                for pid, tname in tag_rows:
+                    tags_by_pkg.setdefault(pid, []).append(tname)
 
             for pkg in packages:
-                # Eagerly load all relationships for detail
-                vq = select(PackageVariant).where(PackageVariant.package_id == pkg.id, PackageVariant.is_active == True, PackageVariant.deleted_at.is_(None))
-                gq = select(PackageGalleryImage).where(PackageGalleryImage.package_id == pkg.id, PackageGalleryImage.deleted_at.is_(None))
-                iq = select(PackageItineraryDay).where(PackageItineraryDay.package_id == pkg.id, PackageItineraryDay.deleted_at.is_(None))
-                hq = select(PackageHighlight).where(PackageHighlight.package_id == pkg.id, PackageHighlight.deleted_at.is_(None))
-                inq = select(PackageInclusion).where(PackageInclusion.package_id == pkg.id, PackageInclusion.deleted_at.is_(None))
-                eq = select(PackageExclusion).where(PackageExclusion.package_id == pkg.id, PackageExclusion.deleted_at.is_(None))
-                bq = select(PackageBoardingPoint).where(PackageBoardingPoint.package_id == pkg.id, PackageBoardingPoint.deleted_at.is_(None))
-                fq = select(PackageFAQ).where(PackageFAQ.package_id == pkg.id, PackageFAQ.deleted_at.is_(None))
-                pq = select(PackagePolicy).where(PackagePolicy.package_id == pkg.id, PackagePolicy.deleted_at.is_(None))
-                tq = select(PackageTransportOption).where(PackageTransportOption.package_id == pkg.id, PackageTransportOption.deleted_at.is_(None))
-                mq = select(PackageMealItem).where(PackageMealItem.package_id == pkg.id, PackageMealItem.deleted_at.is_(None))
-                exq = select(PackageExtra).where(PackageExtra.package_id == pkg.id, PackageExtra.deleted_at.is_(None))
-                tagsq = select(Tag).join(package_tags).where(package_tags.c.package_id == pkg.id, Tag.is_active == True)
-
-                variants = (await db.execute(vq)).scalars().all()
-                gallery = (await db.execute(gq)).scalars().all()
-                itinerary = (await db.execute(iq)).scalars().all()
-                highlights = (await db.execute(hq)).scalars().all()
-                inclusions = (await db.execute(inq)).scalars().all()
-                exclusions = (await db.execute(eq)).scalars().all()
-                boarding_pts = (await db.execute(bq)).scalars().all()
-                faqs = (await db.execute(fq)).scalars().all()
-                policies = (await db.execute(pq)).scalars().all()
-                transports = (await db.execute(tq)).scalars().all()
-                meals = (await db.execute(mq)).scalars().all()
-                extras = (await db.execute(exq)).scalars().all()
-                tags = (await db.execute(tagsq)).scalars().all()
+                raw_variants = variants_by_pkg.get(pkg.id, [])
+                variants = sorted(
+                    raw_variants,
+                    key=lambda v: (
+                        1 if (("a/c" in (v.title or "").lower() or "ac" in (v.title or "").lower()) and "non" not in (v.title or "").lower() and "cab" not in (v.title or "").lower()) else 0,
+                        v.adult_price or Decimal("0.00")
+                    )
+                )
+                gallery = gallery_by_pkg.get(pkg.id, [])
+                itinerary = itinerary_by_pkg.get(pkg.id, [])
+                highlights = highlights_by_pkg.get(pkg.id, [])
+                inclusions = inclusions_by_pkg.get(pkg.id, [])
+                exclusions = exclusions_by_pkg.get(pkg.id, [])
+                boarding_pts = boarding_by_pkg.get(pkg.id, [])
+                faqs = faqs_by_pkg.get(pkg.id, [])
+                policies = policies_by_pkg.get(pkg.id, [])
+                transports = transports_by_pkg.get(pkg.id, [])
+                meals = meals_by_pkg.get(pkg.id, [])
+                extras = sorted(
+                    [item for item in extras_by_pkg.get(pkg.id, []) if not item.deleted_at and has_text(item.title)],
+                    key=lambda x: (x.sort_order if x.sort_order is not None else 99, x.id)
+                )
+                tag_names = tags_by_pkg.get(pkg.id, [])
 
                 if pkg.is_student_package:
                     starting_price = min((v.student_price for v in variants if v.student_price is not None), default=None)
@@ -119,7 +156,7 @@ async def warmup_public_cache():
                     video_url=pkg.video_url,
                     is_active=pkg.is_active,
                     is_featured=pkg.is_featured,
-                    tags=[t.name for t in tags],
+                    tags=tag_names,
                     starting_price=starting_price,
                     advance_payment_type=pkg.advance_payment_type.value if hasattr(pkg.advance_payment_type, 'value') else str(pkg.advance_payment_type or "FULL_PAYMENT"),
                     advance_payment_value=pkg.advance_payment_value or Decimal("0.00"),
@@ -166,36 +203,49 @@ async def warmup_public_cache():
                     faqs=[item for item in faqs if not item.deleted_at and has_text(item.question) and has_text(item.answer)],
                     policies=[item for item in policies if not item.deleted_at and has_text(item.title) and has_text(item.description)],
                     meals=[item for item in meals if not item.deleted_at and has_text(item.name)],
-                    extras=[item for item in extras if not item.deleted_at and has_text(item.title)],
+                    extras=extras,
                     agent_commission_type=None,
                     agent_commission_percentage=None,
                     agent_commission_fixed_amount=None,
                     agent_daily_quota=None,
                     agent_is_allowed=None,
                 )
-                set_mem_cached("package_detail", f"{pkg.slug.lower()}:False:0", dto, ttl_seconds=3600)
-                set_mem_cached("package_detail", pkg.slug.lower(), dto, ttl_seconds=3600)
+                set_mem_cached("package_detail", f"{pkg.slug.lower()}:False:0", dto, ttl_seconds=600)
+                set_mem_cached("package_detail", pkg.slug.lower(), dto, ttl_seconds=600)
 
-            # 3. Warm All Rooms
+            # 3. Warm All Rooms (batched)
             room_query = select(Room).where(
                 Room.status == PublishStatus.PUBLISHED,
                 Room.is_active == True,
                 Room.deleted_at.is_(None)
             ).order_by(Room.order_priority.asc(), Room.id.desc())
             rooms = (await db.execute(room_query)).scalars().all()
+            room_ids = [r.id for r in rooms]
+
+            def _group_by_room(rows):
+                grouped = {}
+                for row in rows:
+                    grouped.setdefault(row.room_id, []).append(row)
+                return grouped
+
+            rv_by_room = {}
+            rg_by_room = {}
+            rh_by_room = {}
+            rf_by_room = {}
+            rp_by_room = {}
+            if room_ids:
+                rv_by_room = _group_by_room((await db.execute(select(RoomVariant).where(RoomVariant.room_id.in_(room_ids), RoomVariant.is_active == True, RoomVariant.deleted_at.is_(None)))).scalars().all())
+                rg_by_room = _group_by_room((await db.execute(select(RoomGalleryImage).where(RoomGalleryImage.room_id.in_(room_ids), RoomGalleryImage.deleted_at.is_(None)))).scalars().all())
+                rh_by_room = _group_by_room((await db.execute(select(RoomHighlight).where(RoomHighlight.room_id.in_(room_ids), RoomHighlight.deleted_at.is_(None)))).scalars().all())
+                rf_by_room = _group_by_room((await db.execute(select(RoomFAQ).where(RoomFAQ.room_id.in_(room_ids), RoomFAQ.deleted_at.is_(None)))).scalars().all())
+                rp_by_room = _group_by_room((await db.execute(select(RoomPolicy).where(RoomPolicy.room_id.in_(room_ids), RoomPolicy.deleted_at.is_(None)))).scalars().all())
 
             for r in rooms:
-                rvq = select(RoomVariant).where(RoomVariant.room_id == r.id, RoomVariant.is_active == True, RoomVariant.deleted_at.is_(None))
-                rgq = select(RoomGalleryImage).where(RoomGalleryImage.room_id == r.id, RoomGalleryImage.deleted_at.is_(None))
-                rhq = select(RoomHighlight).where(RoomHighlight.room_id == r.id, RoomHighlight.deleted_at.is_(None))
-                rfq = select(RoomFAQ).where(RoomFAQ.room_id == r.id, RoomFAQ.deleted_at.is_(None))
-                rpq = select(RoomPolicy).where(RoomPolicy.room_id == r.id, RoomPolicy.deleted_at.is_(None))
-
-                r_variants = (await db.execute(rvq)).scalars().all()
-                r_gallery = (await db.execute(rgq)).scalars().all()
-                r_highlights = (await db.execute(rhq)).scalars().all()
-                r_faqs = (await db.execute(rfq)).scalars().all()
-                r_policies = (await db.execute(rpq)).scalars().all()
+                r_variants = rv_by_room.get(r.id, [])
+                r_gallery = rg_by_room.get(r.id, [])
+                r_highlights = rh_by_room.get(r.id, [])
+                r_faqs = rf_by_room.get(r.id, [])
+                r_policies = rp_by_room.get(r.id, [])
 
                 starting_price = min((v.weekday_price for v in r_variants), default=None)
                 room_dto = RoomDetailDTO(
@@ -219,8 +269,8 @@ async def warmup_public_cache():
                     ],
                     gallery=r_gallery, highlights=r_highlights, faqs=r_faqs, policies=r_policies
                 )
-                set_mem_cached("room_detail", r.slug.lower(), room_dto, ttl_seconds=3600)
-                set_mem_cached("room_detail", f"{r.slug.lower()}:False:0", room_dto, ttl_seconds=3600)
+                set_mem_cached("room_detail", r.slug.lower(), room_dto, ttl_seconds=600)
+                set_mem_cached("room_detail", f"{r.slug.lower()}:False:0", room_dto, ttl_seconds=600)
 
         elapsed = (asyncio.get_event_loop().time() - t0)
         logger.info(f"Cache warmup finished successfully in {elapsed:.2f}s! ({len(packages)} packages, {len(rooms)} rooms, {len(categories)} categories preloaded).")

@@ -18,13 +18,21 @@ from loguru import logger
 
 router = APIRouter(tags=["Pre-Bookings - Public"])
 
-# ── In-memory rate limiter ─────────────────────────────────────────────────────
+# ── In-memory rate limiter (bounded) ───────────────────────────────────────────
 _rate_map: dict[str, dict] = {}
+_MAX_RATE_MAP_SIZE = 1000
 
 def _check_rate(ip: str, max_per_hour: int = 30) -> bool:
     if ip in ("127.0.0.1", "localhost", "::1", "testclient"):
         return True
     now = datetime.now().timestamp()
+    if len(_rate_map) >= _MAX_RATE_MAP_SIZE:
+        expired = [k for k, v in _rate_map.items() if now > v["reset_at"]]
+        for k in expired:
+            _rate_map.pop(k, None)
+        if len(_rate_map) >= _MAX_RATE_MAP_SIZE:
+            for k in list(_rate_map.keys())[:100]:
+                _rate_map.pop(k, None)
     record = _rate_map.get(ip)
     if not record or now > record["reset_at"]:
         _rate_map[ip] = {"count": 1, "reset_at": now + 3600}

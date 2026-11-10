@@ -1,6 +1,8 @@
+import gc
+import os
+import shutil
 import uuid
 import re
-import io
 import logging
 from pathlib import Path
 from PIL import Image as PILImage
@@ -11,6 +13,12 @@ from app.middleware.auth import require_admin
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
+
+# Guard against malformed image decompression bombs and keep upload RAM bounded
+PILImage.MAX_IMAGE_PIXELS = 50_000_000
+MAX_IMAGE_UPLOAD_BYTES = 20 * 1024 * 1024   # 20 MB
+MAX_PDF_UPLOAD_BYTES = 25 * 1024 * 1024     # 25 MB
+MAX_VIDEO_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 router = APIRouter(
     prefix="/media",
@@ -87,108 +95,132 @@ async def upload_media(
             detail="Only image files (JPG, PNG, WEBP, GIF, AVIF, SVG), video files (MP4, WEBM, MOV), and PDF brochures are allowed."
         )
 
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+    file_size = 0
+    try:
+        # Measure size on the spooled file without loading huge uploads into a Python bytes buffer
+        file.file.seek(0, os.SEEK_END)
+        file_size = file.file.tell()
+        file.file.seek(0)
 
-    original_filename = file.filename or "uploaded_media"
-    ext = original_filename.split('.')[-1].lower() if '.' in original_filename else 'jpg'
-    safe_base = re.sub(r'[^a-zA-Z0-9_-]', '_', original_filename.rsplit('.', 1)[0])[:40]
-    unique_id = uuid.uuid4().hex[:12]
-    unique_filename = f"{safe_base}_{unique_id}.{ext}"
+        if file_size <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
 
-    # Determine resource type and folder
-    if file.content_type == "application/pdf":
-        resource_type = "raw"
-        folder = "ts_tours/brochures"
-    elif file.content_type in allowed_video_types:
-        resource_type = "video"
-        folder = "ts_tours/videos"
-    else:
-        resource_type = "image"
-        folder = "ts_tours"
+        if file.content_type == "application/pdf":
+            resource_type = "raw"
+            folder = "ts_tours/brochures"
+            max_bytes = MAX_PDF_UPLOAD_BYTES
+            label = "PDF"
+        elif file.content_type in allowed_video_types:
+            resource_type = "video"
+            folder = "ts_tours/videos"
+            max_bytes = MAX_VIDEO_UPLOAD_BYTES
+            label = "Video"
+        else:
+            resource_type = "image"
+            folder = "ts_tours"
+            max_bytes = MAX_IMAGE_UPLOAD_BYTES
+            label = "Image"
 
-    object_key = f"{folder}/{unique_filename}"
+        if file_size > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"{label} exceeds maximum allowed size of {max_bytes // (1024 * 1024)} MB."
+            )
 
-    # Extract dimensions if it is an image
-    width, height = None, None
-    if resource_type == "image" and file.content_type != "image/svg+xml":
+        original_filename = file.filename or "uploaded_media"
+        ext = original_filename.split('.')[-1].lower() if '.' in original_filename else 'jpg'
+        safe_base = re.sub(r'[^a-zA-Z0-9_-]', '_', original_filename.rsplit('.', 1)[0])[:40]
+        unique_id = uuid.uuid4().hex[:12]
+        unique_filename = f"{safe_base}_{unique_id}.{ext}"
+        object_key = f"{folder}/{unique_filename}"
+
+        # Extract header-only dimensions for raster images without copying full bytes
+        width, height = None, None
+        if resource_type == "image" and file.content_type != "image/svg+xml":
+            try:
+                file.file.seek(0)
+                with PILImage.open(file.file) as pil_img:
+                    width, height = pil_img.size
+            except Exception:
+                pass
+            finally:
+                file.file.seek(0)
+
+        r2_error_msg = None
+        cloudinary_error_msg = None
+
+        # 1. Primary: Cloudflare R2 (streams directly from spooled file)
+        if r2_service.is_configured:
+            try:
+                file.file.seek(0)
+                await r2_service.upload_file(
+                    file.file,
+                    object_key,
+                    content_type=file.content_type,
+                    content_length=file_size,
+                )
+                base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
+                public_url = f"{base_url}/{object_key}"
+                logger.info(f"Successfully uploaded media to Cloudflare R2: {public_url}")
+                return {
+                    "url": public_url,
+                    "public_id": object_key,
+                    "format": ext,
+                    "resource_type": resource_type,
+                    "width": width,
+                    "height": height
+                }
+            except Exception as r2_err:
+                r2_error_msg = str(r2_err)
+                logger.error(f"Cloudflare R2 upload failed, trying fallback: {r2_err}")
+        else:
+            r2_error_msg = "R2 credentials not configured"
+            logger.warning("R2 storage not configured — skipping R2 upload")
+
+        # 2. Cloudinary permanently bypassed (account disabled; R2 is primary high-speed global storage)
+        cloudinary_error_msg = "Cloudinary disabled - bypassed for Cloudflare R2"
+
+        # 3. Local disk fallback (/static/uploads) — stream in 64 KB chunks
         try:
-            with PILImage.open(io.BytesIO(contents)) as pil_img:
-                width, height = pil_img.size
-        except Exception:
-            pass
+            upload_dir = Path("app/static/uploads")
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            local_filename = f"{resource_type}_{unique_filename}"
+            local_path = upload_dir / local_filename
+            file.file.seek(0)
+            with open(local_path, "wb") as f:
+                shutil.copyfileobj(file.file, f, length=65536)
 
-    r2_error_msg = None
-    cloudinary_error_msg = None
-
-    # 1. Primary: Cloudflare R2
-    if r2_service.is_configured:
-        try:
-            await r2_service.upload_file(contents, object_key, content_type=file.content_type)
-            base_url = (settings.R2_CUSTOM_DOMAIN or settings.R2_PUBLIC_URL or "https://media.tstelanganatourism.com").rstrip("/")
-            public_url = f"{base_url}/{object_key}"
-            logger.info(f"Successfully uploaded media to Cloudflare R2: {public_url}")
+            backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
+            if not backend_base or "media.tstelanganatourism" not in backend_base:
+                backend_base = "https://backend-st7o.onrender.com"
+            local_url = f"{backend_base}/static/uploads/{local_filename}"
+            logger.warning(
+                f"[FALLBACK] Saved media locally. This file is EPHEMERAL and will be lost on redeploy. "
+                f"Please configure R2 credentials in Render dashboard. URL: {local_url}"
+            )
             return {
-                "url": public_url,
-                "public_id": object_key,
+                "url": local_url,
+                "public_id": local_filename,
                 "format": ext,
                 "resource_type": resource_type,
                 "width": width,
                 "height": height
             }
-        except Exception as r2_err:
-            r2_error_msg = str(r2_err)
-            logger.error(f"Cloudflare R2 upload failed, trying fallback: {r2_err}")
-    else:
-        r2_error_msg = "R2 credentials not configured"
-        logger.warning("R2 storage not configured — skipping R2 upload")
+        except Exception as local_err:
+            logger.critical(f"All media upload tiers failed. R2: {r2_error_msg} | Cloudinary: {cloudinary_error_msg} | Local: {local_err}")
 
-    # 2. Cloudinary permanently bypassed (account disabled; R2 is primary high-speed global storage)
-    cloudinary_error_msg = "Cloudinary disabled - bypassed for Cloudflare R2" 
+            if r2_error_msg and "credentials" not in r2_error_msg.lower():
+                detail = "Cloud storage upload failed. Please check that R2 credentials (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME) are set correctly in the Render environment dashboard."
+            elif cloudinary_error_msg and "disabled" in cloudinary_error_msg.lower():
+                detail = "Upload failed: Cloudinary account is disabled. Please re-activate your Cloudinary account or ensure R2 credentials are correctly configured in the Render dashboard."
+            else:
+                detail = f"Upload failed across all storage providers. R2: {r2_error_msg or 'not tried'} | Cloudinary: {cloudinary_error_msg or 'not tried'} | Local: {str(local_err)}"
 
-    # 3. Local disk fallback (/static/uploads)
-    # NOTE: This is a last-resort fallback. Files saved here are ephemeral on Render
-    # (lost on redeploy). Prefer fixing R2 credentials in Render dashboard.
-    try:
-        upload_dir = Path("app/static/uploads")
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        local_filename = f"{resource_type}_{unique_filename}"
-        local_path = upload_dir / local_filename
-        with open(local_path, "wb") as f:
-            f.write(contents)
-
-        # Use absolute backend URL so cross-origin frontends (Vercel/Next.js) can display the image.
-        # A relative path like /static/... only works when the client is on the same domain as the backend.
-        backend_base = (settings.R2_CUSTOM_DOMAIN or "").rstrip("/")
-        # Fallback: derive backend URL from known Render service URL or configured frontend
-        if not backend_base or "media.tstelanganatourism" not in backend_base:
-            backend_base = "https://backend-st7o.onrender.com"
-        local_url = f"{backend_base}/static/uploads/{local_filename}"
-        logger.warning(
-            f"[FALLBACK] Saved media locally. This file is EPHEMERAL and will be lost on redeploy. "
-            f"Please configure R2 credentials in Render dashboard. URL: {local_url}"
-        )
-        return {
-            "url": local_url,
-            "public_id": local_filename,
-            "format": ext,
-            "resource_type": resource_type,
-            "width": width,
-            "height": height
-        }
-    except Exception as local_err:
-        logger.critical(f"All media upload tiers failed. R2: {r2_error_msg} | Cloudinary: {cloudinary_error_msg} | Local: {local_err}")
-
-        # Build a clear, actionable error message for the admin
-        if r2_error_msg and "credentials" not in r2_error_msg.lower():
-            detail = f"Cloud storage upload failed. Please check that R2 credentials (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME) are set correctly in the Render environment dashboard."
-        elif cloudinary_error_msg and "disabled" in cloudinary_error_msg.lower():
-            detail = "Upload failed: Cloudinary account is disabled. Please re-activate your Cloudinary account or ensure R2 credentials are correctly configured in the Render dashboard."
-        else:
-            detail = f"Upload failed across all storage providers. R2: {r2_error_msg or 'not tried'} | Cloudinary: {cloudinary_error_msg or 'not tried'} | Local: {str(local_err)}"
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=detail
-        )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=detail
+            )
+    finally:
+        await file.close()
+        if file_size > 1_048_576:
+            gc.collect()

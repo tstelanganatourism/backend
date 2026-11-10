@@ -2664,6 +2664,12 @@ async def download_public_booking_pdf(
         # constant-time comparison prevents timing attacks
         raise HTTPException(status_code=403, detail="Invalid authorization secret for document PDF download")
 
+    if not settings.ENABLE_PLAYWRIGHT_PDF:
+        raise HTTPException(
+            status_code=503,
+            detail="Server-side Chromium PDF rendering is disabled to stay within instance memory limits; please use browser Print / Save PDF."
+        )
+
     # In production use FRONTEND_URL; locally use 127.0.0.1:3000
     if settings.ENVIRONMENT == "production":
         frontend_base = settings.FRONTEND_URL.rstrip("/")

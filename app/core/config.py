@@ -86,6 +86,11 @@ class Settings(BaseSettings):
 
     # Sentry
     SENTRY_DSN: Optional[str] = None
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.05
+
+    # Runtime / Memory Guardrails (512 MB Render Free Tier defaults)
+    ENABLE_PLAYWRIGHT_PDF: bool = False
+    ENABLE_EMBEDDED_WORKER: bool = True
     
     # MSG91 SMS Configuration
     MSG91_AUTH_KEY: Optional[str] = None

@@ -69,6 +69,8 @@ async def _clear_package_cache_for_variant(db: AsyncSession, variant_id: int) ->
         )
         row = result.first()
         if row:
+            if len(_variant_pkg_meta) >= 500:
+                _variant_pkg_meta.clear()
             _variant_pkg_meta[variant_id] = (row[0], row[1])
     if row:
         pkg_id, slug = row

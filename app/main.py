@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import os
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -10,51 +12,30 @@ import sqlalchemy
 import asyncio
 
 
-async def _periodic_draft_cleanup():
-    """Runs every 60 seconds to release inventory for expired payment drafts automatically."""
+def _get_rss_mb() -> float | None:
+    """Return resident/peak RSS in MB on POSIX hosts without external psutil dependency."""
+    try:
+        import resource
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux returns KB, macOS returns bytes
+        if sys.platform == "darwin":
+            return round(maxrss / (1024 * 1024), 1)
+        return round(maxrss / 1024, 1)
+    except Exception:
+        return None
+
+
+async def _run_embedded_worker_forever(arq_worker) -> None:
+    """Run embedded ARQ worker inside FastAPI lifespan with resilient reconnect backoff."""
     while True:
         try:
-            await asyncio.sleep(60)
-            from app.workers.inventory_cleanup import cleanup_expired_drafts
-            await cleanup_expired_drafts(None)
+            await arq_worker.main()
+            return
         except asyncio.CancelledError:
-            break
+            raise
         except Exception as err:
-            logger.warning(f"Background draft cleanup error: {err}")
-
-
-async def _periodic_daily_cutoff():
-    """Runs after startup and every 5 minutes to trigger 6 AM inventory cutoff and dispatch travel day SMS reminders."""
-    await asyncio.sleep(5)
-    while True:
-        try:
-            from app.workers.daily_cutoff import perform_daily_cutoff
-            await perform_daily_cutoff(None)
-        except asyncio.CancelledError:
-            break
-        except Exception as err:
-            logger.warning(f"Background daily cutoff / travel SMS error: {err}")
-        try:
-            await asyncio.sleep(300)
-        except asyncio.CancelledError:
-            break
-
-
-async def _periodic_missed_emails():
-    """Runs after startup and every 15 minutes to recover any missed customer or admin emails."""
-    await asyncio.sleep(10)
-    while True:
-        try:
-            from app.workers.missed_emails import recover_missed_emails
-            await recover_missed_emails(None)
-        except asyncio.CancelledError:
-            break
-        except Exception as err:
-            logger.warning(f"Background missed emails recovery error: {err}")
-        try:
-            await asyncio.sleep(900)
-        except asyncio.CancelledError:
-            break
+            logger.warning(f"Embedded ARQ worker loop error ({err}); restarting in 5s...")
+            await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -77,10 +58,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Redis warmup warning: {e}")
 
-    cleanup_task = asyncio.create_task(_periodic_draft_cleanup())
-    cutoff_task = asyncio.create_task(_periodic_daily_cutoff())
-    missed_emails_task = asyncio.create_task(_periodic_missed_emails())
-    
     # Warmup memory cache for packages and rooms to deliver < 1ms TTFB
     try:
         from app.services.cache_warmer import warmup_public_cache
@@ -88,20 +65,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to schedule cache warmup: {e}")
 
-    # Start embedded ARQ worker inside FastAPI so background queues (brochures, emails, SMS)
-    # are always processed immediately, even on single-service deployments without a dedicated worker container.
+    # Single embedded ARQ worker handles all background queues (emails, SMS, brochures)
+    # AND all scheduled crons (draft cleanup, daily cutoff, missed email recovery),
+    # eliminating duplicate Python processes and duplicate periodic asyncio loops.
     arq_worker = None
     arq_task = None
-    try:
-        from arq.worker import create_worker
-        from app.worker import WorkerSettings
-        arq_worker = create_worker(WorkerSettings)
-        arq_task = asyncio.create_task(arq_worker.main())
-        logger.info("Embedded ARQ background worker started inside FastAPI.")
-    except Exception as e:
-        logger.warning(f"Failed to start embedded ARQ worker: {e}")
+    if settings.ENABLE_EMBEDDED_WORKER:
+        try:
+            from arq.worker import create_worker
+            from app.worker import WorkerSettings
+            arq_worker = create_worker(WorkerSettings)
+            arq_task = asyncio.create_task(_run_embedded_worker_forever(arq_worker))
+            logger.info("Embedded ARQ background worker started inside FastAPI.")
+        except Exception as e:
+            logger.warning(f"Failed to start embedded ARQ worker: {e}")
 
-    logger.info("Background tasks started: 60s draft cleanup, 5m daily cutoff & travel SMS, 15m email recovery, memory cache warmer, embedded ARQ worker.")
+    logger.info(f"Startup complete (peak RSS: {_get_rss_mb()} MB).")
 
     yield
 
@@ -113,13 +92,17 @@ async def lifespan(app: FastAPI):
             pass
     if arq_task:
         arq_task.cancel()
-
-    for task in (cleanup_task, cutoff_task, missed_emails_task):
-        task.cancel()
         try:
-            await task
+            await arq_task
         except asyncio.CancelledError:
             pass
+
+    try:
+        from app.services.r2_storage import r2_service
+        await r2_service.close()
+    except Exception:
+        pass
+
     from app.db.session import engine
     await engine.dispose()
     logger.info("Database connection pool disposed gracefully.")
@@ -155,12 +138,127 @@ if settings.SENTRY_DSN:
     import sentry_sdk
     sentry_sdk.init(
         dsn=settings.SENTRY_DSN,
-        traces_sample_rate=1.0,
+        traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
         environment=settings.ENVIRONMENT,
     )
     logger.info("Sentry initialized")
 
 setup_exception_handlers(app)
+
+from fastapi import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
+from app.services.redis_client import get_redis
+
+
+class RateLimitMiddleware:
+    """
+    Pure ASGI Redis rate limiting middleware.
+    Avoids Starlette BaseHTTPMiddleware request/response body buffering on file uploads and SSE streams.
+    """
+
+    STATIC_EXTENSIONS = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf")
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET")
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if (
+            path.startswith("/health")
+            or path.startswith("/ping")
+            or path.startswith("/docs")
+            or path.startswith("/openapi.json")
+            or path.startswith("/static")
+            or path.startswith("/_next")
+            or path.endswith(self.STATIC_EXTENSIONS)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        forwarded = headers.get(b"x-forwarded-for")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+        else:
+            client = scope.get("client")
+            client_ip = headers.get(b"cf-connecting-ip") or (client[0] if client else "unknown")
+
+        if client_ip in ("127.0.0.1", "localhost", "::1"):
+            await self.app(scope, receive, send)
+            return
+
+        limit = 200
+        category = "public"
+
+        if path.startswith("/api/v1/admin"):
+            if "/admin/resend-otp" in path:
+                limit = 10
+                category = "otp_resend"
+            elif "/admin/login" in path or "/admin/verify-otp" in path:
+                limit = 20
+                category = "admin_login_otp"
+            else:
+                limit = 600
+                category = "admin_portal"
+        elif "/admin/resend-otp" in path or "/resend-otp" in path:
+            limit = 10
+            category = "otp_resend"
+        elif (
+            "/admin/login" in path
+            or "/admin/verify-otp" in path
+            or "/forgot-password" in path
+            or "/verify-reset-otp" in path
+            or "/reset-password" in path
+        ):
+            limit = 20
+            category = "admin_login_otp"
+        elif method in ("POST", "PUT") and ("/bookings" in path or "/payments" in path or "/checkout" in path):
+            limit = 60
+            category = "checkout"
+
+        auth_header = headers.get(b"authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            try:
+                from app.core.security import decode_token
+                token_str = auth_header.split(" ", 1)[1]
+                token_payload = decode_token(token_str, expected_type="access")
+                if token_payload.get("role") == "ADMIN":
+                    limit = max(limit, 600)
+                    category = "admin_authenticated"
+            except Exception:
+                pass
+
+        key = f"ratelimit:{client_ip}:{category}"
+        try:
+            r = get_redis()
+            async with r.pipeline(transaction=True) as pipe:
+                pipe.incr(key)
+                pipe.expire(key, 60, nx=True)
+                res = await pipe.execute()
+            current = res[0]
+            if current > limit:
+                logger.warning(f"Rate limit exceeded for IP {client_ip} on {path} (Category: {category}, Current: {current}, Limit: {limit})")
+                resp = Response(
+                    content='{"detail": "Too many requests. Please slow down and try again shortly."}',
+                    status_code=429,
+                    media_type="application/json",
+                )
+                await resp(scope, receive, send)
+                return
+        except Exception as e:
+            logger.error(f"Rate Limiter Redis Error: {e}")
+
+        await self.app(scope, receive, send)
+
 
 from fastapi.middleware.gzip import GZipMiddleware
 
@@ -173,6 +271,8 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=settings.ALLOWED_HOSTS,
 )
+
+app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -267,119 +367,6 @@ app.include_router(
     prefix="/api/v1/admin",
 )
 
-# ─── Static Files (Upload Fallback) ──────────────────────────────────────────
-from pathlib import Path
-from fastapi.staticfiles import StaticFiles
-_static_dir = Path("app/static")
-_static_dir.mkdir(parents=True, exist_ok=True)
-(_static_dir / "uploads").mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
-
-from fastapi import Request, Response
-from app.services.redis_client import get_redis
-
-# --- Rate Limiting Middleware (Phase-4) --------------------------------------
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    # Extract real client IP through reverse proxies (Vercel, Cloudflare, Render)
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    else:
-        client_ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "unknown")
-
-    if client_ip in ("127.0.0.1", "localhost", "::1"):
-        return await call_next(request)
-
-    path = request.url.path
-
-    # Exempt routes (health, API documentation, and static assets)
-    static_extensions = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf")
-    if (
-        path.startswith("/health")
-        or path.startswith("/ping")
-        or path.startswith("/docs")
-        or path.startswith("/openapi.json")
-        or path.startswith("/static")
-        or path.startswith("/_next")
-        or path.endswith(static_extensions)
-    ):
-        return await call_next(request)
-
-    # Determine route-based thresholds
-    limit = 200        # Public browsing default: 200 requests/min/IP
-    category = "public"
-
-    # Admin operations: generous threshold for management operations
-    if path.startswith("/api/v1/admin"):
-        if "/admin/resend-otp" in path:
-            limit = 10
-            category = "otp_resend"
-        elif "/admin/login" in path or "/admin/verify-otp" in path:
-            limit = 20
-            category = "admin_login_otp"
-        else:
-            limit = 600
-            category = "admin_portal"
-
-    elif "/admin/resend-otp" in path or "/resend-otp" in path:
-        limit = 10
-        category = "otp_resend"
-
-    elif (
-        "/admin/login" in path
-        or "/admin/verify-otp" in path
-        or "/forgot-password" in path
-        or "/verify-reset-otp" in path
-        or "/reset-password" in path
-    ):
-        limit = 20
-        category = "admin_login_otp"
-
-    # Only actual payment/booking creation (POST/PUT checkout actions) should be throttled to checkout limit
-    elif request.method in ("POST", "PUT") and ("/bookings" in path or "/payments" in path or "/checkout" in path):
-        limit = 60
-        category = "checkout"
-
-    # Check if request has an authenticated Admin token — admins get high allowance across all routes
-    auth_header = request.headers.get("authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        try:
-            from app.core.security import decode_token
-            token_str = auth_header.split(" ", 1)[1]
-            token_payload = decode_token(token_str, expected_type="access")
-            if token_payload.get("role") == "ADMIN":
-                limit = max(limit, 600)
-                category = "admin_authenticated"
-        except Exception:
-            pass
-
-    key = f"ratelimit:{client_ip}:{category}"
-
-    try:
-        r = get_redis()
-        # Redis pipeline for atomic increment and expiry
-        async with r.pipeline(transaction=True) as pipe:
-            pipe.incr(key)
-            pipe.expire(key, 60, nx=True)
-            res = await pipe.execute()
-
-        current = res[0]
-        if current > limit:
-            logger.warning(f"Rate limit exceeded for IP {client_ip} on {path} (Category: {category}, Current: {current}, Limit: {limit})")
-            return Response(
-                content='{"detail": "Too many requests. Please slow down and try again shortly."}',
-                status_code=429,
-                media_type="application/json",
-            )
-    except Exception as e:
-        logger.error(f"Rate Limiter Redis Error: {e}")
-        # Fail open if Redis is down
-        pass
-
-    return await call_next(request)
-# -----------------------------------------------------------------------------
-
 @app.get("/ping")
 async def ping():
     """Zero-overhead liveness ping for Render keep-alive (0 DB, 0 Redis, < 0.1ms)."""
@@ -388,7 +375,13 @@ async def ping():
 @app.get("/health")
 async def health_check():
     """Robust health check verifying external dependencies."""
-    health_status = {"status": "ok", "service": settings.PROJECT_NAME, "db": "unknown", "redis": "unknown"}
+    health_status = {
+        "status": "ok",
+        "service": settings.PROJECT_NAME,
+        "db": "unknown",
+        "redis": "unknown",
+        "peak_rss_mb": _get_rss_mb(),
+    }
     
     # 1. Check DB
     try:

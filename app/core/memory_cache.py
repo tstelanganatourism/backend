@@ -11,7 +11,7 @@ from loguru import logger
 
 # Store format: { (namespace, key): (data, expire_at) }
 _CACHE: Dict[Tuple[str, str], Tuple[Any, float]] = {}
-_MAX_ENTRIES = 5000
+_MAX_ENTRIES = 500
 
 
 def get_mem_cached(namespace: str, key: str) -> Optional[Any]:
@@ -37,7 +37,7 @@ def set_mem_cached(namespace: str, key: str, value: Any, ttl_seconds: int = 60) 
             _CACHE.pop(k, None)
         # If still full, drop oldest 10%
         if len(_CACHE) >= _MAX_ENTRIES:
-            keys_to_drop = list(_CACHE.keys())[:500]
+            keys_to_drop = list(_CACHE.keys())[: max(1, _MAX_ENTRIES // 10)]
             for k in keys_to_drop:
                 _CACHE.pop(k, None)
 

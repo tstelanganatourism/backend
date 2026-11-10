@@ -18,8 +18,16 @@ from app.services.redis_client import get_redis
 from app.core.timezone import get_ist_now
 
 CUTOFF_CHECK_INTERVAL_SECONDS = 300
+_cutoff_lock = asyncio.Lock()
 
 async def perform_daily_cutoff(ctx):
+    if _cutoff_lock.locked():
+        return
+    async with _cutoff_lock:
+        await _run_daily_cutoff()
+
+
+async def _run_daily_cutoff():
     now_ist = get_ist_now()
     today = now_ist.date()
     
@@ -139,6 +147,11 @@ async def perform_daily_cutoff(ctx):
     # ── 2. Travel Day SMS Reminders ───────────────────────────────────────────
     # Send to all confirmed bookings travelling today (idempotent via per-booking Redis key)
     try:
+        # Cooldown prevents duplicate scans during restart bursts / stale cron drain
+        acquired = await redis.set("travel_sms_scan_cooldown", "1", ex=60, nx=True)
+        if not acquired:
+            return
+
         from app.models.booking import Booking, BookingPassenger
         from app.models.enums import BookingStatus as BStatus
         from app.models.user import User as UserModel

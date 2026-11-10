@@ -52,22 +52,33 @@ class R2StorageService:
             self._client = None
             self._client_context = None
 
-    async def upload_file(self, file_content: bytes, object_name: str, content_type: str = "application/pdf") -> str:
+    async def upload_file(
+        self,
+        file_content,
+        object_name: str,
+        content_type: str = "application/pdf",
+        content_length: Optional[int] = None,
+    ) -> str:
         """
-        Uploads a file to R2.
+        Uploads bytes or a seekable binary file-like object to R2.
         Returns the object_name (the path in the bucket).
         """
         if not self.is_configured:
             raise ValueError("R2 Storage is not configured.")
-            
+
         client = await self.get_client()
         try:
-            await client.put_object(
-                Bucket=self.bucket_name,
-                Key=object_name,
-                Body=file_content,
-                ContentType=content_type
-            )
+            if hasattr(file_content, "seek"):
+                file_content.seek(0)
+            put_kwargs = {
+                "Bucket": self.bucket_name,
+                "Key": object_name,
+                "Body": file_content,
+                "ContentType": content_type,
+            }
+            if content_length is not None and content_length >= 0:
+                put_kwargs["ContentLength"] = content_length
+            await client.put_object(**put_kwargs)
             return object_name
         except ClientError as e:
             logger.error(f"Failed to upload to R2: {e}")

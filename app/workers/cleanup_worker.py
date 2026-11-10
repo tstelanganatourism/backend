@@ -15,16 +15,31 @@ from app.models.package import PackageVariantInventory
 from app.models.room import RoomSlotInventory
 from app.core.timezone import get_ist_now
 
+_cleanup_lock = asyncio.Lock()
+
+
 async def release_expired_drafts():
     """
     Finds expired BookingDrafts, releases their reserved inventory, and deletes them.
     """
+    if _cleanup_lock.locked():
+        return
+    async with _cleanup_lock:
+        await _run_release_expired_drafts()
+
+
+async def _run_release_expired_drafts():
     logger.info("Running expired drafts cleanup worker...")
     async with AsyncSessionLocal() as db:
         now = get_ist_now()
         
-        # Find all expired drafts
-        query = select(BookingDraft).where(BookingDraft.expires_at < now).with_for_update()
+        # Find expired drafts in bounded batches without waiting on locked rows
+        query = (
+            select(BookingDraft)
+            .where(BookingDraft.expires_at < now)
+            .with_for_update(skip_locked=True)
+            .limit(50)
+        )
         result = await db.execute(query)
         drafts = result.scalars().all()
         
