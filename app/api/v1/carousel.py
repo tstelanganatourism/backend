@@ -58,7 +58,8 @@ async def get_carousel_slides(
     The carousel will show all slides added by the administrator.
     """
     from app.core.memory_cache import get_mem_cached, set_mem_cached
-    set_public_cache_headers(response)
+    from app.utils.cache import set_no_store_headers
+    set_no_store_headers(response)
 
     cached = get_mem_cached("carousel", "slides")
     if cached is not None:

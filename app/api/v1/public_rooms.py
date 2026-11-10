@@ -61,7 +61,8 @@ async def get_rooms(
     Returns a paginated list of active rooms/lodges.
     """
     cache_key = f"rooms:list:{page}:{size}:{is_featured}:{cat or ''}:{tuple(facilities or [])}:{sort}:{q or ''}"
-    set_public_cache_headers(response, max_age=60, stale_while_revalidate=300)
+    from app.utils.cache import set_no_store_headers
+    set_no_store_headers(response)
 
     from app.core.memory_cache import get_mem_cached, set_mem_cached
     mem_key = f"{page}:{size}:{is_featured}:{cat or ''}:{tuple(facilities or [])}:{sort}:{q or ''}"
@@ -212,9 +213,10 @@ async def list_room_categories(
 ):
     """Returns all active room categories for /stays landing page."""
     from app.core.memory_cache import get_mem_cached, set_mem_cached
+    from app.utils.cache import set_no_store_headers
     cached = get_mem_cached("room_cats", "all")
     if cached is not None:
-        set_public_cache_headers(response)
+        set_no_store_headers(response)
         return cached
 
     result = await db.execute(
@@ -249,7 +251,7 @@ async def list_room_categories(
             min_price=min_price,
         ))
     set_mem_cached("room_cats", "all", out, ttl_seconds=60)
-    set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
+    set_no_store_headers(response)
     return out
 
 @router.get("/categories/{cat_slug}", response_model=RoomCategoryDetailPublicDTO, tags=["Public Discovery - Room Categories"])
@@ -260,9 +262,10 @@ async def get_room_category(
 ):
     """Returns a single room category with its rooms for /stays/categories/{slug}."""
     from app.core.memory_cache import get_mem_cached, set_mem_cached
+    from app.utils.cache import set_no_store_headers
     cached = get_mem_cached("room_cat_detail", cat_slug.lower())
     if cached is not None:
-        set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
+        set_no_store_headers(response)
         return cached
     result = await db.execute(
         select(RoomCategory)
@@ -308,7 +311,7 @@ async def get_room_category(
         rooms=rooms_dto,
     )
     set_mem_cached("room_cat_detail", cat_slug.lower(), result_dto, ttl_seconds=60)
-    set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
+    set_no_store_headers(response)
     return result_dto
 
 
@@ -324,7 +327,8 @@ async def get_room_detail(
     Returns full details for a specific room including rich content.
     """
     cache_key = f"rooms:detail:{slug}"
-    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
+    from app.utils.cache import set_no_store_headers
+    set_no_store_headers(response)
 
     from app.core.memory_cache import get_mem_cached, set_mem_cached
     cached_mem = get_mem_cached("room_detail", slug.lower())

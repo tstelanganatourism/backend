@@ -105,8 +105,10 @@ def set_public_cache_headers(response, max_age: int = 60, stale_while_revalidate
     )
 
 def set_no_store_headers(response) -> None:
-    response.headers["Cache-Control"] = "no-store, max-age=0"
+    response.headers["Cache-Control"] = "private, no-cache, no-store, max-age=0, must-revalidate"
     response.headers["Pragma"] = "no-cache"
+    response.headers["CDN-Cache-Control"] = "no-store"
+    response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
 
 def clear_cache_prefix(prefix: str) -> None:
     """
