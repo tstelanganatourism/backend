@@ -199,6 +199,7 @@ class RoomListDTO(AppBaseModel):
     id: int
     slug: str
     lodge_name: str
+    public_title: Optional[str] = None
     cover_image_url: Optional[str] = None
     video_url: Optional[str] = None  # Primary highlight video (Cloudinary)
     is_featured: bool

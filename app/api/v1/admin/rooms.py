@@ -21,14 +21,74 @@ from app.utils.cache import clear_cache_prefix, clear_cache_prefix_async
 from pydantic import BaseModel, ConfigDict
 import re
 
-from sqlalchemy.orm import selectinload
-from app.models.enums import AdvancePaymentType
+from sqlalchemy.orm import selectinload, with_loader_criteria
+from app.models.enums import AdvancePaymentType, PublishStatus
+import time as _time_mod
 
 router = APIRouter(
     prefix="/rooms",
     tags=["Admin - Room CMS"],
     dependencies=[Depends(require_admin)]
 )
+
+
+async def purge_room_caches(
+    db: Optional[AsyncSession] = None,
+    room_id: Optional[int] = None,
+    slugs: Optional[List[str]] = None,
+    category_slugs: Optional[List[str]] = None,
+) -> None:
+    """
+    Purge every cache layer for accommodations & room categories:
+    1. In-process LRU/TTL memory_cache (`rooms_list`, `room_detail`, `room_cats`, `room_cat_detail`, `carousel`)
+    2. Redis + utility `_mem_cache` (`rooms:`, `carousel:`, `room_cat_`)
+    3. Next.js On-Demand ISR Revalidation webhook (`/api/revalidate`)
+    """
+    try:
+        from app.core.memory_cache import invalidate_mem_cached
+        for ns in ("rooms_list", "room_detail", "room_cats", "room_cat_detail", "carousel", "public_stats"):
+            invalidate_mem_cached(ns)
+    except Exception:
+        pass
+
+    try:
+        await clear_cache_prefix_async("rooms:")
+        await clear_cache_prefix_async("carousel:")
+        await clear_cache_prefix_async("room_cat_")
+    except Exception:
+        pass
+
+    tags = ["rooms", "stays", "categories", "room-categories", "carousel"]
+    paths = ["/", "/stays", "/rooms"]
+
+    if room_id:
+        tags.append(f"room-{room_id}")
+    if slugs:
+        for s in slugs:
+            if s:
+                tags.extend([f"room:{s}", f"stay:{s}", f"room-{s}"])
+                paths.extend([f"/stays/{s}", f"/rooms/{s}"])
+
+    resolved_cat_slugs = list(category_slugs or [])
+    if db is not None and not resolved_cat_slugs:
+        try:
+            cat_rows = await db.execute(
+                select(RoomCategory.slug).where(RoomCategory.deleted_at.is_(None))
+            )
+            resolved_cat_slugs = [row[0] for row in cat_rows.all() if row[0]]
+        except Exception:
+            pass
+
+    for cs in resolved_cat_slugs:
+        if cs:
+            tags.extend([f"room-category:{cs}", "categories", "room-categories"])
+            paths.append(f"/stays/categories/{cs}")
+
+    try:
+        from app.utils.cache import trigger_frontend_revalidation
+        trigger_frontend_revalidation(tags=list(set(tags)), paths=list(set(paths)))
+    except Exception:
+        pass
 
 def slugify(text: str) -> str:
     text = text.lower().strip()
@@ -64,14 +124,66 @@ async def sync_nested_relation(db: AsyncSession, room: Room, relation_name: str,
             
     setattr(room, relation_name, new_list)
 
+async def sync_room_variants(db: AsyncSession, room: Room, input_variants: Optional[List[any]]) -> None:
+    """
+    Sync RoomVariant rows cleanly without breaking FK references on existing bookings.
+    If a previously existing variant has bookings, soft-delete it instead of orphan-deleting.
+    """
+    if input_variants is None:
+        return
+
+    from app.models.booking import Booking
+    from datetime import datetime, timezone
+
+    current_list = list(getattr(room, "variants", []) or [])
+    current_map = {item.id: item for item in current_list if item.id is not None}
+    kept_ids = set()
+    new_list = []
+
+    for input_data in input_variants:
+        data = input_data if isinstance(input_data, dict) else input_data.model_dump()
+        item_id = data.get("id")
+        if item_id and item_id in current_map:
+            item = current_map[item_id]
+            for key, val in data.items():
+                if key != "id":
+                    setattr(item, key, val)
+            item.deleted_at = None
+            kept_ids.add(item_id)
+            new_list.append(item)
+        else:
+            data.pop("id", None)
+            new_list.append(RoomVariant(**data))
+
+    removed_ids = [vid for vid in current_map if vid not in kept_ids]
+    if removed_ids:
+        booked_res = await db.execute(
+            select(Booking.room_variant_id)
+            .where(Booking.room_variant_id.in_(removed_ids))
+            .distinct()
+        )
+        booked_ids = {row[0] for row in booked_res.all()}
+        now_ts = datetime.now(timezone.utc)
+        for vid in removed_ids:
+            if vid in booked_ids:
+                item = current_map[vid]
+                item.is_active = False
+                item.deleted_at = now_ts
+                new_list.append(item)
+
+    setattr(room, "variants", new_list)
+
+
 class RoomUpdate(BaseModel):
     lodge_name: Optional[str] = None
+    public_title: Optional[str] = None
     slug: Optional[str] = None
     description: Optional[str] = None
     address: Optional[str] = None
     map_url: Optional[str] = None
     facilities: Optional[List[str]] = None
     cover_image_url: Optional[str] = None
+    video_url: Optional[str] = None
     total_rooms: Optional[int] = None
     slot_start: Optional[time] = None
     slot_end: Optional[time] = None
@@ -88,6 +200,7 @@ class RoomUpdate(BaseModel):
     og_image_url: Optional[str] = None
     canonical_url: Optional[str] = None
     booking_slots: Optional[List[RoomBookingSlotSchema]] = None
+    category_ids: Optional[List[int]] = None
 
     variants: Optional[List[RoomVariantInput]] = None
     gallery: Optional[List[RoomGalleryImageInput]] = None
@@ -116,9 +229,16 @@ async def list_rooms(
     base_query = select(Room).where(Room.deleted_at.is_(None))
     
     if search:
-        fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
+        fts_vector = func.to_tsvector(
+            text("'english'::regconfig"),
+            func.coalesce(Room.public_title, '') + ' ' + Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, '')
+        )
         base_query = base_query.where(
-            fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), search))
+            or_(
+                fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), search)),
+                func.coalesce(Room.public_title, '').ilike(f"%{search}%"),
+                Room.lodge_name.ilike(f"%{search}%"),
+            )
         )
         
     if status_filter:
@@ -130,7 +250,9 @@ async def list_rooms(
 
     query = base_query.options(
         selectinload(Room.variants),
-        selectinload(Room.categories)
+        selectinload(Room.categories),
+        with_loader_criteria(RoomCategory, RoomCategory.deleted_at.is_(None), include_aliases=True),
+        with_loader_criteria(RoomVariant, RoomVariant.deleted_at.is_(None), include_aliases=True),
     )
     query = query.order_by(Room.order_priority.asc(), Room.id.asc()).limit(limit).offset(offset)
     
@@ -173,7 +295,9 @@ def full_room_options():
         selectinload(Room.gallery),
         selectinload(Room.highlights),
         selectinload(Room.faqs),
-        selectinload(Room.policies)
+        selectinload(Room.policies),
+        with_loader_criteria(RoomCategory, RoomCategory.deleted_at.is_(None), include_aliases=True),
+        with_loader_criteria(RoomVariant, RoomVariant.deleted_at.is_(None), include_aliases=True),
     )
 
 
@@ -209,6 +333,7 @@ async def list_room_categories(db: AsyncSession = Depends(get_db)):
             rooms=[RoomResponse(
                 id=r.id,
                 lodge_name=r.lodge_name,
+                public_title=r.public_title,
                 slug=r.slug,
                 description=r.description,
                 address=r.address,
@@ -242,8 +367,7 @@ async def create_room_category(
     slug = body.slug or slugify(body.name)
     existing = await db.execute(select(RoomCategory).where(RoomCategory.slug == slug, RoomCategory.deleted_at.is_(None)))
     if existing.scalar_one_or_none():
-        import time as _time
-        slug = f"{slug}-{int(_time.time())}"
+        slug = f"{slug}-{int(_time_mod.time())}"
     cat = RoomCategory(
         name=body.name,
         slug=slug,
@@ -256,7 +380,7 @@ async def create_room_category(
     db.add(cat)
     await db.commit()
     await db.refresh(cat)
-    await clear_cache_prefix_async("rooms:")
+    await purge_room_caches(db, category_slugs=[cat.slug])
     return RoomCategoryResponse(
         id=cat.id, name=cat.name, slug=cat.slug,
         description=cat.description, cover_image_url=cat.cover_image_url,
@@ -271,20 +395,26 @@ async def update_room_category(
     db: AsyncSession = Depends(get_db)
 ):
     """Update a room category."""
-    result = await db.execute(select(RoomCategory).where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None)))
+    result = await db.execute(
+        select(RoomCategory)
+        .where(RoomCategory.id == category_id, RoomCategory.deleted_at.is_(None))
+        .options(selectinload(RoomCategory.rooms))
+    )
     cat = result.scalar_one_or_none()
     if not cat:
         raise HTTPException(status_code=404, detail="Room category not found")
+    old_slug = cat.slug
     for key, val in body.model_dump(exclude_none=True).items():
         setattr(cat, key, val)
     await db.commit()
     await db.refresh(cat)
-    await clear_cache_prefix_async("rooms:")
+    await purge_room_caches(db, category_slugs=[old_slug, cat.slug])
+    active_count = len([r for r in cat.rooms if not r.deleted_at])
     return RoomCategoryResponse(
         id=cat.id, name=cat.name, slug=cat.slug,
         description=cat.description, cover_image_url=cat.cover_image_url,
         icon=cat.icon, sort_order=cat.sort_order, is_active=cat.is_active,
-        room_count=0,
+        room_count=active_count,
     )
 
 @room_category_router.delete("/{category_id}", status_code=204)
@@ -298,9 +428,10 @@ async def delete_room_category(
     if not cat:
         raise HTTPException(status_code=404, detail="Room category not found")
     from datetime import datetime, timezone
+    cat_slug = cat.slug
     cat.deleted_at = datetime.now(timezone.utc)
     await db.commit()
-    await clear_cache_prefix_async("rooms:")
+    await purge_room_caches(db, category_slugs=[cat_slug])
 
 @room_category_router.post("/{category_id}/rooms", status_code=200)
 async def assign_rooms_to_category(
@@ -320,7 +451,7 @@ async def assign_rooms_to_category(
         if room.id not in existing_ids:
             cat.rooms.append(room)
     await db.commit()
-    await clear_cache_prefix_async("rooms:")
+    await purge_room_caches(db, slugs=[r.slug for r in rooms], category_slugs=[cat.slug])
     return {"assigned": len(rooms)}
 
 @room_category_router.delete("/{category_id}/rooms/{room_id}", status_code=200)
@@ -334,9 +465,10 @@ async def remove_room_from_category(
     cat = result.scalar_one_or_none()
     if not cat:
         raise HTTPException(status_code=404, detail="Room category not found")
+    removed_slugs = [r.slug for r in cat.rooms if r.id == room_id and r.slug]
     cat.rooms = [r for r in cat.rooms if r.id != room_id]
     await db.commit()
-    await clear_cache_prefix_async("rooms:")
+    await purge_room_caches(db, slugs=removed_slugs, category_slugs=[cat.slug])
     return {"removed": room_id}
 
 router.include_router(room_category_router)
@@ -367,11 +499,19 @@ async def reorder_rooms(
         )
     await db.commit()
     
-    from app.core.memory_cache import clear_mem_cache
-    clear_mem_cache("rooms_list")
-    clear_mem_cache("room_cat_detail")
+    await purge_room_caches(db)
     
     return {"status": "success", "updated": len(items)}
+
+
+@router.post("/cache/clear", status_code=200)
+async def clear_rooms_cache(
+    db: AsyncSession = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """Admin endpoint to flush all room and category caches and revalidate storefront."""
+    await purge_room_caches(db)
+    return {"status": "success", "message": "All room and category caches purged and storefront revalidation triggered."}
 
 
 @router.get("/{room_id}", response_model=RoomDetailResponse)
@@ -403,16 +543,23 @@ async def create_room(
     current_admin: User = Depends(require_admin)
 ):
     """Create a new room/lodge with all nested relations in one transaction."""
-    slug = slugify(body.slug) if body.slug else slugify(body.lodge_name)
+    title_for_slug = body.public_title or body.lodge_name
+    slug = slugify(body.slug) if body.slug else slugify(title_for_slug)
     
     existing = await db.execute(select(Room).where(Room.slug == slug))
     if existing.scalar_one_or_none():
-        slug = f"{slug}-{int(func.now().select().scalar_one().timestamp())}"
+        slug = f"{slug}-{int(_time_mod.time())}"
         
     room_data = body.model_dump(exclude={
-        "variants", "gallery", "highlights", "faqs", "policies"
+        "variants", "gallery", "highlights", "faqs", "policies", "category_ids"
     })
     room_data["slug"] = slug
+    if room_data.get("public_title"):
+        room_data["public_title"] = str(room_data["public_title"]).strip() or None
+    elif room_data.get("lodge_name"):
+        from app.utils.room_display import looks_like_vendor_name
+        if not looks_like_vendor_name(room_data["lodge_name"]):
+            room_data["public_title"] = str(room_data["lodge_name"]).strip()
     
     # Auto-seed default office address & map if not specified
     if not room_data.get("address"):
@@ -433,6 +580,12 @@ async def create_room(
     await sync_nested_relation(db, room, "highlights", RoomHighlight, valid_highlights)
     await sync_nested_relation(db, room, "faqs", RoomFAQ, valid_faqs)
     await sync_nested_relation(db, room, "policies", RoomPolicy, valid_policies)
+
+    if body.category_ids:
+        cat_res = await db.execute(
+            select(RoomCategory).where(RoomCategory.id.in_(body.category_ids), RoomCategory.deleted_at.is_(None))
+        )
+        room.categories = list(cat_res.scalars().all())
 
     # Compute starting_price
     room.starting_price = min(
@@ -458,13 +611,10 @@ async def create_room(
         action="CREATE_ROOM",
         entity_type="Room",
         entity_id=str(room.id),
-        details={"lodge_name": room.lodge_name, "slug": room.slug}
+        details={"lodge_name": room.lodge_name, "public_title": room.public_title, "slug": room.slug}
     )
     await db.commit()
-    clear_cache_prefix("rooms:")
-    clear_cache_prefix("carousel:")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
+    await purge_room_caches(db, room_id=room.id, slugs=[room.slug])
     
     return room
 
@@ -491,9 +641,12 @@ async def update_room(
         )
         
     update_data = body.model_dump(exclude_unset=True, exclude={
-        "variants", "gallery", "highlights", "faqs", "policies"
+        "variants", "gallery", "highlights", "faqs", "policies", "category_ids"
     })
     
+    if "public_title" in update_data and update_data["public_title"] is not None:
+        update_data["public_title"] = str(update_data["public_title"]).strip() or None
+
     if "slug" in update_data and update_data["slug"]:
         update_data["slug"] = slugify(update_data["slug"])
         if update_data["slug"] != room.slug:
@@ -511,7 +664,7 @@ async def update_room(
         
     # Sync child relations if provided (filtering out empty/blank entries)
     if body.variants is not None:
-        await sync_nested_relation(db, room, "variants", RoomVariant, body.variants)
+        await sync_room_variants(db, room, body.variants)
     if body.gallery is not None:
         valid_gallery = [g for g in body.gallery if getattr(g, 'image_url', None) and str(g.image_url).strip()]
         await sync_nested_relation(db, room, "gallery", RoomGalleryImage, valid_gallery)
@@ -524,8 +677,13 @@ async def update_room(
     if body.policies is not None:
         valid_policies = [p for p in body.policies if getattr(p, 'title', None) and str(p.title).strip() and getattr(p, 'description', None) and str(p.description).strip()]
         await sync_nested_relation(db, room, "policies", RoomPolicy, valid_policies)
+    if body.category_ids is not None:
+        cat_res = await db.execute(
+            select(RoomCategory).where(RoomCategory.id.in_(body.category_ids), RoomCategory.deleted_at.is_(None))
+        )
+        room.categories = list(cat_res.scalars().all())
 
-    # Recompute starting_price
+    # Recompute starting_price from active non-deleted variants
     room.starting_price = min(
         (v.weekday_price for v in room.variants if v.is_active and not getattr(v, 'deleted_at', None) and getattr(v, 'weekday_price', 0) > 0),
         default=0
@@ -537,17 +695,16 @@ async def update_room(
 
     await db.commit()
     
-    from app.core.memory_cache import clear_mem_cache
-    clear_mem_cache("rooms_list")
-    clear_mem_cache("room_cat_detail")
-    
+    audit_details = body.model_dump(mode="json", exclude_unset=True, exclude={
+        "variants", "gallery", "highlights", "faqs", "policies"
+    })
     await log_action(
         db=db,
         user_id=current_admin.id,
         action="UPDATE_ROOM",
         entity_type="Room",
         entity_id=str(room.id),
-        details=update_data
+        details=audit_details
     )
     await db.commit()
     
@@ -564,12 +721,7 @@ async def update_room(
         }
         await sse_manager.broadcast_event("room", str(room.id), "ENTITY_STATUS_UPDATE", sse_payload)
         
-    clear_cache_prefix("rooms:list:")
-    clear_cache_prefix(f"rooms:detail:{old_slug}")
-    clear_cache_prefix(f"rooms:detail:{room.slug}")
-    clear_cache_prefix("carousel:")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
+    await purge_room_caches(db, room_id=room.id, slugs=[old_slug, room.slug])
     
     # Reload room with all options to prevent expired attributes during Pydantic serialization
     refresh_query = select(Room).where(Room.id == room.id).options(*full_room_options())
@@ -603,7 +755,7 @@ async def delete_room(
         action="DELETE_ROOM",
         entity_type="Room",
         entity_id=str(room.id),
-        details={"lodge_name": room.lodge_name}
+        details={"lodge_name": room.lodge_name, "public_title": room.public_title}
     )
     await db.commit()
     
@@ -619,10 +771,7 @@ async def delete_room(
     }
     await sse_manager.broadcast_event("room", str(room_id), "ENTITY_STATUS_UPDATE", sse_payload)
     
-    clear_cache_prefix("rooms:list:")
-    clear_cache_prefix(f"rooms:detail:{room.slug}")
-    from app.utils.cache import trigger_frontend_revalidation
-    trigger_frontend_revalidation(tags=[f"room-{room.id}"])
+    await purge_room_caches(db, room_id=room.id, slugs=[room.slug])
     
     return None
 

@@ -87,6 +87,7 @@ class RoomPolicyInput(AppBaseModel):
 
 class RoomBase(AppBaseModel):
     lodge_name: str
+    public_title: Optional[str] = None
     slug: Optional[str] = None
     description: Optional[str] = None
     address: Optional[str] = None
@@ -117,6 +118,7 @@ class RoomCreate(RoomBase):
     highlights: List[RoomHighlightInput] = []
     faqs: List[RoomFAQInput] = []
     policies: List[RoomPolicyInput] = []
+    category_ids: Optional[List[int]] = None
 
 class RoomCategorySlimDTO(AppBaseModel):
     id: int

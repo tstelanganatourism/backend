@@ -742,9 +742,14 @@ async def generate_room_inventory(
         clear_cache_prefix(f"rooms:detail:{slug}")
         import asyncio
         from app.services.redis_client import invalidate_cached_availability
+        from app.core.memory_cache import invalidate_mem_cached
+        invalidate_mem_cached("room_detail", slug.lower())
         asyncio.create_task(invalidate_cached_availability(slug))
         from app.utils.cache import trigger_frontend_revalidation
-        trigger_frontend_revalidation(tags=[f"room-{slug}"])
+        trigger_frontend_revalidation(
+            tags=["rooms", "stays", f"room:{slug}", f"stay:{slug}", f"room-{slug}"],
+            paths=["/stays", "/rooms", f"/stays/{slug}", f"/rooms/{slug}"],
+        )
 
         # Broadcast SSE for newly created or restored room inventory slots
         if created > 0:
@@ -918,9 +923,14 @@ async def update_room_inventory_row(
                     slug, room_id = slug_row[0], slug_row[1]
                     clear_cache_prefix(f"rooms:detail:{slug}")
                     from app.services.redis_client import invalidate_cached_availability
+                    from app.core.memory_cache import invalidate_mem_cached
+                    invalidate_mem_cached("room_detail", slug.lower())
                     await invalidate_cached_availability(slug)
                     from app.utils.cache import trigger_frontend_revalidation
-                    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+                    trigger_frontend_revalidation(
+                        tags=["rooms", "stays", f"room:{slug}", f"stay:{slug}", f"room-{slug}"],
+                        paths=["/stays", "/rooms", f"/stays/{slug}", f"/rooms/{slug}"],
+                    )
 
                     import time
                     from app.core.timezone import get_ist_now
@@ -1017,9 +1027,14 @@ async def delete_room_inventory_row(
                     slug, room_id = slug_row[0], slug_row[1]
                     clear_cache_prefix(f"rooms:detail:{slug}")
                     from app.services.redis_client import invalidate_cached_availability
+                    from app.core.memory_cache import invalidate_mem_cached
+                    invalidate_mem_cached("room_detail", slug.lower())
                     await invalidate_cached_availability(slug)
                     from app.utils.cache import trigger_frontend_revalidation
-                    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+                    trigger_frontend_revalidation(
+                        tags=["rooms", "stays", f"room:{slug}", f"stay:{slug}", f"room-{slug}"],
+                        paths=["/stays", "/rooms", f"/stays/{slug}", f"/rooms/{slug}"],
+                    )
 
                     import time
                     from app.core.timezone import get_ist_now
@@ -1704,8 +1719,13 @@ async def bulk_action_room_inventory(
     
     slug, room_id = room_obj.slug, room_obj.id
     await clear_cache_prefix_async(f"rooms:detail:{slug}")
+    from app.core.memory_cache import invalidate_mem_cached
+    invalidate_mem_cached("room_detail", slug.lower())
     asyncio.create_task(invalidate_cached_availability(slug))
-    trigger_frontend_revalidation(tags=[f"room-{slug}"])
+    trigger_frontend_revalidation(
+        tags=["rooms", "stays", f"room:{slug}", f"stay:{slug}", f"room-{slug}"],
+        paths=["/stays", "/rooms", f"/stays/{slug}", f"/rooms/{slug}"],
+    )
     
     # Broadcast SSE updates for modified rows
     if updated > 0:

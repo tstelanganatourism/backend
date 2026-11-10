@@ -418,12 +418,42 @@ async def get_booking_sms_payload(
 
         # ── 4b. Room booking ──────────────────────────────────────────────────
         elif booking.room_variant_id:
-            from app.models.room import RoomVariant
-            rv_stmt = _select(RoomVariant).where(RoomVariant.id == booking.room_variant_id)
+            from app.models.room import RoomVariant, Room, RoomSlotInventory
+            from app.utils.room_display import resolve_post_booking_hotel_details
+            rv_stmt = (
+                _select(RoomVariant, Room)
+                .join(Room, Room.id == RoomVariant.room_id)
+                .where(RoomVariant.id == booking.room_variant_id)
+            )
             rv_res = await db.execute(rv_stmt)
-            rv = rv_res.scalar_one_or_none()
-            lodge_name = rv.lodge_name if rv else "Lodge Stay"
-            room_name = rv.variant_name if rv else "Room"
+            rv_row = rv_res.first()
+            rv = rv_row[0] if rv_row else None
+            room_obj = rv_row[1] if rv_row else None
+
+            inv_stmt = _select(RoomSlotInventory).where(
+                RoomSlotInventory.room_variant_id == booking.room_variant_id,
+                RoomSlotInventory.date == booking.travel_date,
+            )
+            snap = booking.pricing_snapshot or {}
+            if snap.get("slot_start") and snap.get("slot_end"):
+                try:
+                    from datetime import datetime as _dt
+                    s_t = _dt.strptime(snap["slot_start"], "%H:%M:%S").time()
+                    e_t = _dt.strptime(snap["slot_end"], "%H:%M:%S").time()
+                    inv_stmt = inv_stmt.where(
+                        RoomSlotInventory.slot_start == s_t,
+                        RoomSlotInventory.slot_end == e_t,
+                    )
+                except Exception:
+                    pass
+            inv_row = (await db.execute(inv_stmt)).scalars().first()
+            hotel_info = resolve_post_booking_hotel_details(room_obj, inv_row, snap)
+            lodge_name = hotel_info["hotel_name"] or "Lodge Stay"
+            room_name = (
+                (rv.variant_name if rv else None)
+                or (room_obj.public_title if room_obj and room_obj.public_title else None)
+                or "Room"
+            )
 
             sd_stmt = _select(BookingStayDate).where(BookingStayDate.booking_id == booking.id)
             sd_res = await db.execute(sd_stmt)

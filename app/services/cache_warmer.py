@@ -240,6 +240,8 @@ async def warmup_public_cache():
                 rf_by_room = _group_by_room((await db.execute(select(RoomFAQ).where(RoomFAQ.room_id.in_(room_ids), RoomFAQ.deleted_at.is_(None)))).scalars().all())
                 rp_by_room = _group_by_room((await db.execute(select(RoomPolicy).where(RoomPolicy.room_id.in_(room_ids), RoomPolicy.deleted_at.is_(None)))).scalars().all())
 
+            from app.utils.room_display import get_public_room_title, get_public_room_address
+
             for r in rooms:
                 r_variants = rv_by_room.get(r.id, [])
                 r_gallery = rg_by_room.get(r.id, [])
@@ -247,12 +249,15 @@ async def warmup_public_cache():
                 r_faqs = rf_by_room.get(r.id, [])
                 r_policies = rp_by_room.get(r.id, [])
 
+                display_title = get_public_room_title(r, [v.variant_name for v in r_variants])
                 starting_price = min((v.weekday_price for v in r_variants), default=None)
+                starting_weekend_price = min((v.weekend_price for v in r_variants), default=None)
                 room_dto = RoomDetailDTO(
-                    id=r.id, slug=r.slug, lodge_name=r.lodge_name,
+                    id=r.id, slug=r.slug, lodge_name=display_title, public_title=display_title,
                     cover_image_url=r.cover_image_url, video_url=r.video_url,
                     is_featured=r.is_featured, starting_price=starting_price,
-                    address=r.address, map_url=r.map_url, facilities=r.facilities or [],
+                    starting_weekend_price=starting_weekend_price,
+                    address=get_public_room_address(r), map_url=None, facilities=r.facilities or [],
                     description=r.description,
                     brochure_pdf_url=r.brochure_pdf_url or r.generated_brochure_url,
                     generated_brochure_url=r.generated_brochure_url,

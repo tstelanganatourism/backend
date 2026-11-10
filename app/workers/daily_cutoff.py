@@ -318,16 +318,24 @@ async def _run_daily_cutoff():
 
                 cust_name = (cust_full_name or "Customer").split()[0]
                 
-                # Fetch lodge and checkin details
+                # Fetch lodge and checkin details (inventory/snapshot override -> Room default lodge_name)
                 r_var = bk.room_variant
                 r_room = r_var.room if r_var else None
-                
+                snap = bk.pricing_snapshot or {}
+
                 if r_room:
-                    lodge_name = r_room.lodge_name or "Lodge Stay"
+                    from app.models.room import RoomSlotInventory
+                    inv_q = await db.execute(
+                        select(RoomSlotInventory.hotel_name).where(
+                            RoomSlotInventory.room_variant_id == bk.room_variant_id,
+                            RoomSlotInventory.date == bk.travel_date,
+                        )
+                    )
+                    inv_hotel = inv_q.scalars().first()
+                    lodge_name = (inv_hotel or snap.get("hotel_name") or r_room.lodge_name or "Lodge Stay")
                     checkin_time = r_room.slot_start.strftime("%I:%M %p") if r_room.slot_start else "11:00 AM"
                 else:
-                    snap = bk.pricing_snapshot or {}
-                    lodge_name = snap.get("room_title") or snap.get("room_name") or "Lodge Stay"
+                    lodge_name = snap.get("hotel_name") or snap.get("room_title") or snap.get("room_name") or "Lodge Stay"
                     checkin_time = "11:00 AM"
 
                 checkin_date_str = bk.travel_date.strftime("%d-%b-%Y")

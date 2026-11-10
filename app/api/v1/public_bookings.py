@@ -1980,17 +1980,10 @@ async def get_booking_details(
         inv_res = await db.execute(inv_stmt)
         inv_row = inv_res.scalars().first()
         
-        # Keep package_title as original Lodge Name
+        # Default to room's default lodge_name, overridden by frozen snapshot and live inventory allocation
         package_title = row[3] or "Godavari Riverside Bamboo Huts"
         hotel_name = package_title
 
-        if inv_row:
-            if inv_row.hotel_name:
-                hotel_name = inv_row.hotel_name
-            if inv_row.hotel_address:
-                room_address = inv_row.hotel_address
-            if inv_row.hotel_map_url:
-                room_map_url = inv_row.hotel_map_url
         if b.pricing_snapshot:
             if b.pricing_snapshot.get('hotel_name'):
                 hotel_name = b.pricing_snapshot.get('hotel_name')
@@ -1998,6 +1991,13 @@ async def get_booking_details(
                 room_address = b.pricing_snapshot.get('hotel_address')
             if b.pricing_snapshot.get('hotel_map_url'):
                 room_map_url = b.pricing_snapshot.get('hotel_map_url')
+        if inv_row:
+            if inv_row.hotel_name:
+                hotel_name = inv_row.hotel_name
+            if inv_row.hotel_address:
+                room_address = inv_row.hotel_address
+            if inv_row.hotel_map_url:
+                room_map_url = inv_row.hotel_map_url
     
     room_checkout_date = None
     room_highlights = []

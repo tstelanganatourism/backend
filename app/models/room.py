@@ -49,6 +49,7 @@ class Room(BaseModel, SEOMixin):
     __tablename__ = "rooms"
 
     lodge_name = Column(String, nullable=False, index=True)
+    public_title = Column(String, nullable=True, index=True)
     slug = Column(String, unique=True, nullable=False, index=True)
     description = Column(String, nullable=True)
     address = Column(String, nullable=True)

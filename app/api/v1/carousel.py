@@ -153,10 +153,12 @@ async def get_carousel_slides(
         ))
 
     # Fetch featured rooms (PUBLISHED + is_featured=True)
+    from app.utils.room_display import get_public_room_title, get_public_room_address
     room_result = await db.execute(
         select(
             Room.slug,
             Room.lodge_name,
+            Room.public_title,
             Room.description,
             Room.cover_image_url,
             Room.starting_price,
@@ -178,7 +180,7 @@ async def get_carousel_slides(
         desc = html.unescape(desc)
         desc = re.sub(r'<[^>]+>', '', desc).strip()
         desc = desc[:180] + "..." if len(desc) > 180 else desc
-        title = html.unescape(room.lodge_name or "")
+        title = html.unescape(get_public_room_title(room))
 
         slides.append(CarouselSlide(
             type="room",
@@ -188,7 +190,7 @@ async def get_carousel_slides(
             cover_image_url=room.cover_image_url,
             starting_price=room.starting_price,
             starting_weekend_price=room.starting_weekend_price,
-            address=room.address,
+            address=get_public_room_address(room),
         ))
 
     set_mem_cached("carousel", "slides", slides, ttl_seconds=CAROUSEL_CACHE_TTL)

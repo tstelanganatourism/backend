@@ -10,6 +10,7 @@ from decimal import Decimal
 from app.db.session import get_db
 from app.models.room import Room, RoomVariant, RoomSlotInventory, RoomCategory
 from app.schemas.public import PaginatedResponse, RoomListDTO, RoomDetailDTO, RoomVariantPublicDTO, RoomCategoryPublicDTO, RoomCategoryDetailPublicDTO
+from app.utils.room_display import get_public_room_title, get_public_room_address
 from app.utils.cache import set_no_store_headers, set_public_cache_headers, ttl_cache_get_or_set
 from app.models.enums import PublishStatus
 from app.middleware.auth import get_current_user_optional
@@ -39,50 +40,9 @@ class RoomAvailabilityResponse(BaseModel):
     dates: List[RoomDateAvailability]
 
 def format_room_type_title(slug: str, variant_names: List[str], fallback: str = "Deluxe Riverside Stay") -> str:
-    """
-    Business rule: Do NOT expose the backend lodge/hotel vendor name on public discovery.
-    Public discovery must only display the room type/category (e.g. 'Family Mini Suite A/C',
-    '3-Bed', '2-Bed Luxury Suite', 'AC Deluxe Room'). The specific lodge/hotel name is only
-    assigned in inventory or default, and only revealed to users upon booking in their ticket,
-    email, and SMS.
-    """
-    slug_lower = (slug or '').lower()
-    # 1. If slug itself explicitly describes room type (e.g. family-mini-suite-ac)
-    if any(k in slug_lower for k in ['suite', 'deluxe', 'luxury', 'bed', 'cottage', 'hut', 'room']):
-        parts = slug_lower.split('-')
-        clean_parts = []
-        for p in parts:
-            if p in ('ac', 'a/c'):
-                clean_parts.append('A/C')
-            elif p in ('nonac', 'non-ac'):
-                clean_parts.append('Non-A/C')
-            elif p.isdigit():
-                continue
-            else:
-                clean_parts.append(p.capitalize())
-        res = ' '.join(clean_parts).strip()
-        if res:
-            return res
-
-    # 2. Derive from active variant names
-    if variant_names:
-        if len(variant_names) == 1:
-            return variant_names[0]
-        has_suite = any('suite' in v.lower() for v in variant_names)
-        has_deluxe = any('deluxe' in v.lower() for v in variant_names)
-        has_4bed = any('4' in v or 'four' in v.lower() for v in variant_names)
-        has_2bed = any('2' in v or 'two' in v.lower() or 'double' in v.lower() for v in variant_names)
-        has_3bed = any('3' in v or 'three' in v.lower() or 'triple' in v.lower() for v in variant_names)
-
-        if has_suite and has_deluxe:
-            return "Deluxe & Family Suite A/C"
-        if has_2bed and has_4bed:
-            return "2-Bed & 4-Bed A/C Deluxe Room"
-        if has_3bed or has_suite:
-            return "Family Suite & Deluxe A/C"
-        return " / ".join(variant_names[:2])
-
-    return fallback or "Deluxe Riverside Stay"
+    """Backward-compatible wrapper delegating to shared legacy room-title formatter."""
+    from app.utils.room_display import format_legacy_room_type_title
+    return format_legacy_room_type_title(slug, variant_names, fallback)
 
 
 @router.get("", response_model=PaginatedResponse[RoomListDTO])
@@ -91,19 +51,20 @@ async def get_rooms(
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Items per page"),
     is_featured: Optional[bool] = Query(None, description="Filter featured only"),
+    cat: Optional[str] = Query(None, description="Filter by category slug"),
     facilities: Optional[List[str]] = Query(None, description="Filter by facilities"),
     sort: Optional[str] = Query("priority", description="Sort by: priority, price_low, price_high"),
-    q: Optional[str] = Query(None, description="Search term for lodge name/address")
+    q: Optional[str] = Query(None, description="Search term for room title/location")
 ):
     """
     Public Room Discovery API.
     Returns a paginated list of active rooms/lodges.
     """
-    cache_key = f"rooms:list:{page}:{size}:{is_featured}:{tuple(facilities or [])}:{sort}:{q or ''}"
-    set_public_cache_headers(response, max_age=300, stale_while_revalidate=3600)
+    cache_key = f"rooms:list:{page}:{size}:{is_featured}:{cat or ''}:{tuple(facilities or [])}:{sort}:{q or ''}"
+    set_public_cache_headers(response, max_age=60, stale_while_revalidate=300)
 
     from app.core.memory_cache import get_mem_cached, set_mem_cached
-    mem_key = f"{page}:{size}:{is_featured}:{tuple(facilities or [])}:{sort}:{q or ''}"
+    mem_key = f"{page}:{size}:{is_featured}:{cat or ''}:{tuple(facilities or [])}:{sort}:{q or ''}"
     cached_mem = get_mem_cached("rooms_list", mem_key)
     if cached_mem is not None:
         return cached_mem
@@ -123,10 +84,22 @@ async def get_rooms(
             # Filters
             if is_featured is not None:
                 base_query = base_query.where(Room.is_featured == is_featured)
-            if q:
-                fts_vector = func.to_tsvector(text("'english'::regconfig"), Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, ''))
+            if cat:
                 base_query = base_query.where(
-                    fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q))
+                    Room.categories.any(
+                        and_(RoomCategory.slug == cat, RoomCategory.is_active == True, RoomCategory.deleted_at.is_(None))
+                    )
+                )
+            if q:
+                fts_vector = func.to_tsvector(
+                    text("'english'::regconfig"),
+                    func.coalesce(Room.public_title, '') + ' ' + Room.lodge_name + ' ' + func.coalesce(Room.address, '') + ' ' + func.coalesce(Room.description, '')
+                )
+                base_query = base_query.where(
+                    or_(
+                        fts_vector.op('@@')(func.websearch_to_tsquery(text("'english'::regconfig"), q)),
+                        func.coalesce(Room.public_title, '').ilike(f"%{q}%"),
+                    )
                 )
             
             if facilities:
@@ -145,6 +118,7 @@ async def get_rooms(
                     Room.id,
                     Room.slug,
                     Room.lodge_name,
+                    Room.public_title,
                     Room.cover_image_url,
                     Room.video_url,
                     Room.is_featured,
@@ -189,18 +163,19 @@ async def get_rooms(
             # Map to DTOs
             dto_list = []
             for r in rooms:
-                display_title = format_room_type_title(r.slug, variant_map.get(r.id, []), r.lodge_name)
+                display_title = get_public_room_title(r, variant_map.get(r.id, []))
                 dto_list.append(RoomListDTO(
                     id=r.id,
                     slug=r.slug,
                     lodge_name=display_title,
+                    public_title=display_title,
                     cover_image_url=r.cover_image_url,
                     video_url=r.video_url,
                     is_featured=r.is_featured,
                     starting_price=r.starting_price,
                     starting_weekend_price=r.starting_weekend_price,
-                    address=r.address,
-                    map_url=r.map_url,
+                    address=get_public_room_address(r),
+                    map_url=None,
                     facilities=r.facilities if r.facilities else [],
                     order_priority=r.order_priority
                 ))
@@ -251,13 +226,16 @@ async def list_room_categories(
     categories = result.scalars().all()
     out = []
     for cat in categories:
-        room_count = sum(
-            1 for r in cat.rooms
+        published_rooms = [
+            r for r in cat.rooms
             if r.is_active and r.status == PublishStatus.PUBLISHED and not r.deleted_at
-        )
+        ]
+        room_count = len(published_rooms)
+        prices = [float(r.starting_price) for r in published_rooms if r.starting_price is not None and float(r.starting_price) > 0]
+        min_price = min(prices) if prices else None
         cover_image = cat.cover_image_url or DEFAULT_ROOM_CATEGORY_IMAGES.get(cat.slug)
         if not cover_image:
-            for r in cat.rooms:
+            for r in published_rooms:
                 if r.cover_image_url:
                     cover_image = r.cover_image_url
                     break
@@ -268,9 +246,10 @@ async def list_room_categories(
             id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
             cover_image_url=cover_image, icon=cat.icon,
             sort_order=cat.sort_order, room_count=room_count,
+            min_price=min_price,
         ))
-    set_mem_cached("room_cats", "all", out, ttl_seconds=120)
-    set_public_cache_headers(response)
+    set_mem_cached("room_cats", "all", out, ttl_seconds=60)
+    set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
     return out
 
 @router.get("/categories/{cat_slug}", response_model=RoomCategoryDetailPublicDTO, tags=["Public Discovery - Room Categories"])
@@ -283,7 +262,7 @@ async def get_room_category(
     from app.core.memory_cache import get_mem_cached, set_mem_cached
     cached = get_mem_cached("room_cat_detail", cat_slug.lower())
     if cached is not None:
-        set_public_cache_headers(response)
+        set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
         return cached
     result = await db.execute(
         select(RoomCategory)
@@ -299,16 +278,16 @@ async def get_room_category(
         raise HTTPException(status_code=404, detail="Room category not found")
     rooms_dto = []
     for room in cat.rooms:
-        if not (room.status == PublishStatus.PUBLISHED and not room.deleted_at):
+        if not (room.is_active and room.status == PublishStatus.PUBLISHED and not room.deleted_at):
             continue
         v_names = [v.variant_name for v in room.variants if v.is_active and not v.deleted_at]
-        display_title = format_room_type_title(room.slug, v_names, room.lodge_name)
+        display_title = get_public_room_title(room, v_names)
         rooms_dto.append(RoomListDTO(
-            id=room.id, slug=room.slug, lodge_name=display_title,
+            id=room.id, slug=room.slug, lodge_name=display_title, public_title=display_title,
             cover_image_url=room.cover_image_url, video_url=room.video_url,
             is_featured=room.is_featured,
             starting_price=room.starting_price, starting_weekend_price=room.starting_weekend_price,
-            address=room.address, map_url=room.map_url, facilities=room.facilities or [],
+            address=get_public_room_address(room), map_url=None, facilities=room.facilities or [],
             order_priority=room.order_priority,
         ))
     rooms_dto.sort(key=lambda r: (r.order_priority if r.order_priority is not None else 9999, r.id))
@@ -321,13 +300,15 @@ async def get_room_category(
     if not cover_image:
         cover_image = DEFAULT_ROOM_CATEGORY_IMAGES["bhadrachalam-accommodations"]
 
+    cat_prices = [float(r.starting_price) for r in rooms_dto if r.starting_price is not None and float(r.starting_price) > 0]
     result_dto = RoomCategoryDetailPublicDTO(
         id=cat.id, name=cat.name, slug=cat.slug, description=cat.description,
         cover_image_url=cover_image, icon=cat.icon, sort_order=cat.sort_order,
-        room_count=len(rooms_dto), rooms=rooms_dto,
+        room_count=len(rooms_dto), min_price=min(cat_prices) if cat_prices else None,
+        rooms=rooms_dto,
     )
-    set_mem_cached("room_cat_detail", cat_slug.lower(), result_dto, ttl_seconds=120)
-    set_public_cache_headers(response)
+    set_mem_cached("room_cat_detail", cat_slug.lower(), result_dto, ttl_seconds=60)
+    set_public_cache_headers(response, max_age=30, stale_while_revalidate=120)
     return result_dto
 
 
@@ -385,19 +366,22 @@ async def get_room_detail(
         r_policies = await fetch_rel(RoomPolicy)
 
         starting_price = min((v.weekday_price for v in r_variants), default=None)
+        starting_weekend_price = min((v.weekend_price for v in r_variants), default=None)
         active_brochure_url = r.brochure_pdf_url or r.generated_brochure_url
-        display_title = format_room_type_title(r.slug, [v.variant_name for v in r_variants], r.lodge_name)
+        display_title = get_public_room_title(r, [v.variant_name for v in r_variants])
         
         return RoomDetailDTO(
             id=r.id,
             slug=r.slug,
             lodge_name=display_title,
+            public_title=display_title,
             cover_image_url=r.cover_image_url,
             video_url=r.video_url,
             is_featured=r.is_featured,
             starting_price=starting_price,
-            address=r.address,
-            map_url=r.map_url,
+            starting_weekend_price=starting_weekend_price,
+            address=get_public_room_address(r),
+            map_url=None,
             facilities=r.facilities if r.facilities else [],
             description=r.description,
             brochure_pdf_url=active_brochure_url,
