@@ -754,6 +754,9 @@ class AdminCreateBookingRequest(BaseModel):
     service_charge_amount: Optional[float] = None # Direct rupee amount override
     gateway_fee_rate: Optional[float] = None      # Percentage override (e.g. 0.0, 1.0)
     gateway_fee_amount: Optional[float] = None    # Direct rupee amount override
+    # Admin custom price override — bypasses all calculated subtotals/taxes
+    custom_total_amount: Optional[float] = None   # Set a fully custom total (overrides everything)
+    custom_advance_amount: Optional[float] = None # Set a custom advance/partial amount to collect now
 
 
 class AptdcPassengerInput(BaseModel):
@@ -1333,11 +1336,25 @@ async def admin_create_booking(
 
     total_amount = discounted_subtotal + gst_amount + service_charge + gateway_fee
 
+    # ── Custom total override (admin can set any price freely) ──────────────────
+    # When custom_total_amount is provided, it completely overrides the calculated
+    # total. The subtotal/taxes in the snapshot are still kept for reference,
+    # but the booking stores the admin-specified total.
+    if request.custom_total_amount is not None and request.custom_total_amount >= 0:
+        custom_total = Decimal(str(request.custom_total_amount)).quantize(Decimal("0.01"))
+        pricing_snapshot_custom_note = f"Admin custom price override: ₹{custom_total} (calculated would have been ₹{total_amount.quantize(Decimal('0.01'))})"
+        total_amount = custom_total
+
     # Agent commission (if booking under an agent)
     agent_commission = Decimal("0.00")
     agent_id_val = request.agent_id
 
-    paid_amount_val = Decimal(str(request.amount_paid)).quantize(Decimal("0.01")) if request.amount_paid is not None else total_amount
+    # Determine paid amount: priority order:
+    # 1. custom_advance_amount (explicit admin custom advance)
+    # 2. amount_paid (existing field)
+    # 3. default: pay total_amount in full
+    effective_amount_paid = request.custom_advance_amount if request.custom_advance_amount is not None else request.amount_paid
+    paid_amount_val = Decimal(str(effective_amount_paid)).quantize(Decimal("0.01")) if effective_amount_paid is not None else total_amount
     if paid_amount_val < Decimal("0.00"):
         raise HTTPException(status_code=400, detail="Amount paid cannot be negative")
     paid_amount_val = min(paid_amount_val, total_amount)
@@ -1369,6 +1386,10 @@ async def admin_create_booking(
         "booking_mode": "QUICK" if request.quick_booking else "FULL",
         "receipt_style": (getattr(request, 'receipt_style', None) or "STANDARD").upper(),
     }
+    # Embed custom-price note in snapshot if admin overrode the total
+    if request.custom_total_amount is not None and request.custom_total_amount >= 0:
+        pricing_snapshot["admin_price_override"] = True
+        pricing_snapshot["admin_price_override_note"] = locals().get("pricing_snapshot_custom_note", f"Admin custom price override: ₹{total_amount}")
     if transport_snapshot_items:
         pricing_snapshot["transport_selections"] = transport_snapshot_items
 
