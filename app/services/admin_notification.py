@@ -310,9 +310,21 @@ async def send_admin_booking_notification(
 
     base_fare = subtotal_base - refreshment_sub - food_sub - extras_sub - transport_cost
 
+    gst_rate_label = pricing.get("gst_rate", "5")
+    sc_rate_label = pricing.get("service_charge_rate", "1")
+    gw_rate_label = pricing.get("gateway_fee_rate", "0")
+    base_fare_subtext = ""
+    if pricing.get("admin_price_override") and pricing.get("per_ticket_price"):
+        u_count = pricing.get("unit_count", total_guests or 1)
+        per_unit = Decimal(str(pricing.get("per_ticket_price", "0.00")))
+        base_fare_subtext = f"<small style=\"display:block;color:#94a3b8;font-size:11px;\">Custom Rate: ₹{float(per_unit):,.2f} × {u_count}</small>"
+
     fin_rows = f"""
     <tr>
-      <td style="padding:8px 0;font-size:13px;color:#475569;">Package / Base Fare</td>
+      <td style="padding:8px 0;font-size:13px;color:#475569;">
+        Package / Base Fare
+        {base_fare_subtext}
+      </td>
       <td style="padding:8px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(base_fare):,.2f}</td>
     </tr>"""
 
@@ -354,20 +366,21 @@ async def send_admin_booking_notification(
 
     fin_rows += f"""
     <tr>
-      <td style="padding:6px 0;font-size:13px;color:#475569;">GST (5%)</td>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">GST ({gst_rate_label}%)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(gst_amount):,.2f}</td>
     </tr>"""
 
     if float(service_charge) > 0:
         fin_rows += f"""
     <tr>
-      <td style="padding:6px 0;font-size:13px;color:#475569;">Ts Boat Service Charge (1%)</td>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Ts Boat Service Charge ({sc_rate_label}%)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(service_charge):,.2f}</td>
     </tr>"""
 
-    fin_rows += f"""
+    if float(gateway_fee) > 0:
+        fin_rows += f"""
     <tr>
-      <td style="padding:6px 0;font-size:13px;color:#475569;">Gateway Fee (1%)</td>
+      <td style="padding:6px 0;font-size:13px;color:#475569;">Gateway Fee ({gw_rate_label}%)</td>
       <td style="padding:6px 0;font-size:13px;color:#1e293b;text-align:right;font-weight:500;">₹{float(gateway_fee):,.2f}</td>
     </tr>"""
 

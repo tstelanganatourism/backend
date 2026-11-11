@@ -754,8 +754,9 @@ class AdminCreateBookingRequest(BaseModel):
     service_charge_amount: Optional[float] = None # Direct rupee amount override
     gateway_fee_rate: Optional[float] = None      # Percentage override (e.g. 0.0, 1.0)
     gateway_fee_amount: Optional[float] = None    # Direct rupee amount override
-    # Admin custom price override — bypasses all calculated subtotals/taxes
-    custom_total_amount: Optional[float] = None   # Set a fully custom total (overrides everything)
+    # Admin custom price override — custom_base_amount divides equally across tickets/units with taxes on top
+    custom_base_amount: Optional[float] = None    # Custom pre-tax base amount (taxes calculated on top)
+    custom_total_amount: Optional[float] = None   # Legacy: explicit final total override (post-tax)
     custom_advance_amount: Optional[float] = None # Set a custom advance/partial amount to collect now
 
 
@@ -974,6 +975,7 @@ async def admin_create_booking(
     adult_count = request.adult_count or request.quantity
     child_count = request.child_count or 0
     subtotal_amount = Decimal("0.00")
+    transport_snapshot_items = []
     transport_options_to_broadcast = []
     room_variant_id_val = None
     package_variant_id_val = None
@@ -1299,6 +1301,53 @@ async def admin_create_booking(
         coupon_applied = coupon_obj.code
         coupon_obj.usage_count = (coupon_obj.usage_count or 0) + 1
 
+    admin_custom_base_applied = False
+    admin_custom_unit_count = None
+    admin_custom_per_ticket = None
+    admin_original_subtotal = subtotal_amount
+
+    if request.custom_base_amount is not None and request.custom_base_amount >= 0:
+        custom_base = Decimal(str(request.custom_base_amount)).quantize(Decimal("0.01"))
+        subtotal_amount = custom_base
+        admin_custom_base_applied = True
+        is_room_booking = str(request.target_type).lower() == 'room'
+        if is_room_booking:
+            nights_count = max(1, len(stay_dates)) if 'stay_dates' in locals() else 1
+            rooms_cnt = required_rooms if 'required_rooms' in locals() else 1
+            admin_custom_unit_count = max(1, rooms_cnt * nights_count)
+        else:
+            admin_custom_unit_count = max(1, total_passengers if 'total_passengers' in locals() else ((request.adult_count or 0) + (request.child_count or 0) + (request.student_count or 0)))
+        admin_custom_per_ticket = (custom_base / Decimal(str(admin_custom_unit_count))).quantize(Decimal("0.01"))
+
+        # Zero out catalog addon monetary shares so base_fare equals custom_base without subtraction drift,
+        # while preserving selection metadata (titles, quantities, manifests) for operations.
+        if 'refreshment_subtotal' in locals():
+            refreshment_subtotal = Decimal("0.00")
+        if 'food_subtotal' in locals():
+            food_subtotal = Decimal("0.00")
+        if 'extras_subtotal' in locals():
+            extras_subtotal = Decimal("0.00")
+        if 'transport_snapshot_items' in locals():
+            for ts_item in transport_snapshot_items:
+                if "original_item_total" not in ts_item:
+                    ts_item["original_item_total"] = ts_item.get("item_total", 0.0)
+                ts_item["item_total"] = 0.0
+        if 'selected_extras_items' in locals():
+            for ext_item in selected_extras_items:
+                if "original_item_total" not in ext_item:
+                    ext_item["original_item_total"] = ext_item.get("item_total", 0.0)
+                ext_item["item_total"] = 0.0
+
+        # If a coupon was applied against the catalog price above, recompute discount against custom base
+        if 'coupon_obj' in locals() and coupon_obj is not None:
+            coupon_discount = Decimal(str(coupon_obj.calculate_discount(float(subtotal_amount))))
+
+        pricing_snapshot_custom_note = (
+            f"Admin custom base price: ₹{custom_base} "
+            f"(₹{admin_custom_per_ticket}/{'room-night' if is_room_booking else 'ticket'} × {admin_custom_unit_count}; "
+            f"catalog subtotal was ₹{admin_original_subtotal.quantize(Decimal('0.01'))})"
+        )
+
     discounted_subtotal = max(Decimal("0.00"), subtotal_amount - coupon_discount)
 
     # Admin bookings: calculate GST, Ts Boat Service Charge, and Gateway Fee
@@ -1387,7 +1436,15 @@ async def admin_create_booking(
         "receipt_style": (getattr(request, 'receipt_style', None) or "STANDARD").upper(),
     }
     # Embed custom-price note in snapshot if admin overrode the total
-    if request.custom_total_amount is not None and request.custom_total_amount >= 0:
+    if admin_custom_base_applied:
+        pricing_snapshot["admin_price_override"] = True
+        pricing_snapshot["admin_custom_base_amount"] = str(subtotal_amount)
+        pricing_snapshot["original_catalog_subtotal"] = str(admin_original_subtotal.quantize(Decimal("0.01")))
+        pricing_snapshot["unit_count"] = admin_custom_unit_count
+        pricing_snapshot["unit_label"] = "room-night" if str(request.target_type).lower() == 'room' else "ticket"
+        pricing_snapshot["per_ticket_price"] = str(admin_custom_per_ticket)
+        pricing_snapshot["admin_price_override_note"] = locals().get("pricing_snapshot_custom_note", f"Admin custom base price: ₹{subtotal_amount}")
+    elif request.custom_total_amount is not None and request.custom_total_amount >= 0:
         pricing_snapshot["admin_price_override"] = True
         pricing_snapshot["admin_price_override_note"] = locals().get("pricing_snapshot_custom_note", f"Admin custom price override: ₹{total_amount}")
     if transport_snapshot_items:
