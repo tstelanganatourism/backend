@@ -68,6 +68,9 @@ class Package(BaseModel, SEOMixin):
     refreshment_student_price = Column(Numeric(10, 2), nullable=True)  # per-student refreshment cost
     refreshments_min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
 
+    # Accommodation Package support
+    has_accommodation = Column(Boolean, default=False, server_default="false", nullable=False)
+
     # Food / Meals Option fields (distinct from refreshments)
     has_food_option = Column(Boolean, default=False, server_default="false", nullable=False)
     food_adult_price = Column(Numeric(10, 2), nullable=True)

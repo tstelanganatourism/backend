@@ -275,6 +275,7 @@ class PackageBase(AppBaseModel):
     is_student_package: bool = False
     refreshment_student_price: Optional[Decimal] = None
     refreshments_min_passengers: int = 1
+    has_accommodation: bool = False
 
     # Food Option fields
     has_food_option: bool = False
@@ -351,6 +352,7 @@ class PackageUpdate(AppBaseModel):
     is_student_package: Optional[bool] = None
     refreshment_student_price: Optional[Decimal] = None
     refreshments_min_passengers: Optional[int] = None
+    has_accommodation: Optional[bool] = None
 
     # Food option
     has_food_option: Optional[bool] = None

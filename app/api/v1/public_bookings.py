@@ -54,6 +54,13 @@ class TransportSelection(BaseModel):
     option_id: int
     quantity: int = Field(..., ge=1)
 
+class RoomSelection(BaseModel):
+    """A room variant with the quantity of rooms and optional adult/child combination selected for accommodation packages."""
+    variant_id: int
+    quantity: int = Field(..., ge=1)
+    adults: Optional[int] = None
+    children: Optional[int] = None
+
 class CheckoutRequest(BaseModel):
     # Differentiate between package or room
     target_type: str  # 'package' or 'room'
@@ -64,6 +71,8 @@ class CheckoutRequest(BaseModel):
 
     # Package specific
     variant_id: Optional[int] = None
+    # Accommodation room selection (for packages with accommodation)
+    room_selections: Optional[List[RoomSelection]] = None
     # Deprecated: use transport_selections instead (kept for backward compat)
     transport_option_id: Optional[int] = None
     # New: supports multiple vehicle types with quantities
@@ -135,6 +144,10 @@ async def checkout(
     adult_count = request.adult_count if request.adult_count is not None else request.quantity
     child_count = request.child_count if request.child_count is not None else 0
     student_count = request.student_count if request.student_count is not None else 0
+
+    if request.room_selections and not is_student_pkg:
+        adult_count = sum((r.adults or 0) * r.quantity for r in request.room_selections)
+        child_count = sum((r.children or 0) * r.quantity for r in request.room_selections)
 
     # Passenger count validation — deferred until after we know if it's a student package
     if not request.passengers or len(request.passengers) != request.quantity:
@@ -367,8 +380,24 @@ async def checkout(
                 detail=f"This package requires a minimum of {min_pax} passengers per booking. You have selected {total_passengers}."
             )
 
+        # ── Variant Occupancy / Group Size check ───────────────────────
+        variant_occupancy = getattr(variant, 'occupancy', 1) or 1
+        has_room_cart = bool(request.room_selections)
+        if not has_room_cart and variant_occupancy > 1 and not is_admin:
+            if total_passengers < variant_occupancy:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"The option '{variant.title}' requires a minimum of {variant_occupancy} guests per booking."
+                )
+            if total_passengers % variant_occupancy != 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"The option '{variant.title}' is configured for {variant_occupancy} members per room/unit and must be booked in multiples of {variant_occupancy} (e.g. {variant_occupancy}, {variant_occupancy * 2}, {variant_occupancy * 3}). You have selected {total_passengers} guests."
+                )
+
         # ── Pricing ──────────────────────────────────────────────────
         is_weekend = request.travel_date.weekday() in (5, 6)
+        room_snapshot_items = []
 
         if is_student_pkg:
             # Student pricing: one price per student head
@@ -381,6 +410,83 @@ async def checkout(
             eff_adult = eff_student  # used for SSE payload compatibility
             eff_child = Decimal("0.00")
             base_subtotal = Decimal(str(student_count)) * eff_student
+        elif has_room_cart:
+            # Multi-room accommodation booking: calculate base_subtotal summing across each selected room
+            r_variant_ids = [r.variant_id for r in request.room_selections]
+            r_variants_res = await db.execute(
+                select(PackageVariant).where(
+                    PackageVariant.id.in_(r_variant_ids),
+                    PackageVariant.package_id == parent_package.id,
+                    PackageVariant.is_active == True,
+                    PackageVariant.deleted_at.is_(None)
+                )
+            )
+            r_variants_map = {v.id: v for v in r_variants_res.scalars().all()}
+            
+            calc_base_subtotal = Decimal("0.00")
+            for r_sel in request.room_selections:
+                r_var = r_variants_map.get(r_sel.variant_id)
+                if not r_var:
+                    raise HTTPException(status_code=400, detail=f"Invalid room variant id: {r_sel.variant_id}")
+                
+                r_occ = getattr(r_var, 'occupancy', 1) or 1
+                r_adults = r_sel.adults if r_sel.adults is not None else r_occ
+                r_children = r_sel.children if r_sel.children is not None else 0
+                
+                if r_adults < 1 and not is_admin:
+                    raise HTTPException(status_code=400, detail=f"Each room in '{r_var.title}' requires at least 1 adult.")
+                if (r_adults + r_children) != r_occ and not is_admin:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Room '{r_var.title}' capacity is {r_occ} guests. Selected: {r_adults} adults + {r_children} children ({r_adults + r_children})."
+                    )
+
+                # Check for custom combination pricing override
+                custom_room_price = None
+                comb_pricing = getattr(r_var, 'combination_pricing', None)
+                if comb_pricing and isinstance(comb_pricing, list):
+                    for comb in comb_pricing:
+                        if comb.get("adults") == r_adults and comb.get("children") == r_children:
+                            if is_weekend and comb.get("weekend_price") is not None:
+                                custom_room_price = Decimal(str(comb["weekend_price"]))
+                            elif not is_weekend and comb.get("price") is not None:
+                                custom_room_price = Decimal(str(comb["price"]))
+                            elif comb.get("price") is not None:
+                                custom_room_price = Decimal(str(comb["price"]))
+                            break
+
+                if custom_room_price is not None:
+                    eff_room_price = custom_room_price
+                else:
+                    r_adult = r_var.adult_price
+                    r_child = r_var.child_price
+                    if is_weekend:
+                        if r_var.weekend_adult_price is not None:
+                            r_adult = r_var.weekend_adult_price
+                        if r_var.weekend_child_price is not None:
+                            r_child = r_var.weekend_child_price
+                    eff_r_adult, eff_r_child = get_effective_package_prices(
+                        r_adult, r_child, inventory.price_override
+                    )
+                    eff_room_price = (Decimal(str(r_adults)) * eff_r_adult) + (Decimal(str(r_children)) * eff_r_child)
+
+                room_item_cost = Decimal(str(r_sel.quantity)) * eff_room_price
+                calc_base_subtotal += room_item_cost
+                
+                room_snapshot_items.append({
+                    "variant_id": r_var.id,
+                    "title": r_var.title,
+                    "occupancy": r_occ,
+                    "quantity": r_sel.quantity,
+                    "adults": r_adults,
+                    "children": r_children,
+                    "price_per_room": float(eff_room_price),
+                    "item_total": float(room_item_cost)
+                })
+            
+            base_subtotal = calc_base_subtotal
+            eff_adult = variant.adult_price
+            eff_child = variant.child_price
         else:
             base_adult_price = variant.adult_price
             base_child_price = variant.child_price
@@ -906,6 +1012,8 @@ async def checkout(
     # Store transport selections breakdown in snapshot for invoice/ticket rendering
     if request.target_type == 'package' and transport_snapshot_items:
         pricing_snapshot["transport_selections"] = transport_snapshot_items
+    if request.target_type == 'package' and room_snapshot_items:
+        pricing_snapshot["room_selections"] = room_snapshot_items
 
     if is_agent:
         pricing_snapshot["agent_metadata"] = {
