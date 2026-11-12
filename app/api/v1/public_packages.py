@@ -129,6 +129,7 @@ async def get_packages(
                     Package.is_active,
                     Package.is_featured,
                     Package.is_student_package,
+                    Package.has_accommodation,
                     Package.order_priority,
                     Package.starting_price,
                     Package.min_passengers,
@@ -171,6 +172,8 @@ async def get_packages(
                         weekend_child_price=v.weekend_child_price,
                         student_price=v.student_price,
                         weekend_student_price=v.weekend_student_price,
+                        occupancy=v.occupancy or 1,
+                        combination_pricing=v.combination_pricing,
                         transport_info=None
                     ))
 
@@ -191,6 +194,7 @@ async def get_packages(
                     is_active=pkg.is_active,
                     is_featured=pkg.is_featured,
                     is_student_package=pkg.is_student_package,
+                    has_accommodation=pkg.has_accommodation or False,
                     order_priority=pkg.order_priority,
                     min_passengers=pkg.min_passengers or 1,
                     tags=pkg.tags_list or [],
@@ -514,6 +518,7 @@ async def get_package_detail(
                 # Transport & Refreshments
                 is_student_package=pkg.is_student_package or False,
                 has_transport=pkg.has_transport or False,
+                has_accommodation=pkg.has_accommodation or False,
                 transport_options=[
                     TransportOptionPublicDTO(
                         id=t.id,
@@ -553,6 +558,8 @@ async def get_package_detail(
                         weekend_child_price=v.weekend_child_price,
                         student_price=v.student_price,
                         weekend_student_price=v.weekend_student_price,
+                        occupancy=v.occupancy or 1,
+                        combination_pricing=v.combination_pricing,
                         transport_info=None
                     ) for v in pkg_variants
                 ],

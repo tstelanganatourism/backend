@@ -163,6 +163,7 @@ async def warmup_public_cache():
                     min_passengers=pkg.min_passengers or 1,
                     is_student_package=pkg.is_student_package or False,
                     has_transport=pkg.has_transport or False,
+                    has_accommodation=pkg.has_accommodation or False,
                     transport_options=[
                         TransportOptionPublicDTO(
                             id=t.id, type=t.type, title=t.title, capacity=t.capacity,
@@ -191,6 +192,8 @@ async def warmup_public_cache():
                             child_price=v.child_price or Decimal("0.00"),
                             weekend_adult_price=v.weekend_adult_price, weekend_child_price=v.weekend_child_price,
                             student_price=v.student_price, weekend_student_price=v.weekend_student_price,
+                            occupancy=v.occupancy or 1,
+                            combination_pricing=v.combination_pricing,
                             transport_info=None
                         ) for v in variants
                     ],

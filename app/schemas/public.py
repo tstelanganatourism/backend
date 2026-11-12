@@ -1,4 +1,4 @@
-from typing import List, Optional, TypeVar, Generic
+from typing import List, Optional, TypeVar, Generic, Dict, Any
 from pydantic import Field
 from decimal import Decimal
 from datetime import time
@@ -66,6 +66,8 @@ class PackageVariantPublicDTO(AppBaseModel):
     weekend_child_price: Optional[Decimal] = None
     student_price: Optional[Decimal] = None
     weekend_student_price: Optional[Decimal] = None
+    occupancy: Optional[int] = 1
+    combination_pricing: Optional[List[Dict[str, Any]]] = None
     transport_info: Optional[str] = None
 
 class PackageListDTO(AppBaseModel):
@@ -83,6 +85,7 @@ class PackageListDTO(AppBaseModel):
     is_active: bool = True
     is_featured: bool
     is_student_package: bool = False
+    has_accommodation: bool = False
     order_priority: Optional[int] = 0
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
