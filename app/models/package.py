@@ -1,4 +1,5 @@
 from sqlalchemy import Column, String, Numeric, Integer, Boolean, ForeignKey, UniqueConstraint, Table, Enum as SQLEnum, Date, CheckConstraint, BigInteger, Index, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.models.base import BaseModel, SortableMixin, SEOMixin
 from app.models.enums import PackageType, RegionType, PolicyType, PublishStatus, DocumentGenerationStatus, TransportOptionType, AdvancePaymentType, MealType
@@ -216,6 +217,10 @@ class PackageVariant(BaseModel):
     student_price = Column(Numeric(10, 2), nullable=True)  # per-student price (used when package.is_student_package=True)
     weekend_student_price = Column(Numeric(10, 2), nullable=True)
     is_active = Column(Boolean, default=True, server_default="true", nullable=False, index=True)
+    # Group/room-based booking: how many guests book together as one unit (1 = per-person, 2+ = group)
+    occupancy = Column(Integer, default=1, server_default="1", nullable=False)
+    # Adult & child combination pricing overrides for group variants: [{adults, children, price, weekend_price}]
+    combination_pricing = Column(JSONB, nullable=True)
 
     package = relationship("Package", back_populates="variants")
     inventory = relationship("PackageVariantInventory", back_populates="variant")

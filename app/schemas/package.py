@@ -1,4 +1,4 @@
-from typing import Optional, List
+from typing import Optional, List, Any
 from pydantic import Field
 from decimal import Decimal
 from datetime import datetime
@@ -27,6 +27,10 @@ class PackageVariantBase(AppBaseModel):
     student_price: Optional[Decimal] = None
     weekend_student_price: Optional[Decimal] = None
     is_active: bool = True
+    # Group/room-based booking (1 = per-person, 2+ = group)
+    occupancy: int = 1
+    # Adult & child combination pricing overrides
+    combination_pricing: Optional[List[Any]] = None
 
 class PackageTransportOptionBase(AppBaseModel):
     title: str
@@ -145,6 +149,9 @@ class PackageVariantInput(AppBaseModel):
     student_price: Optional[Decimal] = None
     weekend_student_price: Optional[Decimal] = None
     is_active: bool = True
+    # Group booking
+    occupancy: int = 1
+    combination_pricing: Optional[List[Any]] = None
 
 class PackageTransportOptionInput(AppBaseModel):
     id: Optional[int] = None
