@@ -725,6 +725,8 @@ class AdminCreateBookingRequest(BaseModel):
     agent_id: Optional[int] = None  # optional: assign under an agent
     customer_email: Optional[str] = None # Tourist email (for admin direct / agent bookings)
     passengers: List[AdminPassengerInput] = []
+    # Accommodation room selections (for packages with accommodation)
+    room_selections: Optional[List] = None  # List[{variant_id, quantity, adults, children}]
     # Transport
     transport_selections: Optional[List] = None  # List[{option_id, quantity}]
     # Refreshments & Extras
@@ -1029,12 +1031,91 @@ async def admin_create_booking(
             await db.flush()
         # Calculate subtotal using effective prices
         is_weekend_admin = travel_date.weekday() in (5, 6)
+        has_room_cart = bool(request.room_selections)
+        room_snapshot_items = []
         if is_student_pkg:
             base_student_price = getattr(variant, 'student_price', None) or Decimal("0.00")
             if is_weekend_admin and getattr(variant, 'weekend_student_price', None):
                 base_student_price = variant.weekend_student_price
             eff_student = Decimal(str(base_student_price))
             subtotal_amount = eff_student * student_count
+        elif has_room_cart:
+            r_variant_ids = [int(r.get("variant_id") if isinstance(r, dict) else r.variant_id) for r in request.room_selections]
+            r_variants_res = await db.execute(
+                select(PackageVariant).where(
+                    PackageVariant.id.in_(r_variant_ids),
+                    PackageVariant.package_id == variant.package_id,
+                    PackageVariant.is_active == True,
+                    PackageVariant.deleted_at.is_(None)
+                )
+            )
+            r_variants_map = {v.id: v for v in r_variants_res.scalars().all()}
+            calc_base_subtotal = Decimal("0.00")
+            primary_var_candidate = None
+            max_occ = 0
+            for r_item in request.room_selections:
+                r_id = int(r_item.get("variant_id") if isinstance(r_item, dict) else r_item.variant_id)
+                r_qty = int(r_item.get("quantity") if isinstance(r_item, dict) else r_item.quantity)
+                r_var = r_variants_map.get(r_id)
+                if not r_var:
+                    raise HTTPException(status_code=400, detail=f"Invalid room variant id: {r_id}")
+                r_occ = getattr(r_var, 'occupancy', 1) or 1
+                if r_occ > max_occ:
+                    max_occ = r_occ
+                    primary_var_candidate = r_var
+
+                r_adults = int(r_item.get("adults")) if isinstance(r_item, dict) and r_item.get("adults") is not None else getattr(r_item, "adults", r_occ)
+                if r_adults is None:
+                    r_adults = r_occ
+                r_children = int(r_item.get("children")) if isinstance(r_item, dict) and r_item.get("children") is not None else getattr(r_item, "children", 0)
+                if r_children is None:
+                    r_children = 0
+
+                # Check for custom combination pricing override
+                custom_room_price = None
+                comb_pricing = getattr(r_var, 'combination_pricing', None)
+                if comb_pricing and isinstance(comb_pricing, list):
+                    for comb in comb_pricing:
+                        if comb.get("adults") == r_adults and comb.get("children") == r_children:
+                            if is_weekend_admin and comb.get("weekend_price") is not None:
+                                custom_room_price = Decimal(str(comb["weekend_price"]))
+                            elif not is_weekend_admin and comb.get("price") is not None:
+                                custom_room_price = Decimal(str(comb["price"]))
+                            elif comb.get("price") is not None:
+                                custom_room_price = Decimal(str(comb["price"]))
+                            break
+
+                if custom_room_price is not None:
+                    eff_room_price = custom_room_price
+                else:
+                    r_adult = r_var.adult_price
+                    r_child = r_var.child_price
+                    if is_weekend_admin:
+                        if r_var.weekend_adult_price is not None:
+                            r_adult = r_var.weekend_adult_price
+                        if r_var.weekend_child_price is not None:
+                            r_child = r_var.weekend_child_price
+                    eff_r_adult, eff_r_child = get_effective_package_prices(
+                        r_adult, r_child, inv.price_override if hasattr(inv, 'price_override') else None
+                    )
+                    eff_room_price = (Decimal(str(r_adults)) * eff_r_adult) + (Decimal(str(r_children)) * eff_r_child)
+
+                room_cost = Decimal(str(r_qty)) * eff_room_price
+                calc_base_subtotal += room_cost
+                room_snapshot_items.append({
+                    "variant_id": r_var.id,
+                    "title": r_var.title,
+                    "occupancy": r_occ,
+                    "quantity": r_qty,
+                    "adults": r_adults,
+                    "children": r_children,
+                    "price_per_room": float(eff_room_price),
+                    "item_total": float(room_cost)
+                })
+            subtotal_amount = calc_base_subtotal
+            if primary_var_candidate:
+                package_variant_id_val = primary_var_candidate.id
+                variant = primary_var_candidate
         else:
             eff_adult, eff_child = get_effective_package_prices(
                 variant.adult_price, variant.child_price, inv.price_override if hasattr(inv, 'price_override') else None
@@ -1449,6 +1530,8 @@ async def admin_create_booking(
         pricing_snapshot["admin_price_override_note"] = locals().get("pricing_snapshot_custom_note", f"Admin custom price override: ₹{total_amount}")
     if transport_snapshot_items:
         pricing_snapshot["transport_selections"] = transport_snapshot_items
+    if room_snapshot_items:
+        pricing_snapshot["room_selections"] = room_snapshot_items
 
     if request.target_type == 'room':
         if request.slot_start:
