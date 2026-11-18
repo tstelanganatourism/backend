@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_
 from sqlalchemy.orm import selectinload
 from typing import Optional, List
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from datetime import date, datetime
@@ -712,6 +712,10 @@ class AdminPassengerInput(BaseModel):
     is_primary: Optional[bool] = False
     student_class: Optional[str] = Field(None, max_length=100)  # for student packages
 
+class AdminPackageExtraSelection(BaseModel):
+    extra_id: int = Field(..., ge=1)
+    quantity: Decimal = Field(Decimal("1"), ge=Decimal("0.25"), le=9999, max_digits=7, decimal_places=2)
+
 class AdminCreateBookingRequest(BaseModel):
     target_type: str  # 'package' or 'room'
     travel_date: str
@@ -733,7 +737,9 @@ class AdminCreateBookingRequest(BaseModel):
     include_refreshments: Optional[bool] = False
     include_food_option: Optional[bool] = False
     has_food_addon: Optional[bool] = False
+    food_quantity_kg: Optional[Decimal] = Field(None, ge=0, le=9999, max_digits=7, decimal_places=2)
     extra_ids: Optional[List[int]] = None
+    extra_selections: Optional[List[AdminPackageExtraSelection]] = None
     selected_extras: Optional[List] = None
     # Room-specific
     departure_date: Optional[str] = None
@@ -1218,53 +1224,78 @@ async def admin_create_booking(
                 subtotal_amount += ref_cost
                 refreshment_subtotal = ref_cost
 
-        # Food option for admin direct booking
+        # Food is priced by kilograms and is independent of passenger counts.
+        food_quantity_kg = request.food_quantity_kg
+        if food_quantity_kg is None:
+            food_quantity_kg = Decimal("1.00") if (request.include_food_option or request.has_food_addon) else Decimal("0.00")
         food_subtotal = Decimal("0.00")
-        if request.include_food_option or request.has_food_addon:
+        food_price_per_kg = Decimal("0.00")
+        if food_quantity_kg > 0:
             pkg_res_for_food = await db.execute(
                 select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
             )
             parent_pkg_food = pkg_res_for_food.scalar_one_or_none()
             if parent_pkg_food and parent_pkg_food.has_food_option:
-                if is_student_pkg:
-                    f_student = getattr(parent_pkg_food, 'food_student_price', None) or Decimal("0.00")
-                    food_cost = Decimal(str(student_count)) * Decimal(str(f_student))
-                else:
-                    f_adult = parent_pkg_food.food_adult_price or Decimal("0.00")
-                    f_child = parent_pkg_food.food_child_price or Decimal("0.00")
-                    food_cost = Decimal(str(adult_count)) * Decimal(str(f_adult)) + Decimal(str(child_count)) * Decimal(str(f_child))
-                subtotal_amount += food_cost
-                food_subtotal = food_cost
+                configured_food_price = parent_pkg_food.food_price_per_kg
+                if configured_food_price is None:
+                    configured_food_price = parent_pkg_food.food_adult_price or parent_pkg_food.food_student_price or parent_pkg_food.food_child_price
+                food_price_per_kg = Decimal(str(configured_food_price or 0))
+                food_subtotal = (food_quantity_kg * food_price_per_kg).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                subtotal_amount += food_subtotal
 
         # Package Extras calculation
         extras_subtotal = Decimal("0.00")
         selected_extras_items = []
-        raw_extras = getattr(request, 'extra_ids', None) or getattr(request, 'selected_extras', None) or []
-        if raw_extras and isinstance(raw_extras, list):
-            ext_ids = []
-            for item in raw_extras:
-                if isinstance(item, int):
-                    ext_ids.append(item)
-                elif isinstance(item, dict) and 'id' in item:
-                    ext_ids.append(item['id'])
-            if ext_ids:
-                from app.models.package import PackageExtra
-                ext_res = await db.execute(select(PackageExtra).where(PackageExtra.id.in_(ext_ids)))
-                ext_list = ext_res.scalars().all()
-                for ext in ext_list:
-                    if is_student_pkg:
-                        ext_cost = Decimal(str(total_passengers)) * Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
+        extra_quantities = {selection.extra_id: selection.quantity for selection in (request.extra_selections or [])}
+        legacy_extra_ids = request.extra_ids or request.selected_extras or []
+        for raw_id in legacy_extra_ids:
+            extra_id = raw_id if isinstance(raw_id, int) else (raw_id.get("id") if isinstance(raw_id, dict) else None)
+            if extra_id and extra_id not in extra_quantities:
+                extra_quantities[extra_id] = Decimal("1.00")
+        if extra_quantities:
+            from app.models.package import PackageExtra
+            parent_pkg_for_extras = await db.scalar(
+                select(Package).join(PackageVariant, PackageVariant.package_id == Package.id).where(PackageVariant.id == request.variant_id)
+            )
+            if parent_pkg_for_extras:
+                ext_res = await db.execute(
+                    select(PackageExtra).where(
+                        PackageExtra.id.in_(list(extra_quantities)),
+                        PackageExtra.package_id == parent_pkg_for_extras.id,
+                        PackageExtra.deleted_at.is_(None),
+                    )
+                )
+                for ext in ext_res.scalars().all():
+                    if (ext.pricing_unit or "PER_PERSON").upper() == "PER_KG":
+                        quantity = Decimal(str(extra_quantities[ext.id]))
+                        unit_price = Decimal(str(ext.price_per_kg if ext.price_per_kg is not None else (ext.adult_price or 0)))
+                        ext_cost = (quantity * unit_price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        pricing_detail = {"pricing_unit": "PER_KG", "quantity": str(quantity), "unit_price": str(unit_price)}
+                    elif is_student_pkg:
+                        unit_price = Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
+                        ext_cost = Decimal(str(total_passengers)) * unit_price
+                        pricing_detail = {"pricing_unit": "PER_PERSON", "student_count": total_passengers, "student_price": str(unit_price)}
                     else:
-                        ext_cost = Decimal(str(adult_count)) * Decimal(str(ext.adult_price or Decimal("0.00"))) + Decimal(str(child_count)) * Decimal(str(ext.child_price or Decimal("0.00")))
+                        adult_unit_price = Decimal(str(ext.adult_price or Decimal("0.00")))
+                        child_unit_price = Decimal(str(ext.child_price or Decimal("0.00")))
+                        ext_cost = Decimal(str(adult_count)) * adult_unit_price + Decimal(str(child_count)) * child_unit_price
+                        pricing_detail = {
+                            "pricing_unit": "PER_PERSON",
+                            "adult_count": adult_count,
+                            "adult_price": str(adult_unit_price),
+                            "child_count": child_count,
+                            "child_price": str(child_unit_price),
+                        }
                     extras_subtotal += ext_cost
                     selected_extras_items.append({
                         "id": ext.id,
                         "title": ext.title,
                         "description": ext.description,
-                        "item_total": float(ext_cost)
+                        **pricing_detail,
+                        "item_total": str(ext_cost.quantize(Decimal("0.01")))
                     })
                 subtotal_amount += extras_subtotal
-        
+
         # Admin direct bookings occupy package inventory, increment booked_count
         if inv.booked_count + total_passengers > inv.total_capacity:
             inv.total_capacity = inv.booked_count + inv.reserved_count + total_passengers
@@ -1405,6 +1436,9 @@ async def admin_create_booking(
         if 'refreshment_subtotal' in locals():
             refreshment_subtotal = Decimal("0.00")
         if 'food_subtotal' in locals():
+            if food_subtotal > Decimal("0.00"):
+                food_included_in_custom_price = True
+                food_catalog_subtotal = food_subtotal
             food_subtotal = Decimal("0.00")
         if 'extras_subtotal' in locals():
             extras_subtotal = Decimal("0.00")
@@ -1417,6 +1451,7 @@ async def admin_create_booking(
             for ext_item in selected_extras_items:
                 if "original_item_total" not in ext_item:
                     ext_item["original_item_total"] = ext_item.get("item_total", 0.0)
+                ext_item["included_in_custom_price"] = True
                 ext_item["item_total"] = 0.0
 
         # If a coupon was applied against the catalog price above, recompute discount against custom base
@@ -1495,7 +1530,11 @@ async def admin_create_booking(
         "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
         "has_refreshment_addon": getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False),
         "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
-        "has_food_addon": getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False),
+        "food_catalog_subtotal": str(locals().get('food_catalog_subtotal', Decimal("0.00"))),
+        "food_included_in_custom_price": bool(locals().get('food_included_in_custom_price', False)),
+        "has_food_addon": bool(locals().get('parent_pkg_food') and locals()['parent_pkg_food'].has_food_option and locals().get('food_quantity_kg', Decimal("0.00")) > 0),
+        "food_quantity_kg": str(food_quantity_kg) if 'food_quantity_kg' in locals() else "0.00",
+        "food_price_per_kg": str(food_price_per_kg) if 'food_price_per_kg' in locals() else "0.00",
         "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
         "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
         "coupon_discount": str(coupon_discount),

@@ -86,6 +86,8 @@ class PackageListDTO(AppBaseModel):
     is_featured: bool
     is_student_package: bool = False
     has_accommodation: bool = False
+    has_food_option: bool = False
+    food_price_per_kg: Optional[Decimal] = None
     order_priority: Optional[int] = 0
     tags: List[str] = Field(default_factory=list)
     starting_price: Optional[Decimal] = None
@@ -151,6 +153,8 @@ class PackageExtraPublicDTO(AppBaseModel):
     adult_price: Optional[Decimal] = None
     child_price: Optional[Decimal] = None
     student_price: Optional[Decimal] = None
+    pricing_unit: str = "PER_PERSON"
+    price_per_kg: Optional[Decimal] = None
     min_passengers: int = 1
     sort_order: int
 
@@ -165,7 +169,6 @@ class PackageDetailDTO(PackageListDTO, SEOSchema):
     refreshment_child_price: Optional[Decimal] = None
     refreshment_student_price: Optional[Decimal] = None
     refreshments_min_passengers: int = 1
-    has_food_option: bool = False
     food_adult_price: Optional[Decimal] = None
     food_child_price: Optional[Decimal] = None
     food_student_price: Optional[Decimal] = None

@@ -1,4 +1,4 @@
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Literal
 from pydantic import Field
 from decimal import Decimal
 from datetime import datetime
@@ -134,6 +134,8 @@ class PackageExtraResponse(AppBaseModel):
     adult_price: Optional[Decimal] = None
     child_price: Optional[Decimal] = None
     student_price: Optional[Decimal] = None
+    pricing_unit: str = "PER_PERSON"
+    price_per_kg: Optional[Decimal] = None
     min_passengers: int = 1
     sort_order: int = 0
 
@@ -250,6 +252,8 @@ class PackageExtraInput(AppBaseModel):
     adult_price: Optional[Decimal] = None
     child_price: Optional[Decimal] = None
     student_price: Optional[Decimal] = None
+    pricing_unit: Literal["PER_PERSON", "PER_KG"] = "PER_PERSON"
+    price_per_kg: Optional[Decimal] = None
     min_passengers: int = 1
     sort_order: int = 0
 
@@ -279,6 +283,7 @@ class PackageBase(AppBaseModel):
 
     # Food Option fields
     has_food_option: bool = False
+    food_price_per_kg: Optional[Decimal] = None
     food_adult_price: Optional[Decimal] = None
     food_child_price: Optional[Decimal] = None
     food_student_price: Optional[Decimal] = None
@@ -304,6 +309,7 @@ class PackageResponse(PackageBase):
     categories: List[PackageCategorySlimDTO] = []
     variants: List[PackageVariantResponse] = []
     transport_options: List[PackageTransportOptionResponse] = []
+    extras: List[PackageExtraResponse] = []
     active_booking_count: Optional[int] = 0
 
 class PackageDetailResponse(PackageResponse, SEOSchema):
@@ -316,7 +322,6 @@ class PackageDetailResponse(PackageResponse, SEOSchema):
     faqs: List[PackageFAQResponse] = []
     policies: List[PackagePolicyResponse] = []
     meals: List[PackageMealItemResponse] = []
-    extras: List[PackageExtraResponse] = []
 
 class PackageCreate(PackageBase, SEOSchema):
     variants: List[PackageVariantInput] = []
@@ -356,6 +361,7 @@ class PackageUpdate(AppBaseModel):
 
     # Food option
     has_food_option: Optional[bool] = None
+    food_price_per_kg: Optional[Decimal] = None
     food_adult_price: Optional[Decimal] = None
     food_child_price: Optional[Decimal] = None
     food_student_price: Optional[Decimal] = None

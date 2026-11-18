@@ -219,7 +219,8 @@ async def list_packages(
         selectinload(Package.tags),
         selectinload(Package.categories),
         selectinload(Package.variants),
-        selectinload(Package.transport_options)
+        selectinload(Package.transport_options),
+        selectinload(Package.extras)
     )
     query = query.order_by(Package.order_priority.asc(), Package.id.asc()).limit(limit).offset(offset)
     

@@ -73,6 +73,7 @@ class Package(BaseModel, SEOMixin):
 
     # Food / Meals Option fields (distinct from refreshments)
     has_food_option = Column(Boolean, default=False, server_default="false", nullable=False)
+    food_price_per_kg = Column(Numeric(10, 2), nullable=True)
     food_adult_price = Column(Numeric(10, 2), nullable=True)
     food_child_price = Column(Numeric(10, 2), nullable=True)
     food_student_price = Column(Numeric(10, 2), nullable=True)
@@ -204,6 +205,8 @@ class PackageExtra(BaseModel, SortableMixin):
     adult_price = Column(Numeric(10, 2), nullable=True)
     child_price = Column(Numeric(10, 2), nullable=True)
     student_price = Column(Numeric(10, 2), nullable=True)
+    pricing_unit = Column(String(20), nullable=False, default="PER_PERSON", server_default="PER_PERSON")
+    price_per_kg = Column(Numeric(10, 2), nullable=True)
     min_passengers = Column(Integer, default=1, server_default="1", nullable=False)
     package = relationship("Package", back_populates="extras")
 

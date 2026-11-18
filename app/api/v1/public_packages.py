@@ -541,6 +541,7 @@ async def get_package_detail(
                 refreshment_student_price=pkg.refreshment_student_price,
                 refreshments_min_passengers=pkg.refreshments_min_passengers or 1,
                 has_food_option=pkg.has_food_option or False,
+                food_price_per_kg=pkg.food_price_per_kg,
                 food_adult_price=pkg.food_adult_price,
                 food_child_price=pkg.food_child_price,
                 food_student_price=pkg.food_student_price,

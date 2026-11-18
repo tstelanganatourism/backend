@@ -5,7 +5,7 @@ from datetime import date, time, timedelta, datetime, timezone
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from loguru import logger
 import asyncio
 import hmac
@@ -61,6 +61,10 @@ class RoomSelection(BaseModel):
     adults: Optional[int] = None
     children: Optional[int] = None
 
+class PackageExtraSelection(BaseModel):
+    extra_id: int = Field(..., ge=1)
+    quantity: Decimal = Field(Decimal("1"), ge=Decimal("0.25"), le=9999, max_digits=7, decimal_places=2)
+
 class CheckoutRequest(BaseModel):
     # Differentiate between package or room
     target_type: str  # 'package' or 'room'
@@ -79,6 +83,7 @@ class CheckoutRequest(BaseModel):
     transport_selections: Optional[List[TransportSelection]] = None
     include_refreshments: Optional[bool] = False
     include_food_option: Optional[bool] = False
+    food_quantity_kg: Optional[Decimal] = Field(None, ge=0, le=9999, max_digits=7, decimal_places=2)
 
     # Room specific
     room_id: Optional[int] = None
@@ -95,6 +100,7 @@ class CheckoutRequest(BaseModel):
     has_refreshment_addon: Optional[bool] = False
     has_food_addon: Optional[bool] = False
     extra_ids: Optional[List[int]] = None
+    extra_selections: Optional[List[PackageExtraSelection]] = None
     selected_extras: Optional[List] = None
 
     # Passenger manifest
@@ -681,43 +687,70 @@ async def checkout(
                 r_child = parent_package.refreshment_child_price or Decimal("0.00")
                 refreshment_subtotal = Decimal(str(adult_count)) * r_adult + Decimal(str(child_count)) * r_child
 
+        food_quantity_kg = request.food_quantity_kg
+        if food_quantity_kg is None:
+            food_quantity_kg = Decimal("1.00") if (request.include_food_option or request.has_food_addon) else Decimal("0.00")
         food_subtotal = Decimal("0.00")
-        if parent_package.has_food_option and (request.include_food_option or request.has_food_addon):
-            if is_student_pkg:
-                f_student = getattr(parent_package, 'food_student_price', None) or Decimal("0.00")
-                food_subtotal = Decimal(str(student_count)) * Decimal(str(f_student))
-            else:
-                f_adult = parent_package.food_adult_price or Decimal("0.00")
-                f_child = parent_package.food_child_price or Decimal("0.00")
-                food_subtotal = Decimal(str(adult_count)) * f_adult + Decimal(str(child_count)) * f_child
+        food_price_per_kg = Decimal("0.00")
+        if parent_package.has_food_option and food_quantity_kg > 0:
+            configured_food_price = parent_package.food_price_per_kg
+            if configured_food_price is None:
+                configured_food_price = parent_package.food_adult_price or parent_package.food_student_price or parent_package.food_child_price
+            food_price_per_kg = Decimal(str(configured_food_price or 0))
+            food_subtotal = (food_quantity_kg * food_price_per_kg).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         # Extras calculation
         extras_subtotal = Decimal("0.00")
         selected_extras_items = []
-        raw_extras = getattr(request, 'extra_ids', None) or getattr(request, 'selected_extras', None) or []
-        if raw_extras and isinstance(raw_extras, list):
-            ext_ids = []
-            for item in raw_extras:
-                if isinstance(item, int):
-                    ext_ids.append(item)
-                elif isinstance(item, dict) and 'id' in item:
-                    ext_ids.append(item['id'])
-            if ext_ids:
-                from app.models.package import PackageExtra
-                ext_res = await db.execute(select(PackageExtra).where(PackageExtra.id.in_(ext_ids)))
-                ext_list = ext_res.scalars().all()
-                for ext in ext_list:
-                    if is_student_pkg:
-                        ext_cost = Decimal(str(student_count)) * Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
-                    else:
-                        ext_cost = Decimal(str(adult_count)) * Decimal(str(ext.adult_price or Decimal("0.00"))) + Decimal(str(child_count)) * Decimal(str(ext.child_price or Decimal("0.00")))
-                    extras_subtotal += ext_cost
-                    selected_extras_items.append({
-                        "id": ext.id,
-                        "title": ext.title,
-                        "description": ext.description,
-                        "item_total": float(ext_cost)
-                    })
+        extra_quantities = {selection.extra_id: selection.quantity for selection in (request.extra_selections or [])}
+        legacy_extra_ids = getattr(request, 'extra_ids', None) or getattr(request, 'selected_extras', None) or []
+        for raw_id in legacy_extra_ids:
+            extra_id = raw_id if isinstance(raw_id, int) else (raw_id.get('id') if isinstance(raw_id, dict) else None)
+            if extra_id and extra_id not in extra_quantities:
+                extra_quantities[extra_id] = Decimal("1.00")
+        if extra_quantities:
+            from app.models.package import PackageExtra
+            ext_res = await db.execute(
+                select(PackageExtra).where(
+                    PackageExtra.id.in_(list(extra_quantities)),
+                    PackageExtra.package_id == parent_package.id,
+                    PackageExtra.deleted_at.is_(None),
+                )
+            )
+            ext_list = ext_res.scalars().all()
+            for ext in ext_list:
+                if (ext.pricing_unit or "PER_PERSON").upper() == "PER_KG":
+                    quantity = Decimal(str(extra_quantities[ext.id]))
+                    unit_price = Decimal(str(ext.price_per_kg if ext.price_per_kg is not None else (ext.adult_price or 0)))
+                    ext_cost = (quantity * unit_price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    pricing_detail = {
+                        "pricing_unit": "PER_KG",
+                        "quantity": str(quantity),
+                        "unit_price": str(unit_price),
+                    }
+                elif is_student_pkg:
+                    unit_price = Decimal(str(ext.student_price or ext.adult_price or Decimal("0.00")))
+                    ext_cost = Decimal(str(student_count)) * unit_price
+                    pricing_detail = {"pricing_unit": "PER_PERSON", "student_count": student_count, "student_price": str(unit_price)}
+                else:
+                    adult_unit_price = Decimal(str(ext.adult_price or Decimal("0.00")))
+                    child_unit_price = Decimal(str(ext.child_price or Decimal("0.00")))
+                    ext_cost = Decimal(str(adult_count)) * adult_unit_price + Decimal(str(child_count)) * child_unit_price
+                    pricing_detail = {
+                        "pricing_unit": "PER_PERSON",
+                        "adult_count": adult_count,
+                        "adult_price": str(adult_unit_price),
+                        "child_count": child_count,
+                        "child_price": str(child_unit_price),
+                    }
+                extras_subtotal += ext_cost
+                selected_extras_items.append({
+                    "id": ext.id,
+                    "title": ext.title,
+                    "description": ext.description,
+                    **pricing_detail,
+                    "item_total": str(ext_cost.quantize(Decimal("0.01")))
+                })
 
         subtotal_amount = base_subtotal + transport_subtotal + refreshment_subtotal + food_subtotal + extras_subtotal
         
@@ -994,7 +1027,9 @@ async def checkout(
         "refreshment_subtotal": str(refreshment_subtotal) if 'refreshment_subtotal' in locals() else "0.00",
         "has_refreshment_addon": bool(getattr(parent_package, 'has_refreshments', False) and (getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False))) if 'parent_package' in locals() and parent_package else bool(getattr(request, 'include_refreshments', False) or getattr(request, 'has_refreshment_addon', False)),
         "food_subtotal": str(food_subtotal) if 'food_subtotal' in locals() else "0.00",
-        "has_food_addon": bool(getattr(parent_package, 'has_food_option', False) and (getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False))) if 'parent_package' in locals() and parent_package else bool(getattr(request, 'include_food_option', False) or getattr(request, 'has_food_addon', False)),
+        "has_food_addon": bool(getattr(parent_package, 'has_food_option', False) and locals().get('food_quantity_kg', Decimal("0.00")) > 0) if 'parent_package' in locals() and parent_package else False,
+        "food_quantity_kg": str(food_quantity_kg) if 'food_quantity_kg' in locals() else "0.00",
+        "food_price_per_kg": str(food_price_per_kg) if 'food_price_per_kg' in locals() else "0.00",
         "extras_amount": str(extras_subtotal) if 'extras_subtotal' in locals() else "0.00",
         "selected_extras": selected_extras_items if 'selected_extras_items' in locals() else [],
         "coupon_discount": str(coupon_discount),

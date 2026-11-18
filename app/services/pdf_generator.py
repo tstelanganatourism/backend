@@ -509,7 +509,7 @@ def generate_reportlab_brochure_from_dict(pkg: dict) -> bytes:
         elements.append(Spacer(1, 8))
 
     # Add-on Extras & Fresh-Up Services (Food, Rooms, Upgrades)
-    has_extras = pkg.get('has_refreshments') or (pkg.get('extras') and len(pkg['extras']) > 0)
+    has_extras = pkg.get('has_refreshments') or pkg.get('has_food_option') or (pkg.get('extras') and len(pkg['extras']) > 0)
     if has_extras:
         elements.append(Paragraph("Fresh-Up Rooms &amp; Add-on Extras", section_heading))
         extra_rows = [[
@@ -528,13 +528,26 @@ def generate_reportlab_brochure_from_dict(pkg: dict) -> bytes:
                 Paragraph(ref_child, table_cell_style),
             ])
         for ex in pkg.get('extras', []):
-            ex_adult = f"₹{ex.get('adult_price', 0)}" if ex.get('adult_price') else "—"
-            ex_child = f"₹{ex.get('child_price', 0)}" if ex.get('child_price') else "—"
+            if (ex.get('pricing_unit') or 'PER_PERSON').upper() == 'PER_KG':
+                unit_price = ex.get('price_per_kg') if ex.get('price_per_kg') is not None else ex.get('adult_price', 0)
+                ex_adult = f"₹{unit_price}/kg"
+                ex_child = "Quantity chosen at booking"
+            else:
+                ex_adult = f"₹{ex.get('adult_price', 0)}" if ex.get('adult_price') else "—"
+                ex_child = f"₹{ex.get('child_price', 0)}" if ex.get('child_price') else "—"
             extra_rows.append([
                 Paragraph(safe_para_text(ex.get('title', '')), table_cell_style),
                 Paragraph(safe_para_text(ex.get('description', '') or '—'), table_cell_style),
                 Paragraph(ex_adult, table_cell_style),
                 Paragraph(ex_child, table_cell_style),
+            ])
+        if pkg.get('has_food_option'):
+            food_price = pkg.get('food_price_per_kg')
+            extra_rows.append([
+                Paragraph("Optional Food", table_cell_style),
+                Paragraph("Choose the quantity in kg when booking", table_cell_style),
+                Paragraph(f"₹{food_price}/kg" if food_price is not None else "Configure price", table_cell_style),
+                Paragraph("Quantity by kg", table_cell_style),
             ])
         t_extras = Table(extra_rows, colWidths=[180, 200, 70, 70])
         t_extras.setStyle(TableStyle([
@@ -714,6 +727,17 @@ def _extract_package_data(package) -> dict:
             "description": p.description or "",
         }
 
+    def _extra(extra):
+        return {
+            "title": extra.title or "",
+            "description": extra.description or "",
+            "adult_price": extra.adult_price,
+            "child_price": extra.child_price,
+            "student_price": extra.student_price,
+            "pricing_unit": extra.pricing_unit or "PER_PERSON",
+            "price_per_kg": extra.price_per_kg,
+        }
+
     region_val = package.region.value if hasattr(package.region, "value") else (package.region or "")
 
     return {
@@ -723,7 +747,13 @@ def _extract_package_data(package) -> dict:
         "region": region_val,
         "description": package.description or "",
         "starting_price": package.starting_price or 0,
+        "has_refreshments": bool(package.has_refreshments),
+        "refreshment_adult_price": package.refreshment_adult_price,
+        "refreshment_child_price": package.refreshment_child_price,
+        "has_food_option": bool(package.has_food_option),
+        "food_price_per_kg": package.food_price_per_kg,
         "variants": [_variant(v) for v in (package.variants or [])],
+        "extras": [_extra(e) for e in (package.extras or [])],
         "itinerary": sorted([_itinerary(i) for i in (package.itinerary or [])], key=lambda x: (x["day_number"], x["sort_order"])),
         "inclusions": [_label(i) for i in (package.inclusions or [])],
         "exclusions": [_label(e) for e in (package.exclusions or [])],
