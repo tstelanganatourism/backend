@@ -431,24 +431,29 @@ async def _finalize_draft(
     if background_tasks:
         background_tasks.add_task(_enqueue_documents_task_safe, booking.id, booking.public_id, booking.status == BookingStatus.FULLY_PAID)
 
-    # 8. Enqueue confirmation SMS via arq (Zero-DB background task) with direct fallback
+    # 8. Enqueue confirmation SMS via arq only — direct fallback ONLY if ARQ unavailable.
+    # Never send via both ARQ + background_task: MSG91 error 311 (duplicate within 10s).
     try:
         await db.flush()
         from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
         from app.worker import get_arq_pool
         sms_payload = await get_booking_sms_payload(booking.id, db)
         if sms_payload:
+            arq_sent = False
             try:
                 arq_pool = await get_arq_pool()
                 if arq_pool:
                     await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                    arq_sent = True
             except Exception as _arq_err:
                 logger.warning(f"ARQ SMS enqueue skipped for booking {booking.public_id}: {_arq_err}")
 
-            if background_tasks:
-                background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
-            else:
-                asyncio.create_task(dispatch_sms_payload(None, sms_payload))
+            # Only fall back to direct send if ARQ was not available
+            if not arq_sent:
+                if background_tasks:
+                    background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
+                else:
+                    asyncio.create_task(dispatch_sms_payload(None, sms_payload))
     except Exception as _sms_err:
         logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 
@@ -537,23 +542,27 @@ async def verify_status(
                 from app.utils.ledger import recompute_booking_ledger
                 booking = await recompute_booking_ledger(booking.id, db)
 
-                # Enqueue SMS via arq + direct in-process fallback
+                # Enqueue SMS via arq only — direct fallback ONLY if ARQ unavailable.
+                # Never send via both ARQ + background_task: MSG91 error 311 (duplicate within 10s).
                 try:
                     from app.services.sms_service import get_booking_sms_payload, dispatch_sms_payload
                     from app.worker import get_arq_pool
                     sms_payload = await get_booking_sms_payload(booking.id, db)
                     if sms_payload:
+                        arq_sent = False
                         try:
                             arq_pool = await get_arq_pool()
                             if arq_pool:
                                 await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                                arq_sent = True
                         except Exception as _arq_err:
                             logger.warning(f"ARQ SMS enqueue skipped: {_arq_err}")
 
-                        if background_tasks:
-                            background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
-                        else:
-                            asyncio.create_task(dispatch_sms_payload(None, sms_payload))
+                        if not arq_sent:
+                            if background_tasks:
+                                background_tasks.add_task(dispatch_sms_payload, None, sms_payload)
+                            else:
+                                asyncio.create_task(dispatch_sms_payload(None, sms_payload))
                 except Exception as _sms_err:
                     logger.warning(f"Could not enqueue confirmation SMS for booking {booking.public_id}: {_sms_err}")
 

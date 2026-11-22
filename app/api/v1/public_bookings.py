@@ -1370,15 +1370,18 @@ async def checkout(
                     from app.worker import get_arq_pool
                     sms_payload = await get_booking_sms_payload(b_id, sms_db)
                     if sms_payload:
+                        arq_sent = False
                         try:
                             arq_pool = await get_arq_pool()
                             if arq_pool:
                                 await arq_pool.enqueue_job("dispatch_sms_payload", sms_payload)
+                                arq_sent = True
                         except Exception as arq_err:
                             logger.warning(f"ARQ pool skipped for agent SMS: {arq_err}")
-                        
-                        # Direct in-process fallback
-                        await dispatch_sms_payload(None, sms_payload)
+
+                        # Only fall back to direct send if ARQ was not available
+                        if not arq_sent:
+                            await dispatch_sms_payload(None, sms_payload)
             except Exception as sms_err:
                 logger.warning(f"Agent booking SMS dispatch failed for {b_public_id}: {sms_err}")
 
