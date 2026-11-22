@@ -1471,10 +1471,11 @@ async def checkout(
     db.add(draft)
     await db.flush()
 
-    # Log Checkout Funnel Activity and Dispatch Admin Email Alert
+    # Log Checkout Funnel Activity for analytics only — no email here.
+    # Admin gets notified only on PASSENGERS_FILLED (lead captured) or PAYMENT_ABANDONED.
+    # Sending on CHECKOUT_INITIATED causes duplicate/noisy emails for every payment attempt.
     try:
         from app.models.activity_log import CheckoutFunnelLog
-        from app.services.abandoned_lead_service import send_admin_abandoned_lead_notification
 
         header_sess = fastapi_req.headers.get("x-session-id")
         session_id = header_sess or f"sess_{draft_id}"
@@ -1512,10 +1513,11 @@ async def checkout(
             payment_gateway=selected_gateway,
             ip_address=fastapi_req.client.host if fastapi_req.client else None,
             user_agent=fastapi_req.headers.get("user-agent"),
+            admin_email_sent=True,  # Mark as sent to prevent activity.py from sending on this stage too
         )
         db.add(funnel_log)
         await db.flush()
-        background_tasks.add_task(send_admin_abandoned_lead_notification, funnel_log, None)
+        # No email dispatched here — CHECKOUT_INITIATED is too noisy
     except Exception as f_err:
         logger.warning(f"Backend checkout funnel logging error: {f_err}")
 

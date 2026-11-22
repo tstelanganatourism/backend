@@ -121,9 +121,13 @@ async def track_funnel_event(
         await db.commit()
         await db.refresh(log)
 
-        # Trigger admin notification email for critical lead/abandonment stages
+        # Trigger admin notification email for critical lead/abandonment stages only.
+        # - PASSENGERS_FILLED: customer filled details but didn't pay (lead captured)
+        # - PAYMENT_ABANDONED: customer reached payment page but cancelled/abandoned
+        # CHECKOUT_INITIATED and MODAL_CLOSED_AFTER_FILL are skipped — too noisy,
+        # the user gets a booking confirmation email if they actually complete the booking.
         should_notify_admin = (
-            (payload.funnel_stage in ["PASSENGERS_FILLED", "CHECKOUT_INITIATED", "PAYMENT_ABANDONED", "MODAL_CLOSED_AFTER_FILL"])
+            (payload.funnel_stage in ["PASSENGERS_FILLED", "PAYMENT_ABANDONED"])
             and (log.customer_phone or log.customer_email)
             and not log.admin_email_sent
         )
